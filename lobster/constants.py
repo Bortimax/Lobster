@@ -134,27 +134,44 @@ HIT_TEST_FRAME_BUDGET_US = 2_000.0
 
 # Unit costs, measured on the pure-Python path by least squares over twelve
 # controlled scenarios (residual < 5 us on queries costing 18-647 us), then
-# validated against real `resolve_projectile` wall time across five densities.
-# They are rounded *up* from the fit so the model over-predicts across the whole
-# sampled range (measured ratios 1.02-1.16): a budget that errs must err towards
-# tripping early, for the same reason `_BOUND_EPSILON` errs outward.
+# validated against real `resolve_projectile` wall time across nine densities
+# and ray lengths. **Each is rounded up from its own fitted value** so the model
+# over-predicts across the whole sampled range (measured ratios 1.02-1.13): a
+# budget that errs must err towards tripping early, for the same reason
+# `_BOUND_EPSILON` errs outward. Re-derived after D31 changed the scan count.
+
+#: Setting a query up: normalising the ray, sampling the segment into bucket
+#: coordinates, building the result list. Independent of what it finds.
+#:
+#: The first fit had no such term - it came back slightly negative and was
+#: dropped, because at ~280 scans per query the fixed cost hid inside the scan
+#: coefficient. Tightening `SpatialIndex._span` (D31) cut that to ~162 and the
+#: model immediately began *under*-predicting by up to 43%, which is the wrong
+#: direction for a budget. The term is explicit now, so a future change to the
+#: scan count cannot quietly decalibrate the budget again.
+#:
+#: There is no `MAX_QUERIES_PER_FRAME` to go with it: every attack costs at
+#: least one query, so such a ceiling would just be "attacks per frame", which
+#: the modelled total already bounds and the violation message already reports.
+PER_QUERY_US = 10.0
 
 #: Forming a bucket key and looking it up. The traversal cost, empty or not.
 PER_BUCKET_SCAN_US = 1.2
 
 #: A candidate pulled from a bucket and distance-tested against the segment.
-PER_CANDIDATE_US = 2.5
+PER_CANDIDATE_US = 2.6
 
 #: One counted capsule test *in situ* - not the 3.3 us primitive, but its
 #: amortised share of the refinement path around it (bone matrices, region
 #: selection). Measured in place, because that is what a frame actually pays.
-PER_CAPSULE_TEST_US = 12.0
+PER_CAPSULE_TEST_US = 13.0
 
 
-def modelled_cost_us(bucket_scans: int, candidates: int,
+def modelled_cost_us(queries: int, bucket_scans: int, candidates: int,
                      capsule_tests: int) -> float:
     """What this frame's hit-testing cost, from counters alone. Deterministic."""
-    return (bucket_scans * PER_BUCKET_SCAN_US
+    return (queries * PER_QUERY_US
+            + bucket_scans * PER_BUCKET_SCAN_US
             + candidates * PER_CANDIDATE_US
             + capsule_tests * PER_CAPSULE_TEST_US)
 

@@ -46,6 +46,7 @@ from typing import (Any, Dict, Iterable, List, Mapping, Optional, Sequence,
 from .budgets import BudgetViolation
 from .constants import (HIT_TEST_FRAME_BUDGET_US,
                         PER_BUCKET_SCAN_US, PER_CANDIDATE_US,
+                        PER_QUERY_US,
                         PER_CAPSULE_TEST_US,
                         MAX_BROAD_CANDIDATES_PER_FRAME,
                         MAX_BUCKET_SCANS_PER_FRAME,
@@ -311,6 +312,7 @@ class HitTester:
         most of its cost, and the ceiling sat at ~196 ms of wall time - it
         bounded the algorithm's scaling and not the frame. See DECISIONS.md D27.
         """
+        queries = self.index.stats.queries
         scans = self.index.stats.buckets_scanned
         broad = self.index.stats.candidates_considered
         capsules = self.stats.capsule_tests
@@ -332,9 +334,10 @@ class HitTester:
         advice = crowd_advice
 
         if self.frame_budget_us:
-            cost = modelled_cost_us(scans, broad, capsules)
+            cost = modelled_cost_us(queries, scans, broad, capsules)
             if cost > self.frame_budget_us:
-                parts = (("grid traversal", scans * PER_BUCKET_SCAN_US),
+                parts = (("query setup", queries * PER_QUERY_US),
+                         ("grid traversal", scans * PER_BUCKET_SCAN_US),
                          ("broad candidates", broad * PER_CANDIDATE_US),
                          ("capsule tests", capsules * PER_CAPSULE_TEST_US))
                 driver = max(parts, key=lambda kv: kv[1])

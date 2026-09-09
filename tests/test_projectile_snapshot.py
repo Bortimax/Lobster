@@ -328,7 +328,8 @@ class TestVolleyCostModel(unittest.TestCase):
         be worth nothing.
         """
         tester, _ = self.volley(4)
-        cost = modelled_cost_us(self.index.stats.buckets_scanned,
+        cost = modelled_cost_us(self.index.stats.queries,
+                                self.index.stats.buckets_scanned,
                                 self.index.stats.candidates_considered,
                                 tester.stats.capsule_tests)
         self.assertLessEqual(cost, tester.frame_budget_us)
@@ -354,7 +355,7 @@ class TestVolleyCostModel(unittest.TestCase):
                            "the walk crossed a hundred-odd buckets and the "
                            "budget has to be able to see them")
         self.assertGreater(
-            modelled_cost_us(stats.buckets_scanned,
+            modelled_cost_us(stats.queries, stats.buckets_scanned,
                              stats.candidates_considered, 0), 100.0,
             "a query costing hundreds of microseconds must be charged "
             "hundreds of microseconds")

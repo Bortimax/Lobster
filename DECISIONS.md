@@ -1517,3 +1517,75 @@ a written finding and my own restatement of it as outstanding work, and died in
 about a minute against an actual test. The rule that keeps paying: **measure or
 reproduce before changing anything** — including when the thing being changed is
 something I claimed myself.
+
+---
+
+## D31 — The grid dilation was one bucket too wide (deferred from D27)
+
+D27 logged this and refused to do it there:
+
+> Folding a performance change into a correctness fix would mean neither could
+> be measured, and the budget has to be trustworthy before anything is tuned
+> against it.
+
+The budget is now trustworthy, so here it is.
+
+### The defect
+
+`query_sphere` and `query_segment` both dilated every touched bucket by
+`span = int(radius / cell_size) + 1`. The tight bound is different: two bucket
+indices differ by `d` only if `(d - 1) * cell < r`, so `d < r/cell + 1` and the
+correct span is **`ceil(r / cell)`**.
+
+Those agree everywhere except when `r / cell` is an **integer** — the classic
+`floor + 1` where `ceil` was meant. And that is precisely the shipping case:
+`broad_margin()` floors at `PROJECTILE_BROAD_RADIUS_M` (2.5 m) and the grid is
+`SPATIAL_GRID_CELL_M` (2.5 m), so the ratio is exactly 1.0 and every step
+scanned a **5×5 neighbourhood where 3×3 was sufficient** — 25 bucket lookups
+instead of 9.
+
+### How it was made safe to change
+
+This alters which entities the broad phase *finds*, so it is a correctness
+change wearing a performance change's clothes. Three independent checks:
+
+1. **Brute force as the oracle.** 8,000 randomised queries across 5 crowd sizes,
+   3 cell sizes, 6 radii and both query shapes, compared against a direct
+   distance test over every entity. Zero mismatches before the change (the
+   baseline) and zero after.
+2. **The conformance vectors did not move.** D28's 80 committed cases still
+   compare clean, so no answer changed anywhere the harness reaches. This is the
+   first time that harness has earned its keep on something other than itself.
+3. The whole suite, unchanged.
+
+`_span` is floored at 1 because `_segment_buckets` samples the line rather than
+supercovering it, so a diagonal can cross a bucket no sample lands in.
+Consecutive samples are at most one bucket apart, so a span of 1 catches it.
+
+### What it bought, and what it broke
+
+| | before | after |
+|---|---|---|
+| bucket scans per 128 m arrow | 280 | **162** |
+| cost per arrow (200 bodies) | 514 µs | **374 µs** |
+| arrows per cell per frame | 4 | **6** |
+
+**And it decalibrated the frame budget**, which is the part worth recording.
+D27's fit had no per-query term — it came back slightly negative and was
+dropped, because at ~280 scans per query the fixed setup cost hid inside the
+scan coefficient. At 162 scans it no longer does, and the model went from
+over-predicting by 2–16% to **under-predicting by up to 43%** — the wrong
+direction for a budget, and a silent restoration of exactly the class of defect
+D27 existed to remove.
+
+So the unit costs were re-derived on the new code, four terms this time, over
+nine scenarios spanning crowd size and ray length. `PER_QUERY_US = 10.0` is now
+explicit, so a future change to the scan count cannot quietly decalibrate the
+budget again. Each coefficient is rounded up from its own fitted value rather
+than compensated for across terms; the model over-predicts everywhere in the
+sampled range (ratios 1.02–1.13).
+
+**The lesson is the one D27 already stated and this confirmed:** a cost model
+calibrated on one counter mix is not valid on another. Optimising the thing the
+budget counts obliges you to re-derive the budget. Doing these two changes in
+one commit would have hidden that entirely.

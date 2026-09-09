@@ -265,6 +265,27 @@ class SpatialIndex:
                             entry.snapshot_reason)
 
     # -- queries -------------------------------------------------------------
+    def _span(self, radius: float) -> int:
+        """How many buckets out from a touched bucket a candidate can hide.
+
+        With `|a - b| <= r`, two bucket indices differ by `d` only if
+        `(d - 1) * cell < r`, so `d < r/cell + 1` and the tightest safe span is
+        **`ceil(r / cell)`**.
+
+        It used to be `int(r / cell) + 1`, which is the same number except when
+        `r / cell` is an integer - and that is precisely the shipping case:
+        `broad_margin()` floors at `PROJECTILE_BROAD_RADIUS_M` (2.5 m) and the
+        grid is `SPATIAL_GRID_CELL_M` (2.5 m), so the ratio is exactly 1.0 and
+        every touched bucket was dilated into a 5x5 neighbourhood where 3x3 is
+        sufficient - 25 bucket scans per step instead of 9.
+
+        Floored at 1 because `_segment_buckets` samples the line rather than
+        supercovering it, so a diagonal can cross a bucket no sample lands in.
+        Consecutive samples are at most one bucket apart, so any skipped bucket
+        is adjacent to a sampled one and a span of 1 catches it.
+        """
+        return max(1, math.ceil(radius / self.cell_size_m))
+
     def query_sphere(self, center: Vec3, radius: float, *,
                      tiers: Optional[Sequence[str]] = None) -> List[Candidate]:
         """Candidates within `radius`. O(buckets touched), not O(entities).
@@ -275,7 +296,7 @@ class SpatialIndex:
         """
         self.stats.queries += 1
         allowed = set(tiers) if tiers else None
-        span = int(radius / self.cell_size_m) + 1
+        span = self._span(radius)
         cx, cz = self._bucket(center)
         out: List[Candidate] = []
         for ix in range(cx - span, cx + span + 1):
@@ -322,7 +343,7 @@ class SpatialIndex:
         from .geometry import closest_point_on_segment
         self.stats.queries += 1
         allowed = set(tiers) if tiers else None
-        span = int(radius / self.cell_size_m) + 1
+        span = self._span(radius)
 
         seen_buckets: Set[Tuple[int, int]] = set()
         seen_entities: Set[str] = set()

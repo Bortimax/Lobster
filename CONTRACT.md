@@ -151,14 +151,15 @@ attributable, and that includes reproducible.
 | | |
 |---|---|
 | `HIT_TEST_FRAME_BUDGET_US` | **2,000 µs** — one cell's slice of a 16.6 ms frame |
+| `PER_QUERY_US` | 10.0 — setting a query up, independent of what it finds |
 | `PER_BUCKET_SCAN_US` | 1.2 — forming a bucket key and looking it up |
-| `PER_CANDIDATE_US` | 2.5 — a candidate pulled and distance-tested |
-| `PER_CAPSULE_TEST_US` | 12.0 — a counted capsule test *in situ*, refinement path included |
+| `PER_CANDIDATE_US` | 2.6 — a candidate pulled and distance-tested |
+| `PER_CAPSULE_TEST_US` | 13.0 — a counted capsule test *in situ*, refinement path included |
 
-`modelled_cost_us(scans, candidates, capsules)` is the whole model. The unit
-costs are measured, not guessed, and rounded **up** from the fit so the model
-over-predicts across the sampled range — a budget that errs must err toward
-tripping early.
+`modelled_cost_us(queries, scans, candidates, capsules)` is the whole model. The
+unit costs are measured, not guessed, and **each is rounded up from its own
+fitted value** so the model over-predicts across the sampled range (ratios
+1.02–1.13) — a budget that errs must err toward tripping early.
 
 Three unit ceilings are derived from the same slice and enforced as secondary
 guards. Each is the point at which that unit **alone** would spend it, so under
@@ -167,14 +168,15 @@ mixed load the frame budget always fires first:
 | Ceiling | Derived |
 |---|---|
 | `MAX_BUCKET_SCANS_PER_FRAME` | 1,666 |
-| `MAX_BROAD_CANDIDATES_PER_FRAME` | 800 |
-| `MAX_CAPSULE_TESTS_PER_FRAME` | 166 |
+| `MAX_BROAD_CANDIDATES_PER_FRAME` | 769 |
+| `MAX_CAPSULE_TESTS_PER_FRAME` | 153 |
 
 Pass `0` for any of them, or `frame_budget_us=0`, to disable that check (tools,
 offline analysis, tests).
 
-**What this buys on the pure-Python path: about four 120 m arrows into a
-200-strong army, per cell, per frame.** That number is small and it is true. The
+**What this buys on the pure-Python path: about six 120 m arrows into a
+200-strong army, per cell, per frame** (four before D31 tightened the grid
+dilation). That number is small and it is true. The
 previous ceiling permitted roughly 425 — about 196 ms of wall time, twelve
 frames past the point the game stopped being one. Raising the budget is not the
 remedy; the accelerator seam (DECISIONS.md D26) is.
@@ -187,6 +189,7 @@ Two engagements blow the same budget for opposite reasons:
 |---|---|---|
 | **broad candidates** | a packed crowd | mass-casualty event — use the zone-occupancy path (§6.5/§7), resolved once |
 | **grid traversal** | long shots over open ground | grid-walk cost, scaling with ray length × queries and *not* with bodies near the path — shorten the segment resolved per frame, or use the volley seam |
+| **query setup** | very many very short queries | the per-query floor; batch them |
 
 Telling the second caller to use zone occupancy would be nonsense advice: there
 is no crowd. See DECISIONS.md D27.
