@@ -53,6 +53,26 @@ DEFAULT_AGENT_HEIGHT_M = 1.8
 #: How far below a polygon we look for something to stand on.
 DEFAULT_SUPPORT_PROBE_M = 0.35
 
+#: How far below a polygon `bounds()` reaches, and therefore how far below one
+#: the build step's load-bearing inference can see (Scope 10).
+#:
+#: **This must never fall below `DEFAULT_SUPPORT_PROBE_M`**, and the two were
+#: previously coupled by nothing but the arithmetic happening to work out. A
+#: chunk sitting between the two depths would support a polygon - so destroying
+#: it changes walkability - while intersecting no polygon bound, so the
+#: inference would not flag it and no recompute would be queued. That is a
+#: silent false negative, which is the exact failure mode Scope 15.7 says must
+#: not come back:
+#:
+#: > it reopens the exact silent-failure mode (a forgotten flag on a gatehouse,
+#: > NPCs walking through rubble with no error) that v0.4 exists to close.
+#:
+#: The margin is larger than the probe on purpose: the inference must err
+#: towards over-flagging, which costs one recompute that changes nothing.
+#: `tests/test_navmesh_agreement.py` pins the relationship so a future tweak to
+#: either number fails loudly instead of opening the gap.
+LOAD_BEARING_PROBE_MARGIN_M = 0.5
+
 
 class NavmeshError(Exception):
     pass
@@ -86,7 +106,7 @@ class NavPoly:
     def bounds(self) -> AABB:
         xs = [p[0] for p in self.points]
         zs = [p[1] for p in self.points]
-        return AABB((min(xs), self.y - 0.5, min(zs)),
+        return AABB((min(xs), self.y - LOAD_BEARING_PROBE_MARGIN_M, min(zs)),
                     (max(xs), self.y + DEFAULT_AGENT_HEIGHT_M, max(zs)))
 
     def to_dict(self) -> Dict[str, Any]:

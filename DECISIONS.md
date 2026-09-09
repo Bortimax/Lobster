@@ -1466,3 +1466,54 @@ is debuggable from a log alone.
 report unavailable-because-unimplemented while correctly identifying which tier
 the machine *would* land on. The detection and the implementation are separate
 facts and are now reported separately.
+
+---
+
+## D30 — The load-bearing "false negative" was not one; the coupling behind it was real
+
+**A correction to my own claim.** Reviewing Shrimp's finding 3C I wrote that the
+build-step inference had a genuine false negative — "a pillar 5 m below a bridge
+deck is not flagged, so destroying it leaves the deck floating and still
+walkable" — and listed it as an outstanding defect to fix.
+
+**Tested, and it does not exist.** Two things were wrong with the claim:
+
+1. **The arithmetic.** `NavPoly.bounds()` reaches 0.5 m below the surface;
+   `_poly_walkable` looks for support 0.35 m below it. The inference's reach
+   already covers the probe, so every chunk that can change walkability
+   intersects a polygon bound and is flagged. Swept over both directions in
+   `tests/test_navmesh_agreement.py`, at 24 depths and 24 heights.
+2. **The example.** Destroying a chunk removes *that chunk*. There is no
+   structural-collapse cascade — that would be damage simulation, which is not
+   Lobster's (L8, §0 non-goals) — so the deck stays supported by its own voxels
+   and its walkability genuinely does not change. The scenario described a
+   physics feature that does not exist and called its absence an inference bug.
+
+### What was actually wrong
+
+The two numbers were **coupled by nothing but the arithmetic happening to work
+out.** Nothing named the relationship, nothing enforced it, and nothing would
+have noticed it breaking. Raise `DEFAULT_SUPPORT_PROBE_M` past 0.5 — a plausible
+tuning change for taller terrain steps — and a chunk sitting between the probe
+and the bound would hold a polygon up while intersecting nothing. Destroy it and
+walkability changes with no recompute queued: a silent false negative, which is
+the precise failure Scope 15.7 says must not come back.
+
+**Decision: make the relationship structural.**
+`LOAD_BEARING_PROBE_MARGIN_M = 0.5` is now a named constant that `bounds()`
+uses, documented as *never* permitted below `DEFAULT_SUPPORT_PROBE_M` and
+deliberately larger, because the inference must err towards over-flagging — one
+recompute that changes nothing is the cheap direction. Four tests pin it,
+including a sweep and a check that over-flagging still stops somewhere: a bound
+that swallowed the whole cell would queue a recompute for destroying anything.
+
+Verified by mutation — dropping the margin to 0.2 fails two tests with the
+reason spelled out, rather than passing quietly.
+
+### The general point, recorded because it will recur
+
+A defect asserted from reading code is a hypothesis. This one survived a review,
+a written finding and my own restatement of it as outstanding work, and died in
+about a minute against an actual test. The rule that keeps paying: **measure or
+reproduce before changing anything** — including when the thing being changed is
+something I claimed myself.

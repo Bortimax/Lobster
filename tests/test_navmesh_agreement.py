@@ -20,6 +20,9 @@ from lobster.connection_graph import (ConnectionGraphPatcher,
                                       graph_says_connected,
                                       navmesh_says_connected, portal_polys,
                                       sever_ops)
+from lobster.geometry import AABB
+from lobster.navmesh import (DEFAULT_AGENT_HEIGHT_M, DEFAULT_SUPPORT_PROBE_M,
+                             LOAD_BEARING_PROBE_MARGIN_M, NavPoly, Navmesh)
 from lobster.octopus_bridge import OctopusBridge
 from lobster.structure_state import StructureStateWriter
 from tests.fixtures import (BRIDGE, FIELD, KEEP, VILLAGE, bridge_bundle,
@@ -159,3 +162,67 @@ class TestNavmeshConnectionAgreement(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestTheInferenceCanSeeEverythingThatMattersToWalkability(unittest.TestCase):
+    """The build step's load-bearing inference decides *when* to recompute;
+    `recompute_polys` decides *what the answer is*. So the inference has to
+    reach at least as far as walkability does, or a chunk changes the answer
+    without anything asking for it again.
+
+    This was written after a false alarm: a "support from below" false negative
+    was reported, tested for, and turned out not to exist - the inference
+    already reaches further down than the support probe. What did exist was the
+    coupling being accidental. These tests make it a property.
+    """
+
+    def poly(self, y=0.0):
+        return NavPoly(poly_id=1,
+                       points=((0.0, 0.0), (4.0, 0.0), (4.0, 4.0), (0.0, 4.0)),
+                       y=y)
+
+    def test_the_inference_reaches_at_least_as_far_down_as_the_support_probe(self):
+        self.assertGreaterEqual(
+            LOAD_BEARING_PROBE_MARGIN_M, DEFAULT_SUPPORT_PROBE_M,
+            "a chunk between the support probe and the polygon bound would "
+            "hold a polygon up while intersecting nothing - destroy it and "
+            "walkability changes with no recompute queued, which is the silent "
+            "failure Scope 15.7 forbids")
+
+    def test_the_inference_reaches_the_full_agent_clearance(self):
+        """The other half: a chunk in the headroom blocks the polygon."""
+        bounds = self.poly().bounds()
+        self.assertGreaterEqual(bounds.maximum[1] - self.poly().y,
+                                DEFAULT_AGENT_HEIGHT_M)
+
+    def test_a_chunk_that_can_change_walkability_is_always_flagged(self):
+        """Swept, rather than argued. Every depth walkability depends on must
+        intersect the polygon bound."""
+        mesh = Navmesh("cell-x", [self.poly()])
+        steps = 24
+        for i in range(steps + 1):
+            depth = DEFAULT_SUPPORT_PROBE_M * i / steps
+            box = AABB((1.0, -depth - 0.01, 1.0), (3.0, -depth, 3.0))
+            self.assertTrue(
+                mesh.polys_intersecting(box),
+                "a chunk %.3f m below the surface supports it but was not "
+                "flagged" % depth)
+        for i in range(steps + 1):
+            height = DEFAULT_AGENT_HEIGHT_M * i / steps
+            box = AABB((1.0, height, 1.0), (3.0, height + 0.01, 3.0))
+            self.assertTrue(
+                mesh.polys_intersecting(box),
+                "a chunk %.3f m above the surface blocks it but was not "
+                "flagged" % height)
+
+    def test_it_still_stops_somewhere(self):
+        """Over-flagging is the safe direction, not a free one: a flag on every
+        chunk in the cell would queue a recompute for destroying anything."""
+        mesh = Navmesh("cell-x", [self.poly()])
+        self.assertFalse(mesh.polys_intersecting(
+            AABB((1.0, -8.0, 1.0), (3.0, -6.0, 3.0))))
+        self.assertFalse(mesh.polys_intersecting(
+            AABB((1.0, 6.0, 1.0), (3.0, 8.0, 3.0))))
+        self.assertFalse(mesh.polys_intersecting(
+            AABB((40.0, -0.1, 40.0), (42.0, 0.1, 42.0))),
+            "a chunk on the far side of the cell is not load-bearing here")
