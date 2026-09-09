@@ -863,7 +863,73 @@ cell. Pass `kinds=` to include it.
 
 ---
 
-## 9. Zone trigger volumes
+## 9. World-space labels
+
+*Scope §8 item 2, DECISIONS.md D37.* "Where would a label for this go, and can
+you see the spot."
+
+```python
+from lobster.labels import label_anchors
+
+for anchor in label_anchors(camera, selector, ids, view=view):
+    if anchor.on_screen and not anchor.occluded:
+        draw_my_text(anchor.screen_point, my_name_for(anchor.target_id))
+```
+
+| `LabelAnchor` field | Meaning |
+|---|---|
+| `target_id`, `kind`, `cell_id` | what it is and where it lives |
+| `world_point` | the anchor, **world space** — above a rig's head, above a structure's top, just above something lying on the ground |
+| `screen_point` | `(x, y)` in pixels, origin top-left, or `None` when the anchor is at or behind the near plane. **Not the same as off screen** — an off-screen anchor projects fine and returns coordinates outside the viewport, which is what an edge marker wants |
+| `distance` | metres from the camera |
+| `occluded` | something solid stands between the camera and the anchor |
+
+Anchors come back **nearest first**. A target that is in no resident cell is
+omitted — it has no position, so there is no anchor, and an NPC walking out of
+the resident set is not an exception-worthy event.
+
+### What labels refuse
+
+**No text, no "should draw", no priority, no declutter.** Lobster has never known
+a display name (§5 invariant 3 forbids it), distance falloff and "only show
+hostiles" are content deciding what matters (L4), and two labels landing on one
+pixel is a layout problem — layout is 2D chrome. You get `screen_point`;
+overlap is two lines on your side. `LabelAnchor` is asserted to grow no
+`text`, `priority`, `alpha` or `declutter` attribute.
+
+### Occlusion is the same ray selection uses
+
+A label is hidden when something is between the camera and its anchor, and
+`Selector` already answers that. Sharing it means **labels and picking can never
+disagree**: if the crosshair says a wall is in the way, the label behind it
+cannot claim otherwise.
+
+A label is never hidden by its own subject — the anchor floats just above the
+thing it labels, so the test ignores hits on that target. Pass
+`test_occlusion=False` to skip the raycast, which is the whole cost of the call.
+
+---
+
+## 10. Items in the draw list
+
+`ITEM` is a draw kind, and `build_draw_list(..., view=view)` is what makes placed
+items appear. **Items need the view and props do not**: a prop is baked into the
+bundle, an item is an `Item` record read live. `render_resident` forwards its
+view for you.
+
+`ITEM_DRAW_RADIUS_M` (0.6 m) is larger than `ITEM_PICK_RADIUS_M` (0.35 m) on
+purpose. Both are invented — items declare no extent, since `model_ref` resolves
+to nothing until there is an asset pipeline — and they err in opposite
+directions: **a cull must err towards drawing**, because culling something
+invisible costs one wasted draw while culling something visible is a missing
+sword.
+
+Items reach the draw list as bounded entries **with no mesh**, exactly where
+props have always been. There is still no asset pipeline. See DECISIONS.md D37.
+
+---
+
+## 11. Zone trigger volumes
 
 A Zone becomes a trigger volume through two fields, both declared by
 `packages/lobster_geometry.json`:
@@ -924,7 +990,7 @@ invent the second (§4). See DECISIONS.md D14.
 
 ---
 
-## 10. Build-step lint
+## 12. Build-step lint
 
 `lobster-build` refuses to bake a world that cannot work. Every finding carries
 `code`, `record_id` and `cell_id`; the codes in `ERROR_CODES` fail the build and

@@ -1957,3 +1957,96 @@ in the cell is not a new item, or a full cell could never rearrange itself.
 The ceiling is per cell (L6), declarable in `lobster_budget`, and inherits the
 existing discipline for free: a cell may declare a **lower** ceiling than the
 shell default, never a higher one.
+
+---
+
+## D37 — World-space labels, and items in the draw list (Scope §8, steps 4–5)
+
+**Approved by the project owner** as decision 3 of the §8 proposal, with the
+instruction: *"Keep it pure: no text, no 'should draw', no filtering by
+gameplay importance."*
+
+`lobster/labels.py`, `LabelAnchor`, `label_anchors(camera, selector, targets)`.
+Scope §8 is now complete.
+
+### What a label is, reduced to geometry
+
+Four numbers and a boolean: a world anchor, its screen projection, the distance,
+and whether anything stands in the way. Everything else was refused, and each
+refusal is asserted rather than described:
+
+| not owned | why |
+|---|---|
+| the text | Lobster has never known a display name, and §5 invariant 3 forbids it naming a creature or an item at all |
+| whether to draw | distance falloff, "only show hostiles", "hide during menus" - content deciding what matters (L4) |
+| priority | nearest is the only order geometry supports, exactly as in selection (D25) |
+| declutter | two labels on one pixel is a layout problem, and layout is 2D chrome |
+
+**On declutter specifically.** The proposal offered to report screen-space
+overlap and let Shrimp decide what to drop. Read against *"keep it pure"* that
+is still one step onto the slope, so it is not built: `screen_point` is handed
+over and Shrimp can compute overlap in two lines. A test asserts two anchors on
+the same pixel come back as two anchors.
+
+### Occlusion reuses `Selector`, and that is the design
+
+A label is hidden when something stands between the camera and its anchor -
+which is the question selection already answers. Sharing it buys a property
+worth more than the code saved: **labels and picking can never disagree.** If
+the crosshair says a wall is in the way, the label behind it cannot claim
+otherwise. Asserted directly.
+
+Two details that would have been bugs:
+
+* **A label is never hidden by its own subject.** The anchor floats just above
+  the thing it labels, so a ray reaching it clips the very shoulder it hangs
+  over. The occlusion test ignores hits on the target itself.
+* **`OCCLUSION_EPSILON_M` errs towards visible**, the same reasoning as
+  `_BOUND_EPSILON`: a surface exactly at the anchor is decided by rounding, and
+  a label that flickers off when you look straight at a thing is worse than one
+  that lingers a frame.
+
+### Anchors are derived from the rig, not from an assumed humanoid
+
+An entity's anchor sits above `whole_body_capsule()`, so a label over a spider
+is over the spider - the same argument that made the projectile gate rig-derived
+(D19). A structure anchors above its **top**, not its centroid, because a
+centroid anchor is inside the gatehouse and therefore behind its own wall on
+every approach.
+
+`screen_point` is `None` only for an anchor at or behind the near plane. That is
+deliberately **not** the same as off screen: an off-screen anchor projects fine
+and returns coordinates outside the viewport, which is what an edge-of-screen
+marker needs.
+
+A target that is in no resident cell is **omitted, not raised**. An NPC walking
+out of the resident set is ordinary, and raising would make a caller handle an
+exception on a normal frame.
+
+### Step 5 — items in the draw list
+
+`ITEM` joins `DRAW_KINDS`, and `build_draw_list` takes a `view`.
+
+**Items need it and props do not**, which is the whole difference: a prop is
+baked into the bundle, an item is an `Item` record read live. `render_resident`
+forwards its view, and a test asserts it does - **without that forwarding a
+dropped sword would be pickable, labellable and invisible**, which is precisely
+the silent disagreement between subsystems that §13 invariant 2 exists to
+prevent. A caller drawing baked geometry alone (a build-step preview) passes no
+view and correctly gets no items.
+
+`ITEM_DRAW_RADIUS_M` (0.6) is deliberately **larger** than
+`selection.ITEM_PICK_RADIUS_M` (0.35). Both are invented - items declare no
+extent, because `model_ref` resolves to nothing until there is an asset pipeline
+- but they err in opposite directions on purpose: culling something that turns
+out to be invisible costs one wasted draw, while culling something visible is a
+missing sword. **A cull must err towards drawing.**
+
+### What Scope §8 still does not do
+
+Items reach the draw list as bounded entries with no mesh, exactly where props
+have always been. **There is still no asset pipeline**, so nothing resolves
+`model_ref` into geometry. That was stated when step 2 landed and it remains
+true: inventing one under the heading "place an item's representation" would be
+the scope creep L8 forbids, and it is a separate decision about asset loading
+that nobody has asked for yet.

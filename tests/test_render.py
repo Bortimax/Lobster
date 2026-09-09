@@ -29,9 +29,13 @@ from lobster.geometry import AABB, Transform, cross, normalize, sub
 from lobster.render import RenderSettings, render_cell, write_png
 from lobster.render.png import encode_png
 from lobster.render.raster import Framebuffer, _clip_near
+from lobster.cell import CellManager
+from lobster.octopus_bridge import OctopusBridge
 from lobster.skeleton import Skeleton, humanoid_region_set
+from tests.fixtures import VILLAGE, build_session, standard_workspace
 from lobster.tiers import ACTIVE, DORMANT
-from lobster.visibility import (DrawList, ENTITY, STRUCTURE, TERRAIN,
+from lobster.visibility import (DRAW_KINDS, ITEM, ITEM_DRAW_RADIUS_M,
+                                DrawList, ENTITY, STRUCTURE, TERRAIN,
                                 build_draw_list)
 
 
@@ -290,3 +294,69 @@ class TestPng(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestPlacedItemsReachTheDrawList(unittest.TestCase):
+    """Scope §8 step 5 (DECISIONS.md D37).
+
+    Items are not baked into the bundle, so unlike props they need the live
+    view to appear at all. Without this a dropped sword would be pickable,
+    labellable and invisible - which is exactly the class of silent
+    disagreement §13 invariant 2 exists to prevent.
+    """
+
+    def setUp(self):
+        self.session = build_session()
+        self.session.engine.write({"op": "CREATE", "record": {
+            "id": "item-sword", "type": "Item", "display_name": "Sword"}})
+        self.bridge = OctopusBridge(self.session)
+        self.ws = standard_workspace()
+        self.addCleanup(self.ws.close)
+        self.manager = CellManager(self.ws.path, session=self.session)
+        view = self.bridge.frame()
+        self.manager.set_player_cell(view, VILLAGE)
+        self.manager.place_item(view, "item-sword", VILLAGE,
+                                Transform(position=(6.0, 0.5, 8.0)))
+        self.view = self.bridge.frame()
+        self.cells = [self.manager.resident[c]
+                      for c in sorted(self.manager.resident)]
+
+    def draw_list(self, **kwargs):
+        camera = Camera.looking_at((6.0, 1.6, 0.0), (6.0, 1.0, 20.0))
+        return build_draw_list(camera, self.cells,
+                               placements=self.manager.placements(self.view),
+                               **kwargs)
+
+    def test_a_placed_item_is_drawn_when_a_view_is_given(self):
+        drawn = [i for i in self.draw_list(view=self.view).items
+                 if i.kind == ITEM]
+        self.assertEqual([i.item_id for i in drawn], ["item-sword"])
+        self.assertEqual(drawn[0].cell_id, VILLAGE)
+
+    def test_without_a_view_there_are_no_items(self):
+        """Right for a build-step preview, which has baked geometry and no
+        save to read."""
+        self.assertEqual([i for i in self.draw_list().items
+                          if i.kind == ITEM], [])
+
+    def test_a_removed_item_stops_being_drawn(self):
+        self.manager.remove_item(self.bridge.frame(), "item-sword")
+        self.view = self.bridge.frame()
+        self.assertEqual([i for i in self.draw_list(view=self.view).items
+                          if i.kind == ITEM], [])
+
+    def test_the_draw_radius_errs_larger_than_the_pick_radius(self):
+        """A cull must err towards drawing: culling something invisible costs
+        one wasted draw, culling something visible is a missing sword."""
+        from lobster.selection import ITEM_PICK_RADIUS_M
+        self.assertGreater(ITEM_DRAW_RADIUS_M, ITEM_PICK_RADIUS_M)
+
+    def test_item_is_a_declared_draw_kind(self):
+        self.assertIn(ITEM, DRAW_KINDS)
+
+    def test_render_resident_forwards_the_view(self):
+        """Otherwise items would be pickable and invisible."""
+        import inspect
+        from lobster.render import raster
+        source = inspect.getsource(raster.render_resident)
+        self.assertIn("view=view", source)

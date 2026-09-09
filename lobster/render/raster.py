@@ -361,11 +361,16 @@ def render_resident(camera: Camera, manager: Any, view: Any, *,
     the world stops at the cell boundary. The placements come from the manager,
     which is the only object that knows what is resident - `visibility` still
     invents none of it (DECISIONS.md D21).
+
+    The `view` is forwarded to the culler, so **placed items are drawn**: they
+    live in records rather than in the bundle, so without it a dropped sword
+    would be pickable and labellable and invisible (D37).
     """
     settings = settings or RenderSettings()
     cells = [manager.resident[cell_id] for cell_id in sorted(manager.resident)]
     draw_list = build_draw_list(camera.with_aspect(settings.aspect()), cells,
-                                placements=manager.placements(view))
+                                placements=manager.placements(view),
+                                view=view)
     return _dispatch(backend, draw_list,
                      {cell.cell_id: cell for cell in cells}, settings)
 

@@ -35,12 +35,21 @@ from .tiers import DORMANT
 #: What a draw item stands for. Deliberately coarse: a renderer needs to know
 #: which pool a thing came from (terrain and structures are separate systems,
 #: L2) and nothing else about what it means.
+#: Bounding radius for a placed item in the draw list. Items declare no extent
+#: (`Item.model_ref` resolves to nothing until there is an asset pipeline), so
+#: this is invented - and it is a *draw* bound, deliberately larger than
+#: `selection.ITEM_PICK_RADIUS_M`: culling something that turns out to be
+#: invisible costs one wasted draw, while culling something visible is a
+#: missing sword. A cull must err towards drawing.
+ITEM_DRAW_RADIUS_M = 0.6
+
 TERRAIN = "terrain"
 STRUCTURE = "structure"
 ENTITY = "entity"
 PROP = "prop"
+ITEM = "item"
 
-DRAW_KINDS: Tuple[str, ...] = (TERRAIN, STRUCTURE, ENTITY, PROP)
+DRAW_KINDS: Tuple[str, ...] = (TERRAIN, STRUCTURE, ENTITY, PROP, ITEM)
 
 
 @dataclass(frozen=True)
@@ -123,7 +132,8 @@ def build_draw_list(camera: Camera,
                     cells: Iterable[Any],
                     *,
                     placements: Optional[Dict[str, Transform]] = None,
-                    include_dormant_entities: bool = False) -> DrawList:
+                    include_dormant_entities: bool = False,
+                    view: Any = None) -> DrawList:
     """Cull a set of resident cells against the camera.
 
     `cells` are `ResidentCell`s. `placements` maps a cell id to where that cell
@@ -187,6 +197,29 @@ def build_draw_list(camera: Camera,
                 cell_placement=placement, center=center, radius=radius,
                 distance=camera.distance_to(center)))
             drew_any = True
+
+        # -- placed items (Scope 8) --------------------------------------------
+        # Same shape as props and deliberately a separate kind: a prop is
+        # decoration baked into the bundle, an item is an Octopus record with
+        # an id worth reporting (D36). Neither declares an extent - there is no
+        # asset pipeline, so `model_ref` resolves to nothing - and the radius
+        # here is the same invented number selection uses, kept in one place.
+        if view is not None:
+            for record in view.items_in_location(cell.cell_id):
+                raw = (record.get("world_transform") or {}).get("position")
+                if not raw:
+                    continue
+                stats.items_considered += 1
+                center = placement.apply((float(raw[0]), float(raw[1]),
+                                          float(raw[2])))
+                if not camera.sees_sphere(center, ITEM_DRAW_RADIUS_M):
+                    continue
+                items.append(DrawItem(
+                    kind=ITEM, cell_id=cell.cell_id, item_id=record["id"],
+                    cell_placement=placement, center=center,
+                    radius=ITEM_DRAW_RADIUS_M,
+                    distance=camera.distance_to(center)))
+                drew_any = True
 
         # -- entities ----------------------------------------------------------
         index = getattr(cell, "index", None)
