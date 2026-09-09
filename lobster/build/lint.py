@@ -57,6 +57,8 @@ ERROR_CODES = frozenset({
     "exterior_without_grid",
     "exterior_grid_collision",
     "exterior_grid_malformed",
+    "item_transform_without_location",
+    "item_location_without_transform",
 })
 
 #: Manifest keys that would bake record-owned data into the bundle.
@@ -102,6 +104,55 @@ def check_spawn_paths(view: Any) -> List[Dict[str, Any]]:
             "carrying a spawn_transform, so nothing can ever arrive here - "
             "not through a door, not by fast travel",
             record_id=location["id"], cell_id=location["id"]))
+    return out
+
+
+def check_item_placements(view: Any) -> List[Dict[str, Any]]:
+    """`Item.world_transform` and `Item.current_location_ref` are co-null.
+
+    Either an item is in the world - it has **both** a cell and a position in
+    that cell's coordinates - or it is not in the world and has **neither**.
+    Anything else is an item Lobster cannot represent, and in both directions
+    the symptom is the same: it silently never appears.
+
+    Octopus settles the semantics. `StdLib.location_of` maps an Item to
+    `current_location_ref`, so a location *is* the claim "this is out in the
+    world"; and `world_transform` is cell-local, so a transform alone names a
+    position in no coordinate system at all - the same defect shape as a Zone
+    shape with no `shape_location_ref` (D14).
+
+    **This also surfaces an Octopus-side restriction that would otherwise be
+    silent.** `world_transform` is content-settable on purpose (D33, mirroring
+    D3's pre-ruined keep), but Octopus declares `current_location_ref` as
+    `save_layer_only`, so a content package cannot legally supply the other
+    half. An author shipping a sword on a table gets a finding naming exactly
+    that, instead of an item that resolves to nowhere.
+    """
+    out: List[Dict[str, Any]] = []
+    for item in view.records_of_type("Item"):
+        has_transform = bool(item.get("world_transform"))
+        has_cell = bool(item.get("current_location_ref"))
+        if has_transform == has_cell:
+            continue
+        if has_transform:
+            out.append(finding(
+                "item_transform_without_location",
+                "has a world_transform but no current_location_ref, so its "
+                "position is in no cell's coordinates and nothing can place "
+                "it. Note that Octopus declares current_location_ref "
+                "save_layer_only, so a content package cannot set it - a "
+                "pre-placed item must currently be placed at runtime through "
+                "place_item",
+                record_id=item["id"]))
+        else:
+            out.append(finding(
+                "item_location_without_transform",
+                "has a current_location_ref but no world_transform, so it is "
+                "in the world at no particular place and will never be drawn, "
+                "picked or labelled. An item that is not in the world should "
+                "have neither field",
+                record_id=item["id"],
+                cell_id=item.get("current_location_ref")))
     return out
 
 
@@ -339,6 +390,7 @@ def lint_world(view: Any, manifest: Any) -> List[Dict[str, Any]]:
         entry.setdefault("cell_id", None)
         findings.append(entry)
     findings.extend(check_spawn_paths(view))
+    findings.extend(check_item_placements(view))
     findings.extend(check_zone_shapes(view))
     findings.extend(check_exterior_grid(view))
     findings.extend(check_no_bypass_channel(manifest))

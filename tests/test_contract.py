@@ -83,16 +83,16 @@ class TestEventSurface(unittest.TestCase):
 
         self.assertEqual(
             raised,
-            {"on_enter_cell", "on_exit_cell", "on_hit_location",
-             "on_structure_damaged", "on_interact"},
+            set(CONTRACT_EVENTS),
             "the set of events Lobster raises itself has changed; update "
             "CONTRACT §1's 'Raised by' column to match")
 
-        awaiting = set(CONTRACT_EVENTS) - raised
         self.assertEqual(
-            awaiting, {"on_item_placed", "on_item_removed"},
-            "these two await the rest of Scope §8 - item representation in "
-            "the world. Selection landed and closed on_interact (D25)")
+            set(CONTRACT_EVENTS) - raised, set(),
+            "**all seven** are Lobster-raised as of D34. D24 recorded three "
+            "that were declared and never fired; selection closed "
+            "on_interact (D25) and item placement closed the other two. A "
+            "regression here means an event went back to being a promise")
 
     def test_the_caller_raised_events_are_still_fully_wired(self):
         """Declared-but-not-raised is not the same as absent: the payloads,
@@ -165,7 +165,19 @@ class TestQuerySurface(unittest.TestCase):
         self.assertEqual(sorted(PERMITTED_QUERIES), sorted([
             "resolve_npc_state", "zone_occupants", "resolve_equipment_slots",
             "list_active_effects", "limb_state", "structures_in_zone",
-            "structures_in_location"]))
+            "structures_in_location", "items_in_location"]))
+
+    def test_the_list_grew_deliberately_and_the_reason_is_recorded(self):
+        """Eight, not seven. §13's list is closed but not frozen - v0.3 added
+        `structures_in_*` to close the §6.5 gap, and §8's item representation
+        needs `items_in_location` on the same grounds: a cell cannot represent
+        the items in it without asking which those are.
+
+        This assertion exists so the next addition is also an argued one. A
+        query appearing here without a DECISIONS entry is the failure mode.
+        """
+        self.assertEqual(len(PERMITTED_QUERIES), 8)
+        self.assertIn("items_in_location", PERMITTED_QUERIES)
 
     def test_four_of_them_are_octopus_functions_today(self):
         delegates = delegates_to_octopus()
@@ -234,6 +246,7 @@ class TestQuerySurface(unittest.TestCase):
             view.limb_state("npc-ada", purpose=HIT_TEST_ONLY)
             view.structures_in_zone("zone-village")
             view.structures_in_location(VILLAGE)
+            view.items_in_location(VILLAGE)
             self.assertEqual(set(view.calls), set(PERMITTED_QUERIES))
 
 

@@ -2,9 +2,11 @@
   "format": "lce-package",
   "package_id": "lobster.geometry",
   "version": "0.4.0",
-  "schema_compat": {"min": 1, "max": 1},
+  "schema_compat": {
+    "min": 1,
+    "max": 1
+  },
   "package_kind": "standard",
-
   "_comment": [
     "Lobster's Octopus-side data declarations (SDS 7.2 schema extension).",
     "Every field here is content a writer or a mod may layer over, merge into,",
@@ -16,7 +18,6 @@
     "layer owns that declaration can drop Lobster's copy without losing the",
     "rest (apply_extension rejects the same field from two packages)."
   ],
-
   "schema_extensions": {
     "new_fields": {
       "Location": [
@@ -64,6 +65,14 @@
           "default": null,
           "_doc": "Which cell the shape's coordinates are expressed in. A Zone spanning several Locations carries its trigger volume in one of them."
         }
+      ],
+      "Item": [
+        {
+          "name": "world_transform",
+          "merge_policy": "REPLACE",
+          "default": null,
+          "_doc": "Scope 8: where an item's representation physically sits, once it is in the world rather than in an inventory. {position:[x,y,z], rotation:[x,y,z,w]}, metres, right-handed, Y up, in the coordinates of the cell named by Item.current_location_ref. REPLACE because an item is in one place: two mods that both move the same sword must not average it. Deliberately NOT save_layer_only, mirroring destroyed_chunks (DECISIONS.md D3), so a content package may ship a sword already lying on a table. Octopus's own current_location_ref IS save_layer_only, so a content layer cannot yet say which cell that table is in; the build lint reports that as 'item_placed_without_cell' rather than letting it fail silently. Lobster writes this field only through CellManager.place_item / remove_item, on the ordinary Octopus write path."
+        }
       ]
     },
     "new_types": [
@@ -89,6 +98,5 @@
       }
     ]
   },
-
   "operations": []
 }

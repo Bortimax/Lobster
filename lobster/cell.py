@@ -311,8 +311,11 @@ class CellManager:
     def __init__(self, bundle_dir: str, *, bus: Optional[EventBus] = None,
                  ledger: Optional[MemoryLedger] = None,
                  sink: Any = None, patch_queue: Optional[PatchQueue] = None,
-                 ring: int = RESIDENT_RING) -> None:
+                 ring: int = RESIDENT_RING, session: Any = None) -> None:
         self.bundle_dir = bundle_dir
+        #: only used to write item placement (Scope 8). Optional, because every
+        #: other thing this manager does is a read.
+        self.session = session
         self.bus = bus or EventBus()
         self.ledger = ledger or MemoryLedger()
         self.sink = sink
@@ -563,6 +566,71 @@ class CellManager:
                 "arrival lands".format(cell_id))
         source = view.record(from_location_id) if from_location_id else None
         return cell.spawn_transform(source)
+
+    # -- items (Scope 8) -----------------------------------------------------
+    def items_in(self, view: Any, cell_id: str) -> List[Any]:
+        """Every item physically in a resident cell, read fresh.
+
+        Read rather than cached, for the reason §13 gives about every live
+        query: an item somebody else moved this frame has moved. The read costs
+        one permitted query (D34) over an index that is O(items in the cell).
+        """
+        from .items import placed_items
+        if cell_id not in self.resident:
+            raise CellError(
+                "cell {0!r} is not resident; load it before asking what is "
+                "lying about in it".format(cell_id))
+        return placed_items(view, cell_id)
+
+    def place_item(self, view: Any, item_id: str, cell_id: str,
+                   transform: Transform, *, placer: Any = None) -> Any:
+        """Put an item's representation in the world (Scope 8).
+
+        Refuses a cell that is not resident. That is not fussiness: the
+        transform is in that cell's coordinates, and a caller placing into a
+        cell Lobster cannot see is describing a position it cannot check
+        against terrain, structures or the cell's own extent. Loud beats a
+        sword resolving inside a hill.
+
+        `placer` is injectable so a caller may batch writes or supply its own
+        session; by default one is built from this manager's own.
+        """
+        from .items import ItemPlacer
+        if cell_id not in self.resident:
+            raise CellError(
+                "cannot place {0!r} into {1!r}: that cell is not resident, so "
+                "its coordinates mean nothing here".format(item_id, cell_id))
+        writer = placer if placer is not None else ItemPlacer(
+            self._session_for_writes(view), self.bus)
+        return writer.place(item_id, cell_id, transform)
+
+    def remove_item(self, view: Any, item_id: str, *,
+                    placer: Any = None) -> Optional[Any]:
+        """Take an item's representation back out of the world.
+
+        Returns what was removed, or None if it was not in the world to begin
+        with - which is not an error: two systems racing to pick up the same
+        sword is ordinary, and the loser should get a null rather than an
+        exception.
+        """
+        from .items import ItemPlacer, PlacedItem
+        record = view.record(item_id)
+        if not record or not record.get("current_location_ref")                 or not record.get("world_transform"):
+            return None
+        placed = PlacedItem.from_record(record)
+        writer = placer if placer is not None else ItemPlacer(
+            self._session_for_writes(view), self.bus)
+        writer.remove(placed.item_id, placed.cell_id, placed.transform)
+        return placed
+
+    def _session_for_writes(self, view: Any) -> Any:
+        session = self.session if self.session is not None else getattr(
+            view, "session", None)
+        if session is None:
+            raise CellError(
+                "this CellManager has no session, so it cannot write item "
+                "placement; construct it with session=, or pass placer=")
+        return session
 
     # -- damage --------------------------------------------------------------
     def damage_structure(self, view: Any, cell_id: str, structure_id: str,

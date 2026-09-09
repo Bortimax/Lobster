@@ -52,9 +52,9 @@ Seven, exactly. `lobster.events.CONTRACT_EVENTS` is the closed set — subscribi
 to anything else raises `ContractViolation`, and so does emitting a payload of
 the wrong type.
 
-**Five of them Lobster originates. Two it declares but does not yet raise
-itself** — the column says which, and `tests/test_contract.py` pins it, so the
-split cannot drift silently.
+**Lobster originates all seven.** `tests/test_contract.py` pins that, so an
+event cannot quietly go back to being a promise nobody keeps — which is what
+three of them were until Scope §8 landed (D24 → D25, D34).
 
 | Event | Payload fields | Raised by |
 |---|---|---|
@@ -63,18 +63,12 @@ split cannot drift silently.
 | `on_hit_location` | `target_id: str`, `region: str \| None`, `force: float`, `source_id: str \| None` | **Lobster** (`HitTester`, `WorldHitTester`) |
 | `on_structure_damaged` | `structure_id: str`, `chunk_indices: list[int]` | **Lobster** (`CellManager.damage_structure`, `StructureStateWriter`) |
 | `on_interact` | `target_id: str` | **Lobster** (`Selector.interact`) |
-| `on_item_placed` | `item_id: str`, `cell_id: str`, `transform: Transform` | *caller* — awaits Scope §8 |
-| `on_item_removed` | `item_id: str`, `cell_id: str`, `transform: Transform` | *caller* — awaits Scope §8 |
+| `on_item_placed` | `item_id: str`, `cell_id: str`, `transform: Transform` | **Lobster** (`CellManager.place_item`) |
+| `on_item_removed` | `item_id: str`, `cell_id: str`, `transform: Transform` | **Lobster** (`CellManager.remove_item`) |
 
-The last two are fully wired — payload types, `EventBus.item_placed()` /
-`.item_removed()` — but nothing originates them. Scope §8 gives Lobster three
-things: *object selection/raycasting* (**built**, see CONTRACT §8), *world-space labels*,
-and *physically placing/removing an item's representation in the world*. The
-second and third are not built, and those two Events are the visible end of the
-third.
-
-**So today: if you place an item in the world, fire `on_item_placed` yourself.**
-See DECISIONS.md D24 and D25.
+`on_item_removed` carries the cell and transform the item **had**, not where it
+went. Lobster does not know whether it was picked up, destroyed or teleported,
+and guessing would be policy (L4).
 
 Every payload is a frozen dataclass with `.to_dict()`, which is the wire form:
 
@@ -243,6 +237,52 @@ destroy_op("keep-gatehouse", [13, 12])
 # {"op": "MERGE", "id": "keep-gatehouse", "field": "destroyed_chunks",
 #  "values": [12, 13]}
 ```
+
+### `Item.world_transform` — and the co-null invariant
+
+Scope §8 gives Lobster *"physically placing/removing an item's representation in
+the world"*. Where that representation sits is a field Lobster declares on
+Octopus's existing `Item` record, the same way it declares
+`Location.default_spawn_transform` and `Zone.shape`:
+
+```
+Item (Octopus record, field declared by packages/lobster_geometry.json)
+  world_transform: REPLACE, {position:[x,y,z], rotation:[x,y,z,w]}
+                   in the coordinates of the cell named by current_location_ref
+```
+
+`REPLACE` because an item is in one place: two mods that both move the same
+sword must not average it. **Not** save-layer-only, mirroring `destroyed_chunks`
+(D3), so a content package may ship a sword already lying on a table.
+
+> **Invariant — `world_transform` and `current_location_ref` are co-null.**
+> Either an item is in the world and has **both**, or it is not in the world and
+> has **neither**. There is no legal state in between.
+
+Both halves are needed and neither is sufficient. `world_transform` is
+cell-local, so without a cell it names a position in no coordinate system at
+all. And Octopus's `StdLib.location_of` maps an Item to `current_location_ref`,
+so a location is the claim *"this is out in the world"* — without a transform
+that claim is true at no particular place. **In both directions the symptom is
+identical: the item silently never appears**, which is why the build step
+rejects both rather than leaving it to be discovered:
+
+| code | fires on |
+|---|---|
+| `item_transform_without_location` | a position in no cell |
+| `item_location_without_transform` | in the world at no particular place |
+
+**Lobster writes this field from exactly two places** — `CellManager.place_item`
+and `remove_item` — and both go through the ordinary Octopus write path, so it
+stays a normal record field with no special-casing anywhere. They maintain the
+co-null invariant by construction: placement sets both, removal clears both.
+
+**One known conflict, flagged rather than papered over.** Octopus declares
+`Item.current_location_ref` as `save_layer_only`, so a content package cannot
+legally supply the half that `world_transform` needs — a mod cannot yet ship a
+pre-placed item, and the lint says so by name when it tries. That is an Octopus
+decision to revisit, not something Lobster can fix from this side. See
+DECISIONS.md D33.
 
 ### Damaging many structures at once
 
@@ -868,6 +908,7 @@ a runtime symptom weeks later (§15.2).
 |---|---|---|
 | `one_way_connection` | yes | a connection with no return edge — Octopus's own `lce.lint` (its D26), reused rather than re-implemented |
 | `unenterable_location` | yes | **a Location with no `default_spawn_transform` and no incoming connection carrying a `spawn_transform`** (§4) |
+| `item_placed_without_cell` | yes | an `Item` with a `world_transform` and no `current_location_ref` — a position in no cell's coordinates (§8) |
 | `sound_bypass_channel` | yes | a manifest trying to bake record-owned data (sound lists, zone shapes, spawn transforms) into the bundle (§4.5) |
 | `unknown_zone_shape` | yes | a fourth zone primitive |
 | `structure_location_mismatch` | yes | `StructureState.location_id` disagrees with the cell the geometry is baked into |

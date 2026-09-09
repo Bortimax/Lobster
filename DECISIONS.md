@@ -1667,3 +1667,133 @@ Mutation, because a rule with two branches needs both pinned. Forcing
 `walked = True` (the old behaviour) fails the two fast-travel tests; forcing
 `walked = False` fails the two transition-peak tests. Neither half can be
 deleted without the suite saying so.
+
+---
+
+## D33 — `Item.world_transform`, and the co-null invariant (Scope §8, step 1)
+
+**Approved by the project owner** off the §8 proposal.
+
+Scope §8 gives Lobster *"physically placing/removing an item's representation in
+the world"* and gives Octopus *"inventory data — `Item` records"*. So the item is
+Octopus's; **where it is** is Lobster's, and that has to survive a save (L5:
+Lobster saves nothing of its own).
+
+**Decision: a field on the existing `Item` record**, declared by
+`packages/lobster_geometry.json` through `schema_extensions.new_fields` — the
+same mechanism that already declares `Location.default_spawn_transform`,
+`lobster_budget`, `sound_sources`, `spatial_grid_cell_m`, `exterior_grid` and
+`Zone.shape`. `REPLACE`, because an item is in one place and two mods that both
+move the same sword must not average it.
+
+Rejected: a new `ItemPlacement` record. Strictly more contract surface for no
+gain, and splitting placement across two records invites them to disagree about
+where a sword is.
+
+### The co-null invariant
+
+> `world_transform` and `current_location_ref` are co-null. Either an item is in
+> the world and has **both**, or it is not in the world and has **neither**.
+
+Octopus settles the semantics: `StdLib.location_of` maps an Item to
+`current_location_ref`, so a location *is* the claim "this is out in the world";
+and `world_transform` is cell-local, so a transform alone names a position in no
+coordinate system at all — the same defect shape as a Zone shape with no
+`shape_location_ref` (D14).
+
+**In both directions the symptom is identical: the item silently never appears.**
+That is why both are build errors — `item_transform_without_location` and
+`item_location_without_transform` — rather than one being tolerated.
+
+An earlier draft checked only one direction and asserted that a location with no
+transform was clean, on the reasoning "it must be an inventory item". The project
+owner called this out mid-build and was right: Octopus's own `location_of` says
+otherwise.
+
+### `save_layer_only`, and a conflict flagged rather than papered over
+
+`world_transform` is deliberately **not** save-layer-only, mirroring
+`destroyed_chunks` (D3): a mod may ship a pre-ruined keep, so by the same
+argument it may ship a sword already lying on a table.
+
+**But Octopus declares `Item.current_location_ref` as `save_layer_only`**, so a
+content package cannot legally supply the other half. A pre-placed item is
+therefore impossible today regardless of what Lobster does. Rather than silently
+match Octopus's restriction — which would bury it — the lint fires
+`item_transform_without_location` and names `save_layer_only` in the message, so
+an author who tries learns why in one read. **This is an Octopus decision to
+revisit and is recorded here as an open question for that repo.**
+
+---
+
+## D34 — `items_in_location` is an eighth permitted query (Scope §8, step 2)
+
+`CellManager.place_item` / `remove_item`, `lobster/items.py`, and the query that
+makes a resident cell able to say what is lying about in it.
+
+### The contract change, argued rather than assumed
+
+§13's list of permitted live queries had seven entries and a test pinning it
+exactly. This adds an eighth, and the guard failed on the way — which is what it
+is for.
+
+> **Live queries Lobster is permitted to call** […] and — **new in v0.3, closing
+> the §6.5 gap** — `queries.structures_in_zone(zone_id)` and
+> `queries.structures_in_location(location_id)`, both pure lookups over resolved
+> state, same cost model as the occupancy query.
+
+**The list is closed, not frozen**, and it was extended once before on exactly
+these grounds. §8 assigns Lobster item representation in the world, and a cell
+cannot represent the items in it without asking which those are. Same shape of
+read, same cost model: O(items in that location), not O(items in the world), via
+a derived index rebuilt when the resolution changes and never persisted.
+
+Alternative rejected: have the caller place every item on load. The save already
+records where each item is; making Shrimp enumerate them and call `place_item`
+would mean re-writing the records it just read, on every load.
+
+`tests/test_contract.py` now asserts the count is eight and that the reason is
+recorded, so the *next* addition is also an argued one.
+
+### Two fields, no atomic write
+
+**Octopus has no multi-field write.** `PATCH` takes one `field` and one `value`
+(`lce/ops.py`: CREATE, PATCH, MERGE, DELETE, DELETE_ENTRY). The first draft of
+this module invented a `PATCH_MANY` and claimed atomicity for it; checking
+`ops.py` rather than assuming is what caught it.
+
+So the co-null invariant is held by **ordering**, and the honest claim is
+weaker but true: *every intermediate state is "not in the world."*
+
+| | order | intermediate state |
+|---|---|---|
+| place | `world_transform`, then `current_location_ref` | a position in no cell — not indexed, not drawn, not pickable |
+| remove | `current_location_ref`, then `world_transform` | same — out of the index on the first write |
+
+`current_location_ref` is the **commit point** in both directions, because the
+index keys on it. A crash between the two writes leaves a half-placed record,
+which the index skips at runtime and the lint rejects on the next build: loud on
+inspection, inert in play. All four ops are validated by Octopus's own
+`validate_op_shape` in the suite, so an invented op cannot recur.
+
+### What this closes, and what it refuses
+
+**All seven contract Events are now Lobster-raised.** D24 recorded three that
+were declared and never fired; D25 closed `on_interact`, and these two close the
+rest. The pinning test now asserts the awaiting set is empty, so an Event cannot
+go back to being a promise nobody keeps.
+
+Refused, and asserted structurally: no pickup, no inventory, no weight, no stack
+count, no reachability, no owner. `on_item_removed` reports the cell and
+transform the item **had**, not where it went — Lobster does not know whether it
+was picked up, destroyed or teleported, and guessing would be policy (L4).
+`model_ref` is passed through untouched; there is no asset pipeline, and
+inventing one under the heading "place an item's representation" would be the
+scope creep L8 forbids.
+
+Placing into a non-resident cell **raises**. The transform is in that cell's
+coordinates, so a caller placing into a cell Lobster cannot see is describing a
+position it cannot check against terrain, structures or the cell's extent.
+Removing something that is not in the world returns `None` rather than raising:
+two systems racing for the same sword is ordinary, and the loser should get a
+null.

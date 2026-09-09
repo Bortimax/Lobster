@@ -20,7 +20,7 @@ import unittest
 
 from lobster.build.builder import BuildError, build_from_file, build_world
 from lobster.build.lighting import bake_lightmap
-from lobster.build.lint import ERROR_CODES, errors, lint_world
+from lobster.build.lint import check_item_placements, ERROR_CODES, errors, lint_world
 from lobster.build.manifest import ManifestError, load_manifest
 from lobster.build.navmesh_bake import bake_navmesh, unreachable_portals
 from lobster.build.navmesh_inference import (infer_load_bearing,
@@ -348,3 +348,62 @@ class TestLighting(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestItemPlacementLint(unittest.TestCase):
+    """Scope 8: `world_transform` and `current_location_ref` are co-null
+    (CONTRACT §2, DECISIONS.md D33).
+
+    An earlier draft of this checked only one direction and asserted that a
+    location with no transform was clean - "it must be an inventory item".
+    Octopus says otherwise: `StdLib.location_of` maps an Item to
+    `current_location_ref`, so a location *is* the claim that the thing is out
+    in the world. Half-placed in either direction, it silently never appears.
+    """
+
+    class FakeView:
+        def __init__(self, items):
+            self.items = items
+
+        def records_of_type(self, type_name):
+            return list(self.items) if type_name == "Item" else []
+
+    def check(self, **fields):
+        item = {"id": "item-sword", "type": "Item"}
+        item.update(fields)
+        return check_item_placements(self.FakeView([item]))
+
+    def test_a_transform_with_no_cell_is_an_error(self):
+        found = self.check(world_transform={"position": [1.0, 0.0, 2.0]})
+        self.assertEqual(len(found), 1)
+        self.assertEqual(found[0]["code"], "item_transform_without_location")
+        self.assertEqual(found[0]["record_id"], "item-sword")
+        self.assertIn(found[0], errors(found), "this must fail a build")
+
+    def test_a_cell_with_no_transform_is_an_error(self):
+        found = self.check(current_location_ref="cell-village")
+        self.assertEqual(len(found), 1)
+        self.assertEqual(found[0]["code"], "item_location_without_transform")
+        self.assertEqual(found[0]["cell_id"], "cell-village",
+                         "the finding must name the cell it would have been in")
+        self.assertIn(found[0], errors(found))
+
+    def test_it_names_the_octopus_restriction_behind_the_common_cause(self):
+        """An author shipping a pre-placed sword hits Octopus's
+        save_layer_only on current_location_ref. The finding says so rather
+        than leaving them to work it out."""
+        found = self.check(world_transform={"position": [1.0, 0.0, 2.0]})
+        self.assertIn("save_layer_only", found[0]["detail"])
+        self.assertIn("place_item", found[0]["detail"])
+
+    def test_both_halves_present_is_clean(self):
+        self.assertEqual(self.check(world_transform={"position": [1, 0, 2]},
+                                    current_location_ref="cell-village"), [])
+
+    def test_neither_half_present_is_clean(self):
+        """Not being in the world is the normal state of most items."""
+        self.assertEqual(self.check(), [])
+
+    def test_both_codes_fail_a_build(self):
+        self.assertIn("item_transform_without_location", ERROR_CODES)
+        self.assertIn("item_location_without_transform", ERROR_CODES)

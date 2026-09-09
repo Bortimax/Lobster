@@ -62,6 +62,7 @@ PERMITTED_QUERIES: Tuple[str, ...] = (
     "limb_state",
     "structures_in_zone",
     "structures_in_location",
+    "items_in_location",
 )
 
 #: Which of them are Octopus's own functions today.
@@ -124,6 +125,34 @@ class StructureIndex:
         return list(self.by_location.get(location_id, ()))
 
 
+def build_item_index(resolution: Resolution) -> StructureIndex:
+    """location_id -> `Item` records physically in it (Scope 8, D34).
+
+    Identical machinery to `build_structure_index`, over `current_location_ref`
+    instead of `location_id`, and identical in status: pure derived data over a
+    `Resolution`, rebuilt when it changes, never persisted, never a source of
+    truth.
+
+    **Only items that are actually in the world are indexed.** An `Item` with a
+    `current_location_ref` and no `world_transform` is half-placed - the state
+    CONTRACT §2 declares illegal and the build lint rejects - so it is skipped
+    here rather than yielding an item at no particular place. A save that
+    somehow contains one gets an item that does not appear, which is the same
+    outcome as before this index existed, rather than a crash mid-frame.
+    """
+    buckets: Dict[str, List[Dict[str, Any]]] = {}
+    scanned = 0
+    for rec in resolution.by_type("Item"):
+        scanned += 1
+        loc = rec.get("current_location_ref")
+        if isinstance(loc, str) and loc and rec.get("world_transform"):
+            buckets.setdefault(loc, []).append(rec)
+    return StructureIndex(
+        by_location={k: tuple(sorted(v, key=lambda r: r["id"]))
+                     for k, v in buckets.items()},
+        records_scanned_at_build=scanned)
+
+
 def build_structure_index(resolution: Resolution) -> StructureIndex:
     buckets: Dict[str, List[Dict[str, Any]]] = {}
     scanned = 0
@@ -153,12 +182,14 @@ class FrameView:
     def __init__(self, resolution: Resolution, tick: int, *,
                  occupancy: Optional[OccupancyIndex] = None,
                  structures: Optional[StructureIndex] = None,
+                 items: Optional[StructureIndex] = None,
                  player_id: Optional[str] = None) -> None:
         self._resolution = resolution
         self.tick = int(tick)
         self.player_id = player_id
         self._occupancy = occupancy
         self._structures = structures
+        self._items = items
         self._open = True
         #: every permitted call made through this view, for the CLI dump and
         #: for the contract test that asserts nothing else was called.
@@ -249,6 +280,21 @@ class FrameView:
         self._live("structures_in_location")
         return self.structure_index().in_location(location_id)
 
+    def items_in_location(self, location_id: str) -> List[Dict[str, Any]]:
+        """Every `Item` physically placed in one cell. O(items in that cell).
+
+        **New on the Scope 13 permitted-query list (D34).** Scope 8 assigns
+        Lobster *"physically placing/removing an item's representation in the
+        world"*, and a cell cannot represent the items in it without being able
+        to ask which those are. The list was extended once before on the same
+        grounds - `structures_in_location` and `structures_in_zone` were added
+        in v0.3 to close the 6.5 gap - and this is the same shape of read with
+        the same cost model: O(items in that location), not O(items in the
+        world).
+        """
+        self._live("items_in_location")
+        return self.item_index().in_location(location_id)
+
     def structures_in_zone(self, zone_id: str) -> List[Dict[str, Any]]:
         """Every StructureState in a Zone, including descendant Zones.
 
@@ -273,6 +319,11 @@ class FrameView:
         if self._structures is None:
             self._structures = build_structure_index(self._resolution)
         return self._structures
+
+    def item_index(self) -> StructureIndex:
+        if self._items is None:
+            self._items = build_item_index(self._resolution)
+        return self._items
 
     def connections(self, location_id: str) -> List[Tuple[str, float]]:
         """Passable outgoing edges of a Location, as (target_id, travel_cost).
@@ -337,6 +388,7 @@ class OctopusBridge:
         self._index_for: Optional[int] = None
         self._occupancy: Optional[OccupancyIndex] = None
         self._structures: Optional[StructureIndex] = None
+        self._items: Optional[StructureIndex] = None
         self._open_view: Optional[FrameView] = None
 
     # -- resolution/tick sourcing -------------------------------------------
@@ -365,6 +417,7 @@ class OctopusBridge:
         if self._index_for != id(res):
             self._occupancy = None
             self._structures = None
+            self._items = None
             self._index_for = id(res)
         if self._open_view is not None:
             self._open_view.close()
