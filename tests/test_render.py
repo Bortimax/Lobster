@@ -1,0 +1,292 @@
+"""Camera, visibility and the software rasteriser (Scope 1, 3).
+
+Shrimp's observation was that Lobster shipped every input to a renderer and no
+renderer: `TerrainMesh`, `StructureMesher`, `bone_matrices` and the baked
+lightmap were all produced and none was read. These tests are the consumer.
+
+Two of them exist because rendering found bugs that numbers alone did not:
+
+* the terrain mesher wound its top surface so the normal pointed **down**,
+  which no geometry test noticed and which would break lighting and backface
+  culling in any renderer;
+* dropping triangles that cross the near plane silently discarded the ground,
+  because terrain is greedy-meshed into a few enormous quads and the camera
+  stands on one of them.
+
+See DECISIONS.md D21.
+"""
+
+from __future__ import annotations
+
+import math
+import os
+import unittest
+
+from lobster.build.terrain_mesher import (ColumnField, flat_column_field,
+                                          mesh_terrain)
+from lobster.camera import Camera, CameraError
+from lobster.geometry import AABB, Transform, cross, normalize, sub
+from lobster.render import RenderSettings, render_cell, write_png
+from lobster.render.png import encode_png
+from lobster.render.raster import Framebuffer, _clip_near
+from lobster.skeleton import Skeleton, humanoid_region_set
+from lobster.tiers import ACTIVE, DORMANT
+from lobster.visibility import (DrawList, ENTITY, STRUCTURE, TERRAIN,
+                                build_draw_list)
+
+
+class TestCamera(unittest.TestCase):
+
+    def setUp(self):
+        self.camera = Camera.looking_at((0.0, 2.0, 0.0), (0.0, 2.0, 10.0),
+                                        aspect=16.0 / 9.0)
+
+    def test_the_basis_is_right_handed_and_orthonormal(self):
+        right, up, forward = self.camera.basis()
+        for a, b in ((right, up), (right, forward), (up, forward)):
+            self.assertAlmostEqual(sum(x * y for x, y in zip(a, b)), 0.0,
+                                   places=9)
+        derived = cross(right, up)
+        for got, want in zip(derived, forward):
+            self.assertAlmostEqual(got, want, places=9,
+                                   msg="right x up must equal forward, or the "
+                                       "image comes out mirrored")
+
+    def test_screen_axes_point_the_expected_way(self):
+        centre = self.camera.project((0, 2, 10), 640, 360)
+        right = self.camera.project((3, 2, 10), 640, 360)
+        above = self.camera.project((0, 5, 10), 640, 360)
+        self.assertAlmostEqual(centre[0], 320.0, places=6)
+        self.assertAlmostEqual(centre[1], 180.0, places=6)
+        self.assertGreater(right[0], centre[0], "world +x must be screen-right")
+        self.assertLess(above[1], centre[1], "world +y must be screen-up")
+
+    def test_a_point_behind_the_camera_does_not_project(self):
+        self.assertIsNone(self.camera.project((0, 2, -5), 640, 360))
+
+    def test_culling_errs_outward(self):
+        self.assertTrue(self.camera.sees_sphere((0, 2, 50), 1.0))
+        self.assertFalse(self.camera.sees_sphere((0, 2, -50), 1.0))
+        self.assertFalse(self.camera.sees_sphere((500, 2, 50), 1.0))
+        self.assertTrue(self.camera.sees_sphere((30, 2, 50), 8.0),
+                        "a sphere straddling the frustum edge counts as visible")
+
+    def test_far_things_are_culled(self):
+        self.assertFalse(self.camera.sees_aabb(AABB((-5, 0, 900), (5, 10, 910))))
+
+    def test_a_degenerate_camera_is_refused(self):
+        with self.assertRaises(CameraError):
+            Camera.looking_at((0, 0, 0), (0, 0, 0))
+        with self.assertRaises(CameraError):
+            Camera(near=1.0, far=0.5)
+
+
+class TestTerrainNormals(unittest.TestCase):
+    """The bug the first render found."""
+
+    def normals(self, terrain):
+        verts, indices = terrain.mesh.vertices, terrain.mesh.indices
+        out = []
+        for i in range(0, len(indices), 3):
+            tri = [(verts[indices[i + k] * 3], verts[indices[i + k] * 3 + 1],
+                    verts[indices[i + k] * 3 + 2]) for k in range(3)]
+            out.append(tuple(round(c, 6) for c in
+                             normalize(cross(sub(tri[1], tri[0]),
+                                             sub(tri[2], tri[0])))))
+        return out
+
+    def test_the_ground_faces_up(self):
+        normals = self.normals(mesh_terrain("c", flat_column_field(8)))
+        self.assertIn((0.0, 1.0, 0.0), normals)
+        self.assertNotIn((0.0, -1.0, 0.0), normals,
+                         "a downward-facing ground shades as if lit from below "
+                         "and is discarded by backface culling")
+
+    def test_every_cliff_faces_outward(self):
+        heights = [[1 if z < 4 else 3 for z in range(8)] for _ in range(8)]
+        materials = [[1] * 8 for _ in range(8)]
+        field = ColumnField(8, tuple(tuple(r) for r in heights),
+                            tuple(tuple(r) for r in materials))
+        normals = set(self.normals(mesh_terrain("t", field)))
+        self.assertNotIn((0.0, -1.0, 0.0), normals)
+        for axis in ((1.0, 0.0, 0.0), (-1.0, 0.0, 0.0),
+                     (0.0, 0.0, 1.0), (0.0, 0.0, -1.0)):
+            self.assertIn(axis, normals,
+                          "cliffs on all four sides must point away from the "
+                          "hill they belong to")
+
+
+class TestNearPlaneClipping(unittest.TestCase):
+    """The other bug the first render found."""
+
+    def test_a_triangle_straddling_the_near_plane_survives(self):
+        clipped = _clip_near([(0.0, 0.0, 5.0), (0.0, 1.0, -5.0),
+                              (1.0, 0.0, 5.0)], 0.1)
+        self.assertGreaterEqual(len(clipped), 3)
+        self.assertTrue(all(p[2] >= 0.1 - 1e-9 for p in clipped),
+                        "nothing may survive the clip on the wrong side")
+
+    def test_a_triangle_entirely_behind_is_removed(self):
+        self.assertEqual(_clip_near([(0.0, 0.0, -1.0), (1.0, 0.0, -2.0),
+                                     (0.0, 1.0, -3.0)], 0.1), [])
+
+    def test_a_triangle_entirely_in_front_is_untouched(self):
+        points = [(0.0, 0.0, 5.0), (1.0, 0.0, 5.0), (0.0, 1.0, 5.0)]
+        self.assertEqual(_clip_near(points, 0.1), points)
+
+    def test_the_ground_draws_when_the_camera_stands_on_it(self):
+        """The whole point: a huge quad with a corner behind you still fills
+        the screen."""
+        cell = _FakeCell(mesh_terrain("c", flat_column_field(24)))
+        camera = Camera.looking_at((12.0, 3.0, 12.0), (20.0, 1.0, 20.0))
+        frame = render_cell(camera, cell,
+                            settings=RenderSettings(width=160, height=90))
+        self.assertGreater(frame.coverage(), 0.25,
+                           "the ground was dropped for crossing the near plane")
+
+
+class _FakeCell:
+    """The smallest thing `render_cell` accepts - terrain and nothing else."""
+
+    def __init__(self, terrain):
+        self.cell_id = "cell-fake"
+        self.terrain = terrain
+        self.structures = {}
+        self.skeletons = {}
+        self.index = None
+        self.bundle = None
+
+
+class TestVisibility(unittest.TestCase):
+
+    def setUp(self):
+        self.cell = _FakeCell(mesh_terrain("cell-fake", flat_column_field(24)))
+
+    def test_only_what_the_camera_sees_is_in_the_draw_list(self):
+        looking_at_it = Camera.looking_at((12.0, 6.0, 0.0), (12.0, 1.0, 12.0))
+        # Stand well clear before turning away: the culling bound is a sphere
+        # around the whole 24 m patch, so from inside it "facing the other way"
+        # is legitimately still visible.
+        away = Camera.looking_at((12.0, 6.0, -100.0), (12.0, 6.0, -400.0))
+        self.assertEqual(len(build_draw_list(looking_at_it, [self.cell]).items), 1)
+        self.assertEqual(build_draw_list(away, [self.cell]).items, ())
+
+    def test_stats_report_what_culling_saved(self):
+        away = Camera.looking_at((12.0, 6.0, -100.0), (12.0, 6.0, -400.0))
+        stats = build_draw_list(away, [self.cell]).stats
+        self.assertEqual(stats.items_considered, 1)
+        self.assertEqual(stats.items_drawn, 0)
+        self.assertEqual(stats.culled(), 1)
+        self.assertEqual(stats.cells_drawn, 0)
+
+    def test_dormant_entities_are_not_drawn(self):
+        """A DORMANT entity has no rig by definition (CONTRACT §3), so asking
+        to draw one would be asking for something that does not exist."""
+        from lobster.spatial import SpatialIndex
+        index = SpatialIndex("cell-fake")
+        index.snapshot([("mob", (12.0, 1.0, 12.0), DORMANT),
+                        ("knight", (13.0, 1.0, 12.0), ACTIVE)])
+        self.cell.index = index
+        self.cell.skeletons = {"knight": Skeleton(
+            "knight", humanoid_region_set(),
+            root=Transform(position=(13.0, 1.0, 12.0)))}
+        camera = Camera.looking_at((12.0, 4.0, 4.0), (13.0, 1.0, 12.0))
+        entities = build_draw_list(camera, [self.cell]).of_kind(ENTITY)
+        self.assertEqual([i.item_id for i in entities], ["knight"])
+
+    def test_items_come_back_nearest_first(self):
+        from lobster.spatial import SpatialIndex
+        index = SpatialIndex("cell-fake")
+        index.snapshot([("near", (12.0, 1.0, 8.0), ACTIVE),
+                        ("far", (12.0, 1.0, 20.0), ACTIVE)])
+        self.cell.index = index
+        self.cell.skeletons = {
+            name: Skeleton(name, humanoid_region_set(),
+                           root=Transform(position=(12.0, 1.0, z)))
+            for name, z in (("near", 8.0), ("far", 20.0))}
+        camera = Camera.looking_at((12.0, 3.0, 0.0), (12.0, 1.0, 20.0))
+        items = build_draw_list(camera, [self.cell]).items
+        distances = [i.distance for i in items]
+        self.assertEqual(distances, sorted(distances))
+
+    def test_a_cell_with_no_placement_sits_at_the_origin(self):
+        """Lobster does not invent where cells are (DECISIONS.md D21)."""
+        camera = Camera.looking_at((12.0, 6.0, 0.0), (12.0, 1.0, 12.0))
+        item = build_draw_list(camera, [self.cell]).items[0]
+        self.assertEqual(item.cell_placement.position, (0.0, 0.0, 0.0))
+
+    def test_a_placement_moves_a_cell(self):
+        camera = Camera.looking_at((12.0, 6.0, 0.0), (12.0, 1.0, 12.0))
+        far = build_draw_list(
+            camera, [self.cell],
+            placements={"cell-fake": Transform(position=(0.0, 0.0, 600.0))})
+        self.assertEqual(far.items, (),
+                         "moved 600 m away it is past the far plane, bounding "
+                         "sphere included")
+
+
+class TestRasteriser(unittest.TestCase):
+
+    def test_it_actually_draws(self):
+        cell = _FakeCell(mesh_terrain("cell-fake", flat_column_field(24)))
+        camera = Camera.looking_at((12.0, 4.0, 2.0), (12.0, 1.0, 18.0))
+        frame = render_cell(camera, cell,
+                            settings=RenderSettings(width=160, height=90))
+        self.assertGreater(frame.pixels_written, 0)
+        self.assertGreater(frame.coverage(), 0.1)
+
+    def test_an_empty_view_leaves_the_background(self):
+        cell = _FakeCell(mesh_terrain("cell-fake", flat_column_field(24)))
+        settings = RenderSettings(width=64, height=36)
+        camera = Camera.looking_at((12.0, 6.0, 0.0), (12.0, 20.0, -200.0))
+        frame = render_cell(camera, cell, settings=settings)
+        self.assertEqual(frame.coverage(), 0.0)
+        self.assertEqual(frame.pixel(0, 0), settings.background)
+
+    def test_the_z_buffer_keeps_the_nearer_surface(self):
+        frame = Framebuffer(4, 4, (0, 0, 0))
+        self.assertTrue(frame.put(1, 1, 10.0, (255, 0, 0)))
+        self.assertFalse(frame.put(1, 1, 20.0, (0, 255, 0)),
+                         "a farther fragment must not overwrite a nearer one")
+        self.assertEqual(frame.pixel(1, 1), (255, 0, 0))
+        self.assertTrue(frame.put(1, 1, 5.0, (0, 0, 255)))
+        self.assertEqual(frame.pixel(1, 1), (0, 0, 255))
+
+    def test_a_pose_is_what_gets_drawn(self):
+        """`bone_matrices`/`capsule_for` finally have a consumer."""
+        from lobster.spatial import SpatialIndex
+        cell = _FakeCell(mesh_terrain("cell-fake", flat_column_field(24)))
+        index = SpatialIndex("cell-fake")
+        index.snapshot([("knight", (12.0, 1.0, 14.0), ACTIVE)])
+        cell.index = index
+        skeleton = Skeleton("knight", humanoid_region_set(),
+                            root=Transform(position=(12.0, 1.0, 14.0)))
+        cell.skeletons = {"knight": skeleton}
+        camera = Camera.looking_at((12.0, 2.0, 10.0), (12.0, 1.8, 14.0))
+        settings = RenderSettings(width=120, height=90, draw_entities=True)
+
+        with_entity = render_cell(camera, cell, settings=settings).pixels_written
+        without = render_cell(
+            camera, cell,
+            settings=RenderSettings(width=120, height=90,
+                                    draw_entities=False)).pixels_written
+        self.assertGreater(with_entity, without,
+                           "drawing the rig must put pixels on the screen")
+
+
+class TestPng(unittest.TestCase):
+
+    def test_it_writes_a_real_png(self):
+        data = encode_png(2, 2, [255, 0, 0,  0, 255, 0,
+                                 0, 0, 255,  255, 255, 255])
+        self.assertTrue(data.startswith(b"\x89PNG\r\n\x1a\n"))
+        self.assertIn(b"IHDR", data[:32])
+        self.assertTrue(data.endswith(b"IEND\xae\x42\x60\x82"))
+
+    def test_the_wrong_number_of_bytes_is_refused(self):
+        with self.assertRaises(ValueError):
+            encode_png(2, 2, [0, 0, 0])
+
+
+if __name__ == "__main__":
+    unittest.main()

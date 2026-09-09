@@ -1,0 +1,42 @@
+{
+  "format": "lce-package",
+  "package_id": "lobster.limb_state",
+  "version": "0.4.0",
+  "schema_compat": {"min": 1, "max": 1},
+  "package_kind": "standard",
+
+  "_comment": [
+    "Character.limb_state, declared on its own (Scope 5).",
+    "",
+    "'Character.limb_state is a LimbId -> intact | disabled | severed map,",
+    "written via patch_record on threshold crossings, REPLACE_PER_SUBFIELD per",
+    "limb.' Two systems read this field, independently, from the same source of",
+    "truth: Lobster, before resolving a hit-test, so a severed limb offers no",
+    "hitbox; and Shrimp's animation controller, to decide what to do about it.",
+    "Neither reads it on the other's behalf.",
+    "",
+    "It ships as a separate package because SchemaRegistry.apply_extension",
+    "rejects the same field declared by two different packages. If Octopus or",
+    "Shrimp ends up owning this declaration, drop this file and keep the rest",
+    "of Lobster unchanged - lobster.octopus_bridge reads the field if it is",
+    "there and treats its absence as 'all limbs intact' (DECISIONS.md D2).",
+    "",
+    "Who WRITES it is not Lobster. Scope 5 gives per-limb damage state to",
+    "Octopus core + the stats module; Lobster only ever reads."
+  ],
+
+  "schema_extensions": {
+    "new_fields": {
+      "Character": [
+        {
+          "name": "limb_state",
+          "merge_policy": "REPLACE_PER_SUBFIELD",
+          "default": {},
+          "_doc": "LimbId -> 'intact' | 'disabled' | 'severed'. REPLACE_PER_SUBFIELD so each limb resolves independently and the highest layer wins per limb."
+        }
+      ]
+    }
+  },
+
+  "operations": []
+}

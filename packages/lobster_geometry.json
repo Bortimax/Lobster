@@ -1,0 +1,94 @@
+{
+  "format": "lce-package",
+  "package_id": "lobster.geometry",
+  "version": "0.4.0",
+  "schema_compat": {"min": 1, "max": 1},
+  "package_kind": "standard",
+
+  "_comment": [
+    "Lobster's Octopus-side data declarations (SDS 7.2 schema extension).",
+    "Every field here is content a writer or a mod may layer over, merge into,",
+    "and delta-save through the ordinary path. Lobster has no private format:",
+    "the .lobster_cell bundle is a derived build artifact, and everything that",
+    "can change at runtime is one of these records. See DECISIONS.md D1-D3.",
+    "Character.limb_state is deliberately NOT declared here - it lives in",
+    "packages/lobster_limb_state.json so a project whose Shrimp or Octopus",
+    "layer owns that declaration can drop Lobster's copy without losing the",
+    "rest (apply_extension rejects the same field from two packages)."
+  ],
+
+  "schema_extensions": {
+    "new_fields": {
+      "Location": [
+        {
+          "name": "default_spawn_transform",
+          "merge_policy": "REPLACE",
+          "default": null,
+          "_doc": "Scope 4: where an entry that did not come through an authored connection arrives - fast travel, first-time dungeon entry. {position:[x,y,z], rotation:[x,y,z,w]}. The build-step lint rejects a Location with neither this nor an incoming connection carrying a spawn point."
+        },
+        {
+          "name": "lobster_budget",
+          "merge_policy": "REPLACE",
+          "default": null,
+          "_doc": "L6: budgets are declared per cell. {max_structure_voxels, max_micro_chunks, max_active_skeletons, max_bytes}. A cell may declare a LOWER ceiling than the shell default, never a higher one."
+        },
+        {
+          "name": "sound_sources",
+          "merge_policy": "UNION_TOMBSTONED",
+          "default": [],
+          "_doc": "Scope 3/4.5: ambient sound sources as cell metadata, {position, sound_id, radius}. UNION_TOMBSTONED so a mod-supplied list is ordinary layered content with the same merge and quarantine rules as anything else - explicitly not a second save channel."
+        },
+        {
+          "name": "spatial_grid_cell_m",
+          "merge_policy": "REPLACE",
+          "default": null,
+          "_doc": "Scope 7: the uniform spatial grid is 2.5 m by default, 'adjustable per-cell'. Null means the shell default."
+        },
+        {
+          "name": "exterior_grid",
+          "merge_policy": "REPLACE",
+          "default": null,
+          "_doc": "[x, z] integer grid coordinates of an exterior cell, Bethesda-style. World offset is [x * 128, 0, z * 128] using the locked exterior cell size. Null for interiors, which are their own coordinate space and are never placed relative to anything. This is the ONLY thing that says where one cell sits relative to another - a connection says where you arrive, not where the cell is. See DECISIONS.md D21."
+        }
+      ],
+      "Zone": [
+        {
+          "name": "shape",
+          "merge_policy": "REPLACE",
+          "default": null,
+          "_doc": "Scope 4: Zone becomes a trigger volume via shape_ref. Primitives are FROZEN at box | cylinder | polygon. {kind:'box', center:[x,y,z], size:[x,y,z]} | {kind:'cylinder', center, radius, height} | {kind:'polygon', points:[[x,z],...], min_y, max_y}."
+        },
+        {
+          "name": "shape_location_ref",
+          "merge_policy": "REPLACE",
+          "default": null,
+          "_doc": "Which cell the shape's coordinates are expressed in. A Zone spanning several Locations carries its trigger volume in one of them."
+        }
+      ]
+    },
+    "new_types": [
+      {
+        "type_name": "StructureState",
+        "base_type": "Keyword",
+        "schema_version": 1,
+        "_doc": "Scope 6, the one record Lobster's save integration depends on. The authored voxel grid (StructureVoxelData) ships in the .lobster_cell bundle and is never saved; this is the break-state, and it is the only thing that is.",
+        "fields": [
+          {
+            "name": "location_id",
+            "merge_policy": "REPLACE",
+            "default": null,
+            "_doc": "Which cell/Location this structure belongs to."
+          },
+          {
+            "name": "destroyed_chunks",
+            "merge_policy": "UNION_TOMBSTONED",
+            "default": [],
+            "_doc": "Micro-chunk indices that are gone. UNION_TOMBSTONED because destruction is additive and monotonic: two mods damaging different walls of the same keep must both apply. NOT save-layer-only, so a mod may ship a pre-ruined keep (DECISIONS.md D3). Repair is the rare explicit act, modelled as DELETE_ENTRY."
+          }
+        ]
+      }
+    ]
+  },
+
+  "operations": []
+}
