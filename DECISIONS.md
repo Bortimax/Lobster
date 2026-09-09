@@ -2050,3 +2050,98 @@ have always been. **There is still no asset pipeline**, so nothing resolves
 true: inventing one under the heading "place an item's representation" would be
 the scope creep L8 forbids, and it is a separate decision about asset loading
 that nobody has asked for yet.
+
+---
+
+## D38 — A broad phase for items, so the ceiling could rise
+
+**Asked for directly**: *"Index items in the SpatialIndex so the ceiling can
+rise."* D36 had logged the remedy and declined to build it, so this is that
+entry being cashed.
+
+### Not in `SpatialIndex`, and the measurement is why
+
+`SpatialIndex` carries two things items have no use for:
+
+* **A tier.** `check_tier` validates against the entity vocabulary, and D18 is
+  explicit that a tier is a query answer about *entities*. Items would have to
+  borrow one, and a mis-scoped query could then hand an item to
+  `resolve_projectile`, where `_require_rig` raises.
+* **Snapshot provenance.** `snapshot_seq` and `snapshot_reason` exist so a
+  stale dormant entity's position is attributable (Scope §15.10). **Items
+  cannot go stale**: the grid is derived from the resolution and discarded when
+  the resolution changes, so there is no staleness to attribute.
+
+Measured, that machinery costs **2,537 µs against 527** to index 1,000 items —
+5× the build, to answer questions items never ask.
+
+**But the traversal is shared.** `ItemGrid` and `SpatialIndex` both walk through
+`spatial.dilated_segment_walk`, because the walk is the part that has been wrong
+twice — D16's sphere bound and D31's off-by-one dilation — and two copies would
+mean fixing it twice. That is the reviewer's duplicated-mesher objection (3A)
+taken seriously in a case where no law forces the split.
+
+### What the measurements decided
+
+Three of them changed the design rather than confirming it.
+
+**1. A coarser grid is worse, not better.** The obvious tune — bigger buckets
+for sparse items — loses badly, because a dilated corridor at 16 m sweeps most
+of the cell and tests nearly everything. 2.5 m, matching the entity grid, won at
+every item count.
+
+**2. The win depends on ray length, not item count.** The first benchmark used
+a 120 m ray, which is the worst case for a walk and the best case for a scan,
+and made the grid look marginal. At interaction range it is not marginal:
+
+| reach | items | linear | grid |
+|---|---|---|---|
+| 3 m | 1,000 | 4,637 µs | **52 µs** (89×) |
+| 20 m | 1,000 | 4,289 µs | **65 µs** (66×) |
+| 120 m | 25 | 108 µs | 212 µs (**0.5×**) |
+
+So the grid is not used unconditionally. `ItemGrid.walk_cost` reports what the
+walk would cost and `_items` takes the scan when the walk is worse — a long ray
+through a thin scatter. A cell with no items skips both, which matters because
+most resident cells hold none and an empty grid still pays a full walk.
+
+**3. The grid must be cached per *resolution*, not per view.** `frame()` builds
+a new `FrameView` every frame even when nothing was written, so caching there
+rebuilt an unchanged grid once a frame — the exact cost the index exists to
+remove. It lives on the bridge alongside the occupancy and structure indexes,
+keyed on resolution identity, which also makes it impossible to go stale.
+
+### The number
+
+Re-measured with a fresh frame per pick, so the build is not amortised away:
+
+| | µs per item, per pick |
+|---|---|
+| first cut (D33) | 8.3 |
+| D36 — test raw records, construct nothing until a hit | 4.2 |
+| **D38 — `ItemGrid`** | **0.64** aimed, **0.01** at interaction range |
+
+```
+MAX_ITEMS_PER_CELL = 1000 / (0.64 * 9) = 173      (was 26)
+```
+
+Derived by the same rule as before, from the worse of the two cases. **Raising
+it further means making a pick cheaper again, not editing the number** — which
+is the property that made the ceiling worth having.
+
+### A refactor that nearly shipped a silent bug
+
+Extracting the shared walk, I replaced `SpatialIndex._bucket` with a naive
+`int(x // cell)` and lost two things it did: subtracting the cell's `origin`,
+and **clamping to the grid** so a point outside the cell falls in the edge
+bucket rather than opening a phantom one.
+
+**The full suite stayed green**, because every fixture uses a zero origin and
+in-range positions. It was caught by reading the leftover method the edit had
+orphaned, not by a test. `bucket_of` now takes both and the behaviour is
+restored; the clamp is documented as deliberate, for the same reason
+`TerrainCollider.ground_height` clamps.
+
+That is the second time in this project a refactor of working code was safe only
+because something outside the test suite noticed. Worth remembering when the
+native kernels (D26) arrive.

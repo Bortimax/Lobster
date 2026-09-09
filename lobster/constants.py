@@ -200,23 +200,32 @@ MAX_CAPSULE_TESTS_PER_FRAME = int(HIT_TEST_FRAME_BUDGET_US / PER_CAPSULE_TEST_US
 #: so tight that content cannot drop loot at all.
 SELECTION_PICK_BUDGET_US = 1_000.0
 
-#: Marginal cost of one placed item in a resident cell, per pick. Measured:
-#: 25 to 200 items in one cell, fitted on the slope rather than the intercept.
-#: It was 8.3 us before `Selector._items` stopped building a `PlacedItem` (and
-#: a Transform, and a quaternion) for every item the ray misses.
-PER_PICKED_ITEM_US = 4.2
+#: Marginal cost of one placed item in a resident cell, per pick. Measured on
+#: the slope, 25 to 200 items in one cell, with a fresh frame per pick so the
+#: grid build is not amortised away.
+#:
+#: The number has come down twice, and both times by removing work rather than
+#: by choosing a friendlier figure:
+#:
+#: | | us/item | what changed |
+#: |---|---|---|
+#: | first cut | 8.3 | built a `PlacedItem`, a `Transform` and a quaternion for every item the ray missed |
+#: | D36 | 4.2 | test raw records, construct nothing until something hits |
+#: | D38 | **0.64** | `ItemGrid` - only items in buckets near the ray are tested |
+#:
+#: 0.64 is the *aimed* case, a 60 m pick. At interaction range the grid makes
+#: the count stop mattering at all - 0.01 us/item, flat from 25 to 200 - and
+#: the budget is derived from the worse of the two on purpose.
+PER_PICKED_ITEM_US = 0.64
 
 #: Placed items one cell may hold.
 #:
 #: Derived, not chosen (D20's method): a pick tests every item in **every**
 #: resident cell, so the worst case is all of them at the ceiling at once.
 #:
-#: **This number is low, and it is honest about a linear scan.** Item picking
-#: has no broad phase - unlike entities, items are not in the cell's
-#: `SpatialIndex`, because their positions live in records rather than in a
-#: structure Lobster owns. If content needs hundreds of dropped items per cell,
-#: the fix is to index them, not to raise this: raising it would move the cost
-#: from a loud refusal at placement time to a silent 2 ms every frame.
+#: Item picking now has a broad phase (`ItemGrid`, D38), which is what let this
+#: rise from 26. It is still derived rather than chosen: raising it further
+#: means making a pick cheaper again, not editing the number.
 MAX_ITEMS_PER_CELL = int(SELECTION_PICK_BUDGET_US
                          / (PER_PICKED_ITEM_US * MAX_RESIDENT_CELLS))
 

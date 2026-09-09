@@ -38,7 +38,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field as dc_field
-from typing import (Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple)
+from typing import (Iterator, Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple)
 
 from .constants import EXTERIOR_CELL_SIZE_M, SPATIAL_GRID_CELL_M
 from .geometry import Vec3, distance
@@ -70,6 +70,90 @@ class Entry:
         return {"entity_id": self.entity_id, "position": list(self.position),
                 "tier": self.tier, "snapshot_seq": self.snapshot_seq,
                 "snapshot_reason": self.snapshot_reason}
+
+
+# ---------------------------------------------------------------------------
+# Grid traversal - shared, because it is the part that had bugs
+# ---------------------------------------------------------------------------
+#
+# `SpatialIndex` and `lobster.items.ItemGrid` both walk a uniform XZ grid along
+# a segment. The *entries* differ - entities carry a tier and snapshot
+# provenance, items carry neither and cannot go stale - but the walk is
+# identical, and it is the walk that has been wrong twice (D16's sphere bound,
+# D31's off-by-one dilation). Two copies would mean fixing it twice.
+
+
+def bucket_of(position: Vec3, cell_size: float, *,
+              origin: Tuple[float, float] = (0.0, 0.0),
+              dim: Optional[int] = None) -> Tuple[int, int]:
+    """Which bucket an XZ position falls in.
+
+    **Clamped to the grid when `dim` is given**, so a point outside the cell
+    buckets into the edge rather than opening a bucket of its own. That is
+    deliberate and matches `TerrainCollider.ground_height`: an entity a few
+    centimetres past the boundary belongs to the edge, not to a phantom column
+    the walk will never visit.
+
+    An earlier version of this refactor dropped both the origin and the clamp,
+    and the suite stayed green because every fixture uses a zero origin and
+    in-range positions. It would have gone wrong on the first cell that did
+    not.
+    """
+    ix = int((position[0] - origin[0]) // cell_size)
+    iz = int((position[2] - origin[1]) // cell_size)
+    if dim is None:
+        return (ix, iz)
+    return (min(max(ix, 0), dim - 1), min(max(iz, 0), dim - 1))
+
+
+def span_for(radius: float, cell_size: float) -> int:
+    """How many buckets out from a touched bucket a candidate can hide.
+
+    `ceil(r / cell)`, floored at 1. See `SpatialIndex._span` for the derivation
+    and for why `int(r / cell) + 1` was wrong (D31).
+    """
+    return max(1, math.ceil(radius / cell_size))
+
+
+def segment_buckets(start: Vec3, end: Vec3, cell_size: float, *,
+                    origin: Tuple[float, float] = (0.0, 0.0),
+                    dim: Optional[int] = None) -> List[Tuple[int, int]]:
+    """Bucket coordinates the segment passes through, on the XZ plane.
+
+    Sampled at half a cell so no bucket the line crosses is skipped, which is
+    cheaper than a full supercover DDA and cannot miss: two consecutive samples
+    are never more than one bucket apart.
+    """
+    dx = end[0] - start[0]
+    dz = end[2] - start[2]
+    planar = math.sqrt(dx * dx + dz * dz)
+    steps = int(planar / (cell_size * 0.5)) + 1
+    out: List[Tuple[int, int]] = []
+    seen: Set[Tuple[int, int]] = set()
+    for i in range(steps + 1):
+        t = i / steps
+        key = bucket_of((start[0] + dx * t, start[1], start[2] + dz * t),
+                        cell_size, origin=origin, dim=dim)
+        if key not in seen:
+            seen.add(key)
+            out.append(key)
+    return out
+
+
+def dilated_segment_walk(start: Vec3, end: Vec3, cell_size: float, span: int,
+                         *, origin: Tuple[float, float] = (0.0, 0.0),
+                         dim: Optional[int] = None
+                         ) -> Iterator[Tuple[int, int]]:
+    """Every bucket key within `span` of the segment, each yielded once."""
+    seen: Set[Tuple[int, int]] = set()
+    for cx, cz in segment_buckets(start, end, cell_size, origin=origin,
+                                  dim=dim):
+        for ix in range(cx - span, cx + span + 1):
+            for iz in range(cz - span, cz + span + 1):
+                key = (ix, iz)
+                if key not in seen:
+                    seen.add(key)
+                    yield key
 
 
 @dataclass
@@ -143,9 +227,8 @@ class SpatialIndex:
 
     # -- bucketing -----------------------------------------------------------
     def _bucket(self, position: Vec3) -> Tuple[int, int]:
-        ix = int((position[0] - self.origin[0]) // self.cell_size_m)
-        iz = int((position[2] - self.origin[1]) // self.cell_size_m)
-        return (min(max(ix, 0), self.dim - 1), min(max(iz, 0), self.dim - 1))
+        return bucket_of(position, self.cell_size_m,
+                         origin=self.origin, dim=self.dim)
 
     def bucket_count(self) -> int:
         return len(self._buckets)
@@ -284,7 +367,7 @@ class SpatialIndex:
         Consecutive samples are at most one bucket apart, so any skipped bucket
         is adjacent to a sampled one and a span of 1 catches it.
         """
-        return max(1, math.ceil(radius / self.cell_size_m))
+        return span_for(radius, self.cell_size_m)
 
     def query_sphere(self, center: Vec3, radius: float, *,
                      tiers: Optional[Sequence[str]] = None) -> List[Candidate]:
@@ -382,26 +465,9 @@ class SpatialIndex:
         return out
 
     def _segment_buckets(self, start: Vec3, end: Vec3) -> List[Tuple[int, int]]:
-        """Bucket coordinates the segment passes through, on the XZ plane.
-
-        Sampled at half a cell so no bucket the line crosses is skipped, which
-        is cheaper than a full supercover DDA and cannot miss: two consecutive
-        samples are never more than one bucket apart.
-        """
-        dx = end[0] - start[0]
-        dz = end[2] - start[2]
-        planar = math.sqrt(dx * dx + dz * dz)
-        steps = int(planar / (self.cell_size_m * 0.5)) + 1
-        out: List[Tuple[int, int]] = []
-        seen: Set[Tuple[int, int]] = set()
-        for i in range(steps + 1):
-            t = i / steps
-            point = (start[0] + dx * t, start[1], start[2] + dz * t)
-            key = self._bucket(point)
-            if key not in seen:
-                seen.add(key)
-                out.append(key)
-        return out
+        """Delegates to the shared walk (see the top of this module)."""
+        return segment_buckets(start, end, self.cell_size_m,
+                               origin=self.origin, dim=self.dim)
 
     # -- accounting ----------------------------------------------------------
     def active_count(self) -> int:

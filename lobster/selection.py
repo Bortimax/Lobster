@@ -61,6 +61,13 @@ PROP_PICK_RADIUS_M = 0.5
 #: keeping them separate means tuning one never silently moves the other.
 ITEM_PICK_RADIUS_M = 0.35
 
+#: How many bucket lookups one item's capsule test is worth, for choosing
+#: between the grid and a linear scan. Measured: a bucket lookup is ~0.2 us and
+#: an item's capsule test ~4.2 us, so a walk that touches more than ~21 buckets
+#: per item present is not worth taking. Rounded down, because the grid also
+#: pays a build (D38).
+SCAN_BUCKETS_PER_ITEM = 20
+
 #: Step used when marching a ray against the terrain heightfield.
 TERRAIN_MARCH_STEP_M = 0.25
 
@@ -417,23 +424,34 @@ class Selector:
         if view is None:
             return []
         from .geometry import Capsule
+        grid = view.item_grid(cell.cell_id) if hasattr(view, "item_grid") else None
+        if grid is not None and len(grid) == 0:
+            # The common case for most resident cells, and worth its own exit:
+            # an empty grid still costs a full bucket walk otherwise, and that
+            # walk is what dominates a long pick (D38).
+            return []
+
+        end = tuple(origin[i] + heading[i] * max_distance for i in range(3))
+        if grid is not None and grid.walk_cost(origin, end, ITEM_PICK_RADIUS_M)                 <= len(grid) * SCAN_BUCKETS_PER_ITEM:
+            candidates = grid.near_segment(origin, end, ITEM_PICK_RADIUS_M)
+        else:
+            # A long ray through a thin scatter: the walk costs more than
+            # testing everything. Measured, not guessed - a 120 m pick over 25
+            # items is 2x slower through the grid (D38).
+            candidates = [(r["id"],
+                           tuple(float(c) for c in
+                                 (r.get("world_transform") or {})["position"]))
+                          for r in view.items_in_location(cell.cell_id)
+                          if (r.get("world_transform") or {}).get("position")]
+
         out: List[Selection] = []
-        # Records, not `PlacedItem`s. The capsule test needs a position and
-        # nothing else, so building a dataclass (and a Transform, and a
-        # rotation quaternion) for every item in the cell means paying full
-        # construction for the ones the ray misses - which is all of them, on a
-        # typical frame. Measured at 8.3 us per item before this, 2.6 after.
-        for record in view.items_in_location(cell.cell_id):
-            raw = (record.get("world_transform") or {}).get("position")
-            if not raw:
-                continue
-            base = (float(raw[0]), float(raw[1]), float(raw[2]))
+        for item_id, base in candidates:
             volume = Capsule(base, (base[0], base[1] + 0.5, base[2]),
                              ITEM_PICK_RADIUS_M)
             if not ray_capsule_hit(origin, heading, volume, max_distance):
                 continue
             out.append(Selection(
-                kind=ITEM, target_id=record["id"], cell_id=cell.cell_id,
+                kind=ITEM, target_id=item_id, cell_id=cell.cell_id,
                 point=placement.apply(base), normal=(0.0, 0.0, 0.0),
                 distance=distance(origin, base)))
         return out

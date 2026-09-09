@@ -31,8 +31,10 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
+from .constants import SPATIAL_GRID_CELL_M
 from .events import EventBus
-from .geometry import Transform
+from .geometry import Transform, Vec3
+from .spatial import bucket_of, dilated_segment_walk, span_for
 
 ITEM_TYPE = "Item"
 WORLD_TRANSFORM = "world_transform"
@@ -211,3 +213,84 @@ class ItemPlacer:
             self._write(op)
         if self.bus is not None:
             self.bus.item_removed(item_id, cell_id, transform)
+
+
+# ---------------------------------------------------------------------------
+# Spatial index for placed items (D38)
+# ---------------------------------------------------------------------------
+
+class ItemGrid:
+    """A uniform XZ grid over one cell's placed items.
+
+    **Why not `SpatialIndex`.** That class carries what *entities* need and
+    items do not: a tier (an entity vocabulary - D18 - which items have no
+    place in) and snapshot provenance (`snapshot_seq`, `snapshot_reason`,
+    which exist so a stale dormant position is attributable). Items cannot go
+    stale: this grid is derived from the resolution and thrown away when the
+    resolution changes, so there is no staleness to attribute. Measured, that
+    machinery costs 5x the build - 2,537 us against 527 for 1,000 items - to
+    answer a question items never ask.
+
+    **The traversal is shared, though**, because that is the part that has been
+    wrong twice (D16's sphere bound, D31's off-by-one dilation). Both this and
+    `SpatialIndex` walk through `lobster.spatial.dilated_segment_walk`, so a
+    fix lands once.
+
+    Entries are `(item_id, position)` pairs and nothing else. There is no
+    `move` and no `remove`: the way an item moves is that its record changes
+    and this gets rebuilt.
+    """
+
+    __slots__ = ("cell_id", "cell_size_m", "buckets", "count")
+
+    def __init__(self, cell_id: str, records: Iterable[Mapping[str, Any]] = (),
+                 *, cell_size_m: float = SPATIAL_GRID_CELL_M) -> None:
+        self.cell_id = cell_id
+        self.cell_size_m = float(cell_size_m)
+        self.buckets: Dict[Tuple[int, int], List[Tuple[str, Vec3]]] = {}
+        self.count = 0
+        for record in records:
+            raw = (record.get(WORLD_TRANSFORM) or {}).get("position")
+            if not raw:
+                continue
+            position = (float(raw[0]), float(raw[1]), float(raw[2]))
+            self.buckets.setdefault(
+                bucket_of(position, self.cell_size_m), []).append(
+                    (record["id"], position))
+            self.count += 1
+
+    def __len__(self) -> int:
+        return self.count
+
+    def near_segment(self, start: Vec3, end: Vec3,
+                     radius: float) -> List[Tuple[str, Vec3]]:
+        """Candidates whose bucket the segment passes within `radius` of.
+
+        Deduplicated by item id, because the dilated walk can reach the same
+        bucket from two samples. Returns positions so the caller can run the
+        narrow test without touching a record again.
+        """
+        if not self.buckets:
+            return []
+        span = span_for(radius, self.cell_size_m)
+        out: List[Tuple[str, Vec3]] = []
+        seen: Set[str] = set()
+        for key in dilated_segment_walk(start, end, self.cell_size_m, span):
+            for item_id, position in self.buckets.get(key, ()):
+                if item_id not in seen:
+                    seen.add(item_id)
+                    out.append((item_id, position))
+        return out
+
+    def walk_cost(self, start: Vec3, end: Vec3, radius: float) -> int:
+        """How many bucket lookups `near_segment` would do.
+
+        Exposed because the caller has to choose between this and a linear
+        scan, and that choice should be made on the actual numbers rather than
+        on a guess about ray length (D38).
+        """
+        import math
+        span = span_for(radius, self.cell_size_m)
+        dx, dz = end[0] - start[0], end[2] - start[2]
+        steps = int(math.sqrt(dx * dx + dz * dz) / (self.cell_size_m * 0.5)) + 1
+        return (steps + 1) * (2 * span + 1) ** 2

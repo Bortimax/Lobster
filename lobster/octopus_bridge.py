@@ -216,6 +216,7 @@ class FrameView:
                  occupancy: Optional[OccupancyIndex] = None,
                  structures: Optional[StructureIndex] = None,
                  items: Optional[StructureIndex] = None,
+                 item_grids: Optional[Dict[str, Any]] = None,
                  player_id: Optional[str] = None) -> None:
         self._resolution = resolution
         self.tick = int(tick)
@@ -223,6 +224,7 @@ class FrameView:
         self._occupancy = occupancy
         self._structures = structures
         self._items = items
+        self._item_grids = item_grids if item_grids is not None else {}
         self._open = True
         #: every permitted call made through this view, for the CLI dump and
         #: for the contract test that asserts nothing else was called.
@@ -312,6 +314,24 @@ class FrameView:
         """Every StructureState in one cell. O(structures in that location)."""
         self._live("structures_in_location")
         return self.structure_index().in_location(location_id)
+
+    def item_grid(self, location_id: str) -> Any:
+        """That cell's items in a spatial grid, built once per resolution.
+
+        Derived data with the same status as every other index here: rebuilt
+        when the resolution changes, never persisted, never a source of truth.
+        That is what makes it impossible to go stale, and why it needs none of
+        `SpatialIndex`'s snapshot provenance (D38).
+
+        Cached per view, so several picks and a label pass in the same frame
+        share one build.
+        """
+        from .items import ItemGrid
+        grid = self._item_grids.get(location_id)
+        if grid is None:
+            grid = ItemGrid(location_id, self.items_in_location(location_id))
+            self._item_grids[location_id] = grid
+        return grid
 
     def items_in_location(self, location_id: str) -> List[Dict[str, Any]]:
         """Every `Item` physically placed in one cell. O(items in that cell).
@@ -422,6 +442,11 @@ class OctopusBridge:
         self._occupancy: Optional[OccupancyIndex] = None
         self._structures: Optional[StructureIndex] = None
         self._items: Optional[StructureIndex] = None
+        #: per-cell item grids, shared across every view over one resolution.
+        #: Held here rather than on the view because `frame()` makes a new view
+        #: every frame even when nothing was written, and rebuilding an unchanged
+        #: grid once a frame is the cost this index exists to remove (D38).
+        self._item_grids: Dict[str, Any] = {}
         self._open_view: Optional[FrameView] = None
 
     # -- resolution/tick sourcing -------------------------------------------
@@ -451,13 +476,14 @@ class OctopusBridge:
             self._occupancy = None
             self._structures = None
             self._items = None
+            self._item_grids = {}
             self._index_for = id(res)
         if self._open_view is not None:
             self._open_view.close()
         view = FrameView(
             res, tick if tick is not None else self.tick(),
             occupancy=self._occupancy, structures=self._structures,
-            player_id=self.player_id())
+            item_grids=self._item_grids, player_id=self.player_id())
         self._open_view = view
         return view
 

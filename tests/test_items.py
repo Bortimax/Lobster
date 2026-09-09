@@ -18,8 +18,9 @@ from lobster.cell import CellError, CellManager
 from lobster.constants import (MAX_ITEMS_PER_CELL, MAX_RESIDENT_CELLS,
                                PER_PICKED_ITEM_US, SELECTION_PICK_BUDGET_US)
 from lobster.events import EventBus
-from lobster.geometry import Transform
-from lobster.items import (ItemError, ItemPlacer, PlacedItem, place_ops,
+from lobster.geometry import Transform, closest_point_on_segment
+from lobster.items import (ItemError, ItemGrid, ItemPlacer, PlacedItem,
+                           place_ops,
                            placed_items, remove_ops)
 from lobster.octopus_bridge import OctopusBridge, PERMITTED_QUERIES
 from tests.fixtures import FIELD, KEEP, VILLAGE, build_session, standard_workspace
@@ -446,3 +447,117 @@ class TestTheItemCeiling(ItemFixture):
         with self.assertRaises(BudgetViolation):
             Budget.declared(VILLAGE, {"lobster_budget": {
                 "max_items": MAX_ITEMS_PER_CELL + 1}})
+
+
+class TestItemGrid(unittest.TestCase):
+    """The broad phase that let the ceiling rise (DECISIONS.md D38)."""
+
+    def records(self, *points):
+        return [{"id": "itm-%d" % i,
+                 "world_transform": {"position": list(p)}}
+                for i, p in enumerate(points)]
+
+    def test_it_finds_what_a_linear_scan_finds(self):
+        """The only property that matters. A faster broad phase that returns a
+        different set is not faster, it is broken."""
+        import random
+        rng = random.Random(31)
+        points = [(rng.uniform(0, 128), 0.0, rng.uniform(0, 128))
+                  for _ in range(300)]
+        grid = ItemGrid("cell", self.records(*points))
+        for _ in range(60):
+            start = (rng.uniform(0, 128), 0.0, rng.uniform(0, 128))
+            end = (rng.uniform(0, 128), 0.0, rng.uniform(0, 128))
+            radius = rng.choice([0.35, 1.0, 2.5])
+            found = {i for i, _ in grid.near_segment(start, end, radius)}
+            wanted = set()
+            for record, point in zip(self.records(*points), points):
+                _, d = closest_point_on_segment(start, end, point)
+                if d <= radius:
+                    wanted.add(record["id"])
+            self.assertTrue(wanted <= found,
+                            "the grid missed {0}".format(wanted - found))
+
+    def test_an_empty_grid_costs_nothing(self):
+        grid = ItemGrid("cell", [])
+        self.assertEqual(len(grid), 0)
+        self.assertEqual(grid.near_segment((0., 0., 0.), (128., 0., 128.), 2.5),
+                         [])
+
+    def test_candidates_are_deduplicated(self):
+        """The dilated walk can reach one bucket from two samples."""
+        grid = ItemGrid("cell", self.records((5.0, 0.0, 5.0)))
+        found = grid.near_segment((0., 0., 0.), (10., 0., 10.), 2.5)
+        self.assertEqual([i for i, _ in found], ["itm-0"])
+
+    def test_a_half_placed_record_is_skipped_not_crashed_on(self):
+        grid = ItemGrid("cell", [{"id": "broken"},
+                                 {"id": "ok", "world_transform":
+                                  {"position": [1.0, 0.0, 1.0]}}])
+        self.assertEqual(len(grid), 1)
+
+    def test_walk_cost_grows_with_ray_length_not_item_count(self):
+        """Which is why the caller has to choose between this and a scan."""
+        few = ItemGrid("cell", self.records((1.0, 0.0, 1.0)))
+        many = ItemGrid("cell", self.records(*[(float(i), 0.0, 1.0)
+                                               for i in range(50)]))
+        short = ((0., 0., 0.), (3., 0., 0.))
+        long_ = ((0., 0., 0.), (120., 0., 0.))
+        self.assertEqual(few.walk_cost(*short, 0.35),
+                         many.walk_cost(*short, 0.35))
+        self.assertGreater(few.walk_cost(*long_, 0.35),
+                           few.walk_cost(*short, 0.35) * 10)
+
+    def test_it_shares_the_traversal_with_the_entity_index(self):
+        """Both walk through `spatial.dilated_segment_walk`. That walk has been
+        wrong twice (D16, D31) and two copies would mean fixing it twice."""
+        import inspect
+        from lobster import items, spatial
+        self.assertIn("dilated_segment_walk", inspect.getsource(items.ItemGrid))
+        self.assertTrue(callable(spatial.dilated_segment_walk))
+
+    def test_it_carries_no_tier_and_no_snapshot_provenance(self):
+        """Items are rebuilt from records whenever the resolution changes, so
+        they cannot go stale - there is no staleness to attribute, and no tier
+        vocabulary to borrow from entities (D18)."""
+        grid = ItemGrid("cell", self.records((1.0, 0.0, 1.0)))
+        for banned in ("tier", "snapshot_seq", "snapshot_reason", "move",
+                       "remove", "refresh_snapshot"):
+            self.assertFalse(hasattr(grid, banned), banned)
+
+
+class TestTheCeilingRose(ItemFixture):
+
+    def test_the_grid_is_what_raised_it(self):
+        self.assertEqual(MAX_ITEMS_PER_CELL, 173)
+        self.assertGreater(MAX_ITEMS_PER_CELL, 26,
+                           "26 was the linear-scan ceiling (D36)")
+
+    def test_a_cell_holds_far_more_than_it_used_to(self):
+        for i in range(100):
+            self.session.engine.write({"op": "CREATE", "record": {
+                "id": "itm-%d" % i, "type": "Item", "display_name": "x"}})
+            self.manager.place_item(self.view(), "itm-%d" % i, VILLAGE,
+                                    Transform(position=(float(i % 40) * 3.0,
+                                                        0.0,
+                                                        float(i // 40) * 3.0)))
+        self.assertEqual(len(self.manager.items_in(self.view(), VILLAGE)), 100)
+
+    def test_the_grid_and_the_scan_pick_the_same_thing(self):
+        """The grid is only used when its walk is cheaper; both paths must
+        agree, or a pick would depend on ray length."""
+        from lobster.selection import ITEM, Selector
+        for i, z in enumerate((4.0, 40.0, 90.0)):
+            self.session.engine.write({"op": "CREATE", "record": {
+                "id": "itm-%d" % i, "type": "Item", "display_name": "x"}})
+            self.manager.place_item(self.view(), "itm-%d" % i, VILLAGE,
+                                    Transform(position=(2.0, 0.0, z)))
+        view = self.view()
+        selector = Selector.from_manager(self.manager, view)
+        near = selector.pick((2.0, 0.2, 0.0), (0.0, 0.0, 1.0), 6.0,
+                             kinds=(ITEM,), view=view)
+        far = selector.pick((2.0, 0.2, 0.0), (0.0, 0.0, 1.0), 120.0,
+                            kinds=(ITEM,), view=view)
+        self.assertEqual(near.target_id, "itm-0")
+        self.assertEqual(far.target_id, "itm-0",
+                         "nearest wins on both paths")

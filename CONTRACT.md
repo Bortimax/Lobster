@@ -791,15 +791,17 @@ caller that passes none is asking about baked geometry and gets no items. Both
 declares an extent — and they are kept separate so tuning one never silently
 moves the other.
 
-**A cell may hold `MAX_ITEMS_PER_CELL` placed items (26), and `place_item`
-refuses past it before writing anything.** That ceiling is derived, not chosen:
-a pick tests every item in every resident cell, so
-`SELECTION_PICK_BUDGET_US / (PER_PICKED_ITEM_US × MAX_RESIDENT_CELLS)`. It is
-low because item picking has **no broad phase** — items are not in the cell's
-`SpatialIndex`, since their positions live in records. If content needs hundreds
-of dropped items per cell the fix is to index them, not to raise the number:
-raising it moves the cost from a loud refusal at placement to a silent
-millisecond every frame. See DECISIONS.md D36.
+**A cell may hold `MAX_ITEMS_PER_CELL` placed items (173), and `place_item`
+refuses past it before writing anything.** The ceiling is derived, not chosen:
+`SELECTION_PICK_BUDGET_US / (PER_PICKED_ITEM_US × MAX_RESIDENT_CELLS)`, because
+a pick reaches every resident cell.
+
+It was 26 while item picking was a linear scan. `ItemGrid` gave it a broad
+phase and the measured per-item cost fell from 4.2 µs to 0.64 µs, so the
+ceiling rose with it — **raising it further means making a pick cheaper again,
+not editing the number.** At interaction range the grid removes the dependence
+on item count entirely (0.01 µs/item, flat from 25 to 200); 0.64 is the aimed
+60 m case, and the budget uses the worse of the two. See DECISIONS.md D36, D38.
 
 ### It is not hit-testing
 
