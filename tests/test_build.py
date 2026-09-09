@@ -351,59 +351,105 @@ if __name__ == "__main__":
 
 
 class TestItemPlacementLint(unittest.TestCase):
-    """Scope 8: `world_transform` and `current_location_ref` are co-null
-    (CONTRACT §2, DECISIONS.md D33).
+    """Where an item starts (Scope §8, CONTRACT §2, DECISIONS.md D33/D35).
 
-    An earlier draft of this checked only one direction and asserted that a
-    location with no transform was clean - "it must be an inventory item".
-    Octopus says otherwise: `StdLib.location_of` maps an Item to
-    `current_location_ref`, so a location *is* the claim that the thing is out
-    in the world. Half-placed in either direction, it silently never appears.
+    Placement is two fields (Octopus D52): content authors
+    `default_location_ref`, the save owns `current_location_ref` and wins when
+    set. Lobster adds `world_transform` for where in that cell it sits.
+
+    This lint used to refuse placement outright, because `current_location_ref`
+    was the only placement field and it was save-only - a mod could not ship a
+    sword on a table at all. **Naming that restriction in the message is what
+    got it changed** rather than worked around; Octopus added the content-layer
+    field, and the message now offers the remedy it could not before.
     """
 
     class FakeView:
-        def __init__(self, items):
-            self.items = items
+        def __init__(self, records):
+            self.records = {r["id"]: r for r in records}
 
         def records_of_type(self, type_name):
-            return list(self.items) if type_name == "Item" else []
+            return [r for r in self.records.values()
+                    if r.get("type", "Item") == type_name]
 
-    def check(self, **fields):
+        def record(self, record_id):
+            return self.records.get(record_id)
+
+    def check(self, *extra, **fields):
         item = {"id": "item-sword", "type": "Item"}
         item.update(fields)
-        return check_item_placements(self.FakeView([item]))
+        return check_item_placements(self.FakeView([item] + list(extra)))
 
-    def test_a_transform_with_no_cell_is_an_error(self):
+    def codes(self, *extra, **fields):
+        return sorted(f["code"] for f in self.check(*extra, **fields))
+
+    # -- the two halves ------------------------------------------------------
+    def test_a_transform_with_no_location_is_an_error(self):
         found = self.check(world_transform={"position": [1.0, 0.0, 2.0]})
-        self.assertEqual(len(found), 1)
-        self.assertEqual(found[0]["code"], "item_transform_without_location")
-        self.assertEqual(found[0]["record_id"], "item-sword")
+        self.assertEqual([f["code"] for f in found],
+                         ["item_transform_without_location"])
         self.assertIn(found[0], errors(found), "this must fail a build")
 
-    def test_a_cell_with_no_transform_is_an_error(self):
-        found = self.check(current_location_ref="cell-village")
-        self.assertEqual(len(found), 1)
-        self.assertEqual(found[0]["code"], "item_location_without_transform")
+    def test_a_location_with_no_transform_is_an_error(self):
+        found = self.check(default_location_ref="cell-village")
+        self.assertEqual([f["code"] for f in found],
+                         ["item_location_without_transform"])
         self.assertEqual(found[0]["cell_id"], "cell-village",
                          "the finding must name the cell it would have been in")
-        self.assertIn(found[0], errors(found))
 
-    def test_it_names_the_octopus_restriction_behind_the_common_cause(self):
-        """An author shipping a pre-placed sword hits Octopus's
-        save_layer_only on current_location_ref. The finding says so rather
-        than leaving them to work it out."""
-        found = self.check(world_transform={"position": [1.0, 0.0, 2.0]})
-        self.assertIn("save_layer_only", found[0]["detail"])
-        self.assertIn("place_item", found[0]["detail"])
-
-    def test_both_halves_present_is_clean(self):
-        self.assertEqual(self.check(world_transform={"position": [1, 0, 2]},
-                                    current_location_ref="cell-village"), [])
+    def test_a_content_placed_item_is_now_clean(self):
+        """The case that could not be expressed at all before Octopus D52."""
+        self.assertEqual(self.check(default_location_ref="cell-village",
+                                    world_transform={"position": [1, 0, 2]}), [])
 
     def test_neither_half_present_is_clean(self):
         """Not being in the world is the normal state of most items."""
         self.assertEqual(self.check(), [])
 
-    def test_both_codes_fail_a_build(self):
-        self.assertIn("item_transform_without_location", ERROR_CODES)
-        self.assertIn("item_location_without_transform", ERROR_CODES)
+    # -- the save-only field, still refused ----------------------------------
+    def test_current_location_ref_in_content_is_still_refused(self):
+        found = self.check(current_location_ref="cell-village",
+                           world_transform={"position": [1, 0, 2]})
+        self.assertEqual([f["code"] for f in found],
+                         ["item_current_location_in_content"])
+        self.assertIn(found[0], errors(found))
+
+    def test_the_message_names_the_restriction_and_now_the_remedy(self):
+        """It named `save_layer_only` before there was anything to suggest.
+        There is now, so it says that too."""
+        detail = self.check(current_location_ref="cell-village",
+                            world_transform={"position": [1, 0, 2]})[0]["detail"]
+        self.assertIn("save_layer_only", detail)
+        self.assertIn("default_location_ref", detail)
+
+    def test_the_save_field_still_satisfies_the_co_null_check(self):
+        """It is the wrong *layer*, not a missing location - so the item gets
+        one finding about the layer, not two about being half-placed."""
+        self.assertEqual(self.codes(current_location_ref="cell-village",
+                                    world_transform={"position": [1, 0, 2]}),
+                         ["item_current_location_in_content"])
+
+    # -- carried items -------------------------------------------------------
+    def test_a_world_transform_on_a_carried_item_is_an_error(self):
+        """Octopus has no inventory record type: "carried by X" is just an item
+        located at X. So a transform there means it is in a pack *and* lying on
+        the floor."""
+        found = self.check({"id": "npc-ada", "type": "Character"},
+                           default_location_ref="npc-ada",
+                           world_transform={"position": [1, 0, 2]})
+        self.assertEqual([f["code"] for f in found],
+                         ["item_placed_on_a_character"])
+        self.assertIn("npc-ada", found[0]["detail"])
+
+    def test_a_carried_item_with_no_transform_is_not_flagged_as_carried(self):
+        """That is just an item in somebody's pack, which is ordinary."""
+        self.assertNotIn("item_placed_on_a_character",
+                         self.codes({"id": "npc-ada", "type": "Character"},
+                                    default_location_ref="npc-ada"))
+
+    def test_all_four_codes_fail_a_build(self):
+        for code in ("item_transform_without_location",
+                     "item_location_without_transform",
+                     "item_current_location_in_content",
+                     "item_placed_on_a_character"):
+            self.assertIn(code, ERROR_CODES, code)

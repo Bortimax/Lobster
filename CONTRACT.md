@@ -238,51 +238,56 @@ destroy_op("keep-gatehouse", [13, 12])
 #  "values": [12, 13]}
 ```
 
-### `Item.world_transform` — and the co-null invariant
+### `Item.world_transform` — where a thing sits
 
 Scope §8 gives Lobster *"physically placing/removing an item's representation in
-the world"*. Where that representation sits is a field Lobster declares on
-Octopus's existing `Item` record, the same way it declares
-`Location.default_spawn_transform` and `Zone.shape`:
+the world"*. **Where an item is belongs to Octopus; whether it is *manifested*
+belongs here.**
 
-```
-Item (Octopus record, field declared by packages/lobster_geometry.json)
-  world_transform: REPLACE, {position:[x,y,z], rotation:[x,y,z,w]}
-                   in the coordinates of the cell named by current_location_ref
-```
+Placement is two Octopus fields (their D52), and Lobster adds a third:
 
-`REPLACE` because an item is in one place: two mods that both move the same
-sword must not average it. **Not** save-layer-only, mirroring `destroyed_chunks`
-(D3), so a content package may ship a sword already lying on a table.
+| field | layer | means |
+|---|---|---|
+| `default_location_ref` | content | where the item **starts** — mods compose here |
+| `current_location_ref` | save only | where the playthrough has **since put it**; wins when set |
+| `world_transform` | either | **where in that cell the representation sits** — declared by `packages/lobster_geometry.json`, `REPLACE` |
 
-> **Invariant — `world_transform` and `current_location_ref` are co-null.**
-> Either an item is in the world and has **both**, or it is not in the world and
-> has **neither**. There is no legal state in between.
+A location ref may name a Location *or* a Character: Octopus has no inventory
+record type, so *"carried by X"* is just an item located at X.
 
-Both halves are needed and neither is sufficient. `world_transform` is
-cell-local, so without a cell it names a position in no coordinate system at
-all. And Octopus's `StdLib.location_of` maps an Item to `current_location_ref`,
-so a location is the claim *"this is out in the world"* — without a transform
-that claim is true at no particular place. **In both directions the symptom is
-identical: the item silently never appears**, which is why the build step
-rejects both rather than leaving it to be discovered:
+> **Invariant.** An item is in the world when it has **a resolved location and a
+> `world_transform`**. With neither it is nowhere. With a location and no
+> transform it is in somebody's pack, or half-written — either way it has no
+> representation, and nothing draws, picks or labels it.
+
+**Never re-derive the fallback.** `current_location_ref or default_location_ref`
+is what `queries.item_location` is for, and Octopus D52 warns that a fourth call
+site "would have had to remember the fallback" — Lobster is that fourth site.
+Use `lobster.octopus_bridge.resolve_item_location`; a test fails the build if
+anything in `lobster/` reads the raw fields to work it out.
+
+Four things the build step rejects, all of which otherwise end in an item that
+silently never appears:
 
 | code | fires on |
 |---|---|
-| `item_transform_without_location` | a position in no cell |
-| `item_location_without_transform` | in the world at no particular place |
+| `item_transform_without_location` | a position in no cell's coordinates |
+| `item_location_without_transform` | somewhere, at no particular place |
+| `item_current_location_in_content` | content reaching for the save-only field — the message names `default_location_ref` as the remedy |
+| `item_placed_on_a_character` | carried *and* lying on the floor |
 
-**Lobster writes this field from exactly two places** — `CellManager.place_item`
-and `remove_item` — and both go through the ordinary Octopus write path, so it
-stays a normal record field with no special-casing anywhere. They maintain the
-co-null invariant by construction: placement sets both, removal clears both.
+**Lobster writes `world_transform` from exactly two places** —
+`CellManager.place_item` and `remove_item` — both through the ordinary Octopus
+write path, so it stays a normal record field that a mod, a console command or a
+save editor changes identically.
 
-**One known conflict, flagged rather than papered over.** Octopus declares
-`Item.current_location_ref` as `save_layer_only`, so a content package cannot
-legally supply the half that `world_transform` needs — a mod cannot yet ship a
-pre-placed item, and the lint says so by name when it tries. That is an Octopus
-decision to revisit, not something Lobster can fix from this side. See
-DECISIONS.md D33.
+`place_item` writes the transform first and the save-layer location second, so
+no reader ever sees a half-placed item as placed. **`remove_item` writes the
+transform only.** Clearing the location would fall back to the content default
+and put a mod-placed sword straight back on its table — and where the item
+*went* is not Lobster's to invent (L4). The caller records that.
+
+See DECISIONS.md D33 and D35.
 
 ### Damaging many structures at once
 

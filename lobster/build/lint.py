@@ -41,7 +41,7 @@ from __future__ import annotations
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Set
 
 from ..constants import ZONE_SHAPE_PRIMITIVES
-from ..octopus_bridge import octopus_lint
+from ..octopus_bridge import octopus_lint, resolve_item_location
 
 #: Findings that fail a build rather than warn.
 ERROR_CODES = frozenset({
@@ -59,6 +59,8 @@ ERROR_CODES = frozenset({
     "exterior_grid_malformed",
     "item_transform_without_location",
     "item_location_without_transform",
+    "item_current_location_in_content",
+    "item_placed_on_a_character",
 })
 
 #: Manifest keys that would bake record-owned data into the bundle.
@@ -108,51 +110,71 @@ def check_spawn_paths(view: Any) -> List[Dict[str, Any]]:
 
 
 def check_item_placements(view: Any) -> List[Dict[str, Any]]:
-    """`Item.world_transform` and `Item.current_location_ref` are co-null.
+    """Where an item starts, checked against how Octopus says placement works.
 
-    Either an item is in the world - it has **both** a cell and a position in
-    that cell's coordinates - or it is not in the world and has **neither**.
-    Anything else is an item Lobster cannot represent, and in both directions
-    the symptom is the same: it silently never appears.
+    Placement is two fields (Octopus D52): content authors
+    `default_location_ref`, the save owns `current_location_ref`, and the save
+    wins when set. Lobster adds `world_transform` for where in that cell it
+    sits, and `queries.item_location` resolves the pair.
 
-    Octopus settles the semantics. `StdLib.location_of` maps an Item to
-    `current_location_ref`, so a location *is* the claim "this is out in the
-    world"; and `world_transform` is cell-local, so a transform alone names a
-    position in no coordinate system at all - the same defect shape as a Zone
-    shape with no `shape_location_ref` (D14).
+    Four things go wrong, all of which otherwise end in an item that silently
+    never appears:
 
-    **This also surfaces an Octopus-side restriction that would otherwise be
-    silent.** `world_transform` is content-settable on purpose (D33, mirroring
-    D3's pre-ruined keep), but Octopus declares `current_location_ref` as
-    `save_layer_only`, so a content package cannot legally supply the other
-    half. An author shipping a sword on a table gets a finding naming exactly
-    that, instead of an item that resolves to nowhere.
+    1. **A transform with no location at all.** `world_transform` is cell-local,
+       so alone it names a position in no coordinate system - the same defect
+       shape as a Zone shape with no `shape_location_ref` (D14).
+    2. **A location with no transform.** The item claims to be somewhere and has
+       no representation to put there.
+    3. **`current_location_ref` set in a content package.** It is save-only, and
+       this lint runs on a content-only resolution (`content_view`), so seeing
+       it here means an author reached for the wrong half. Before Octopus D52
+       this was refused with no remedy to offer; now the message names one.
+    4. **A transform on an item held by a Character.** Octopus has no inventory
+       record type - *"carried by X is just an item located at X"* - so a
+       carried item with a world transform is both in a pack and lying on the
+       floor.
     """
     out: List[Dict[str, Any]] = []
     for item in view.records_of_type("Item"):
         has_transform = bool(item.get("world_transform"))
-        has_cell = bool(item.get("current_location_ref"))
-        if has_transform == has_cell:
-            continue
-        if has_transform:
+
+        if item.get("current_location_ref"):
+            out.append(finding(
+                "item_current_location_in_content",
+                "sets current_location_ref, which Octopus declares "
+                "save_layer_only - it is where a playthrough has since put the "
+                "item, not where content says it starts. Use "
+                "default_location_ref instead; mods compose there and the save "
+                "still wins at runtime (Octopus D52)",
+                record_id=item["id"]))
+
+        where = resolve_item_location(item)
+
+        if has_transform and not where:
             out.append(finding(
                 "item_transform_without_location",
-                "has a world_transform but no current_location_ref, so its "
-                "position is in no cell's coordinates and nothing can place "
-                "it. Note that Octopus declares current_location_ref "
-                "save_layer_only, so a content package cannot set it - a "
-                "pre-placed item must currently be placed at runtime through "
-                "place_item",
+                "has a world_transform but no default_location_ref, so its "
+                "position is in no cell's coordinates and nothing can place it",
                 record_id=item["id"]))
-        else:
+        elif where and not has_transform:
             out.append(finding(
                 "item_location_without_transform",
-                "has a current_location_ref but no world_transform, so it is "
-                "in the world at no particular place and will never be drawn, "
-                "picked or labelled. An item that is not in the world should "
-                "have neither field",
-                record_id=item["id"],
-                cell_id=item.get("current_location_ref")))
+                "has a location but no world_transform, so it is somewhere at "
+                "no particular place and will never be drawn, picked or "
+                "labelled. An item that is not in the world should have "
+                "neither field",
+                record_id=item["id"], cell_id=where))
+
+        if has_transform and where:
+            holder = view.record(where) if hasattr(view, "record") else None
+            if holder is not None and holder.get("type") == "Character":
+                out.append(finding(
+                    "item_placed_on_a_character",
+                    "is located at {0!r}, which is a Character - Octopus has "
+                    "no inventory record type, so that means carried - yet it "
+                    "also has a world_transform. A carried item has no "
+                    "representation lying on the floor".format(where),
+                    record_id=item["id"]))
     return out
 
 

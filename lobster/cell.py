@@ -614,8 +614,9 @@ class CellManager:
         exception.
         """
         from .items import ItemPlacer, PlacedItem
+        from .octopus_bridge import resolve_item_location
         record = view.record(item_id)
-        if not record or not record.get("current_location_ref")                 or not record.get("world_transform"):
+        if not record or not record.get("world_transform")                 or not resolve_item_location(record):
             return None
         placed = PlacedItem.from_record(record)
         writer = placer if placer is not None else ItemPlacer(

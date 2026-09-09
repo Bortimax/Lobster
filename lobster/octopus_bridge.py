@@ -125,28 +125,61 @@ class StructureIndex:
         return list(self.by_location.get(location_id, ()))
 
 
+def resolve_item_location(record: Dict[str, Any]) -> Optional[str]:
+    """Where an `Item` record is, per Octopus's own resolver.
+
+    Two fields: content's `default_location_ref` and the save's
+    `current_location_ref`, which wins when set (Octopus D52). This delegates
+    to `lce.queries.item_location` rather than re-deriving `current or
+    default`, which is exactly what D52 says that function exists to prevent -
+    it names three call sites that read the raw fields and observes that a
+    fourth "would have had to remember the fallback".
+
+    Exposed here because `lce` may only be imported by this module (§13), and
+    the build lint needs the same answer the runtime index does.
+    """
+    from lce.queries import item_location
+    # item_location(resolution, item) ignores the resolution when handed a
+    # record rather than an id, which is all this ever needs.
+    return item_location(None, record)
+
+
 def build_item_index(resolution: Resolution) -> StructureIndex:
-    """location_id -> `Item` records physically in it (Scope 8, D34).
+    """resolved location -> `Item` records physically there (Scope 8, D34/D35).
 
-    Identical machinery to `build_structure_index`, over `current_location_ref`
-    instead of `location_id`, and identical in status: pure derived data over a
-    `Resolution`, rebuilt when it changes, never persisted, never a source of
-    truth.
+    Identical machinery to `build_structure_index`, and identical in status:
+    pure derived data over a `Resolution`, rebuilt when it changes, never
+    persisted, never a source of truth.
 
-    **Only items that are actually in the world are indexed.** An `Item` with a
-    `current_location_ref` and no `world_transform` is half-placed - the state
-    CONTRACT §2 declares illegal and the build lint rejects - so it is skipped
-    here rather than yielding an item at no particular place. A save that
-    somehow contains one gets an item that does not appear, which is the same
-    outcome as before this index existed, rather than a crash mid-frame.
+    **Where an item is comes from Octopus, not from here.** Placement is two
+    fields - content's `default_location_ref` and the save's
+    `current_location_ref`, which wins when set (Octopus D52) - and
+    `queries.item_location` is the canonical resolver for that fallback.
+    Calling it rather than re-deriving `current or default` is the whole point
+    of it existing: D52 names three call sites that read the raw fields and
+    says a fourth "would have had to remember the fallback". Lobster is that
+    fourth site.
+
+    **The bucket key may be a Character, not a Location.** Octopus has no
+    inventory record type - *"carried by X is just an item located at X"* - so
+    a carried item buckets under its holder and `items_in_location(cell_id)`
+    never returns it. That falls out for free rather than needing a check.
+
+    **`world_transform` is the authority on whether an item is in the world.**
+    An item with a location and no transform is not manifested: it is in
+    somebody's pack, or it is the half-written state a crash left behind
+    (D34). Either way it has no representation to draw, pick or label, so it
+    is skipped here rather than yielding an item at no particular place.
     """
     buckets: Dict[str, List[Dict[str, Any]]] = {}
     scanned = 0
     for rec in resolution.by_type("Item"):
         scanned += 1
-        loc = rec.get("current_location_ref")
-        if isinstance(loc, str) and loc and rec.get("world_transform"):
-            buckets.setdefault(loc, []).append(rec)
+        if not rec.get("world_transform"):
+            continue
+        where = resolve_item_location(rec)
+        if isinstance(where, str) and where:
+            buckets.setdefault(where, []).append(rec)
     return StructureIndex(
         by_location={k: tuple(sorted(v, key=lambda r: r["id"]))
                      for k, v in buckets.items()},

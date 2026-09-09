@@ -131,12 +131,18 @@ class TestTheCoNullInvariant(ItemFixture):
         self.assertTrue(rec.get("world_transform"))
         self.assertEqual(rec.get("current_location_ref"), VILLAGE)
 
-    def test_removing_clears_both_halves(self):
+    def test_removing_clears_the_transform_and_nothing_else(self):
+        """The location is where the item *went*, and Lobster does not know.
+        Clearing it would also restore a mod-placed item to its default
+        (Octopus D52, DECISIONS.md D35)."""
         self.place()
         self.manager.remove_item(self.view(), SWORD)
         rec = self.record()
-        self.assertFalse(rec.get("world_transform"))
-        self.assertFalse(rec.get("current_location_ref"))
+        self.assertFalse(rec.get("world_transform"),
+                         "the representation must be gone")
+        self.assertEqual(rec.get("current_location_ref"), VILLAGE,
+                         "where it went is the caller's to record, not "
+                         "Lobster's to guess")
 
     def test_the_write_order_never_shows_a_half_placed_item_as_placed(self):
         """Octopus has no multi-field write, so the invariant is held by
@@ -149,8 +155,9 @@ class TestTheCoNullInvariant(ItemFixture):
                          "intermediate state is 'in no cell' rather than 'in a "
                          "cell at no place'")
         self.assertEqual([o["field"] for o in remove_ops(SWORD)],
-                         ["current_location_ref", "world_transform"],
-                         "removal drops out of the index first")
+                         ["world_transform"],
+                         "removal touches the transform only - the location is "
+                         "where the item went, which Lobster does not know")
 
     def test_the_ops_are_ordinary_octopus_patches(self):
         """`world_transform` stays a normal record field: a mod, a console
@@ -163,10 +170,10 @@ class TestTheCoNullInvariant(ItemFixture):
 
     def test_a_half_placed_record_is_refused_rather_than_guessed_at(self):
         for broken in ({"id": SWORD, "world_transform": {"position": [1, 0, 2]}},
-                       {"id": SWORD, "current_location_ref": VILLAGE}):
+                       {"id": SWORD, "default_location_ref": VILLAGE}):
             with self.assertRaises(ItemError) as ctx:
                 PlacedItem.from_record(broken)
-            self.assertIn("co-null", str(ctx.exception))
+            self.assertIn("not placed", str(ctx.exception))
 
     def test_the_index_skips_a_half_placed_item_rather_than_crashing(self):
         """A save that somehow contains one gets an item that does not appear,
@@ -243,3 +250,105 @@ class TestTheQuery(ItemFixture):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestContentPlacedItems(ItemFixture):
+    """The case that could not be expressed before Octopus D52 / D35.
+
+    `current_location_ref` was the only placement field and it was save-only,
+    so a mod could not ship a sword on a table at all. Lobster's lint named
+    that restriction rather than matching it silently, and Octopus added
+    `default_location_ref` in content. This is the round trip that opens up.
+    """
+
+    def ship_on_a_table(self, cell_id=VILLAGE, at=(3.0, 1.0, 4.0)):
+        """A content package placing an item, with no save layer involved."""
+        self.session.engine.write({"op": "CREATE", "record": {
+            "id": "item-heirloom", "type": "Item", "display_name": "Heirloom",
+            "default_location_ref": cell_id,
+            "world_transform": {"position": list(at),
+                                "rotation": [0.0, 0.0, 0.0, 1.0]}}})
+
+    def test_a_mod_placed_item_is_in_the_world_with_no_save_layer(self):
+        self.ship_on_a_table()
+        found = self.manager.items_in(self.view(), VILLAGE)
+        self.assertEqual([i.item_id for i in found], ["item-heirloom"])
+        self.assertEqual(found[0].position, (3.0, 1.0, 4.0))
+
+    def test_picking_it_up_does_not_restore_it_to_its_default(self):
+        """Clearing the location would fall back to `default_location_ref` and
+        put the sword straight back on the table. Removal clears only the
+        transform, which is why it works."""
+        self.ship_on_a_table()
+        self.manager.remove_item(self.view(), "item-heirloom")
+        self.assertEqual(self.manager.items_in(self.view(), VILLAGE), [])
+
+        record = self.session.resolution().get("item-heirloom")
+        self.assertEqual(record.get("default_location_ref"), VILLAGE,
+                         "content's placement is not Lobster's to erase")
+
+    def test_the_save_layer_wins_when_it_is_set(self):
+        """Octopus D52's whole point: mods compose on the content field, the
+        save owns the current one, and 'has the player moved this?' stays
+        answerable."""
+        self.ship_on_a_table()
+        self.manager.remove_item(self.view(), "item-heirloom")
+        self.manager.place_item(self.view(), "item-heirloom", FIELD,
+                                Transform(position=(9.0, 0.0, 9.0)))
+
+        self.assertEqual(self.manager.items_in(self.view(), VILLAGE), [])
+        self.assertEqual([i.item_id for i in
+                          self.manager.items_in(self.view(), FIELD)],
+                         ["item-heirloom"])
+        record = self.session.resolution().get("item-heirloom")
+        self.assertEqual(record.get("default_location_ref"), VILLAGE)
+        self.assertEqual(record.get("current_location_ref"), FIELD)
+
+    def test_a_carried_item_is_in_no_cell(self):
+        """Octopus has no inventory record type: carried by X is an item
+        located at X. So it buckets under the holder and no cell returns it."""
+        self.ship_on_a_table()
+        self.session.engine.write({"op": "PATCH", "id": "item-heirloom",
+                                   "field": "current_location_ref",
+                                   "value": "npc-ada"})
+        self.assertEqual(self.manager.items_in(self.view(), VILLAGE), [])
+        self.assertEqual(self.manager.items_in(self.view(), FIELD), [])
+
+    def test_nothing_in_lobster_re_derives_the_fallback(self):
+        """Octopus D52 names three call sites that read the raw fields and
+        warns that a fourth 'would have had to remember the fallback'. Lobster
+        is that fourth site, and it goes through `resolve_item_location`.
+
+        What is banned is **re-deriving the fallback**, which is what reading
+        `default_location_ref` outside the bridge always means: that field
+        exists only as the thing `current_location_ref` falls back to. Reading
+        `current_location_ref` *alone* is legitimate and the build lint does
+        it - `item_current_location_in_content` is a question about which
+        layer set a field, not about where the item ended up.
+        """
+        import os
+        import re
+        root = os.path.join(os.path.dirname(os.path.dirname(
+            os.path.abspath(__file__))), "lobster")
+        offenders = []
+        for base, _dirs, files in os.walk(root):
+            for name in sorted(files):
+                if not name.endswith(".py") or name == "octopus_bridge.py":
+                    continue
+                path = os.path.join(base, name)
+                with open(path, encoding="utf-8") as handle:
+                    body = handle.read()
+                code = "\n".join(
+                    line for line in body.splitlines()
+                    if not line.lstrip().startswith(("#", "*", ">")))
+                code = re.sub(r'""".*?"""', "", code, flags=re.S)
+                if 'get("default_location_ref")' in code:
+                    offenders.append(name + " (reads the fallback field)")
+                for line in code.splitlines():
+                    if 'get("current_location_ref")' in line and \
+                            "default_location_ref" in line:
+                        offenders.append(name + " (re-derives the fallback)")
+        self.assertEqual(offenders, [],
+                         "these re-derive Octopus's placement fallback instead "
+                         "of calling resolve_item_location: {0}".format(
+                             offenders))

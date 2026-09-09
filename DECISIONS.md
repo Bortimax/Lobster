@@ -1797,3 +1797,82 @@ position it cannot check against terrain, structures or the cell's extent.
 Removing something that is not in the world returns `None` rather than raising:
 two systems racing for the same sword is ordinary, and the loser should get a
 null.
+
+---
+
+## D35 — D33's open question, closed by Octopus (two-field placement)
+
+**Resolved upstream.** D33 recorded that `world_transform` was deliberately
+content-settable while Octopus's `current_location_ref` was `save_layer_only`,
+so a mod could not ship a sword on a table, and flagged it as an Octopus
+decision to revisit. Octopus revisited it (their D52) and added
+`default_location_ref` in the content layer, with `current_location_ref` still
+save-only and still winning when set.
+
+Their note back is worth keeping, because it is the argument for the whole
+habit:
+
+> **Lobster's lint was right to name the restriction.** Its message told an
+> author *why* placement was refused instead of silently matching the rule.
+
+A lint that had quietly matched the restriction would have taught every content
+author "items cannot be placed" as a fact about the engine. **D33's open
+question is closed.**
+
+### What changed here
+
+**1. The resolver, not the fields.** Octopus D52 introduces
+`queries.item_location` and observes that three call sites read the raw fields
+and a fourth "would have had to remember the fallback". Lobster is that fourth
+site, so `octopus_bridge.resolve_item_location` delegates to theirs and nothing
+in `lobster/` re-derives `current or default`.
+
+That was not a hypothetical. The first pass fixed `build_item_index` and left
+`PlacedItem.from_record` and `CellManager.remove_item` reading the raw field, and
+a mod-placed sword **raised instead of appearing**. A test now walks `lobster/`
+for raw reads of the fallback field and fails on any, so the fourth site cannot
+quietly become a fifth.
+
+**2. The lint permits content placement and still refuses the save field.**
+`item_current_location_in_content` fires when a content package sets
+`current_location_ref` - detectable because the build resolves through
+`content_view`, which has no save layer, so anything seen there came from
+content. The message keeps naming `save_layer_only` and **now names the remedy
+it had none for before**.
+
+**3. A new check falls out of Octopus's model.** *"Carried by X is just an item
+located at X"*, so an item whose location resolves to a Character has no
+business also having a `world_transform`: it would be in a pack and lying on the
+floor at once. `item_placed_on_a_character`.
+
+**4. `remove_item` was wrong, and this is a correction.** It cleared the
+location as well as the transform. Both halves of that were mistakes once
+Octopus's model was read properly:
+
+- **It cannot work.** Nulling `current_location_ref` falls back to
+  `default_location_ref`, so removing a mod-placed sword would *restore* it to
+  its table.
+- **It is not Lobster's to say.** The location field is where the item **went**,
+  and Lobster does not know whether that is a backpack, a chest or nowhere.
+  Writing it would be guessing, which is policy (L4).
+
+Removal now clears `world_transform` alone. That is sufficient - the index keys
+presence on the transform, so the representation leaves the world on that write
+whatever any location says - and it is honest about the limit of what Lobster
+knows. The caller records where it went.
+
+### The invariant, restated
+
+D33 called `world_transform` and `current_location_ref` co-null. With two
+placement fields the accurate statement is:
+
+> An item is in the world when it has **a resolved location and a
+> `world_transform`**. With neither it is nowhere. With a location and no
+> transform it is in somebody's pack, or half-written - either way it has no
+> representation.
+
+The co-null shape survives; what changed is that "location" now means the
+resolved answer rather than one field. The runtime index keys presence on the
+transform, which is why a save can legitimately hold "located, not manifested"
+while the *content* lint still rejects it - the lint is an authoring check, run
+on a content-only resolution.

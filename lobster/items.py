@@ -10,11 +10,13 @@ reach it" - all of that is Shrimp's and Octopus's (L4, L8). What Lobster owns is
 the fact that a sword is lying at a particular spot in a particular cell, and
 the two Events that say so.
 
-**Both fields move together.** CONTRACT §2 declares `Item.world_transform` and
-`Item.current_location_ref` co-null: an item is in the world with both, or out
-of it with neither. Octopus has no multi-field write, so this is maintained by
-*ordering* rather than by atomicity - see `place_ops`, where every intermediate
-state is "not in the world" and the location write is the commit point.
+**Where an item is comes from Octopus; whether it is *manifested* comes from
+here.** Placement is two fields - content's `default_location_ref` and the
+save's `current_location_ref`, which wins when set (Octopus D52) - and
+`world_transform` says where in that cell the representation sits. Placement
+writes the transform and then the save-layer location, so no reader sees a
+half-placed item as placed. Removal writes only the transform, because the
+location is where the item *went* and that is not Lobster's to invent.
 
 **Writes go down the ordinary Octopus path.** `world_transform` is a normal
 record field on a normal record, written with a normal `PATCH`, resolved by
@@ -70,18 +72,25 @@ class PlacedItem:
     def from_record(cls, record: Dict[str, Any]) -> "PlacedItem":
         """Build one from an `Item` that `items_in_location` returned.
 
-        That query already filters out half-placed items, so this asserts the
-        invariant rather than tolerating a breach: reaching here with a missing
-        half means something bypassed both the lint and the index.
+        Where it is comes from `resolve_item_location`, not from a raw field
+        read: placement is `current_location_ref` falling back to
+        `default_location_ref` (Octopus D52), and re-deriving that here is the
+        mistake D52 named in advance. The first version of this method did read
+        the raw field, and a mod-placed sword raised instead of appearing.
+
+        `items_in_location` already filters out unmanifested items, so this
+        asserts the invariant rather than tolerating a breach: reaching here
+        with a missing half means something bypassed both the lint and the
+        index.
         """
+        from .octopus_bridge import resolve_item_location
         transform = record.get(WORLD_TRANSFORM)
-        cell_id = record.get(LOCATION_REF)
+        cell_id = resolve_item_location(record)
         if not transform or not cell_id:
             raise ItemError(
-                "{0!r} is half-placed: world_transform={1!r}, "
-                "current_location_ref={2!r}. CONTRACT §2 declares these "
-                "co-null - both, or neither".format(
-                    record.get("id"), transform, cell_id))
+                "{0!r} is not placed: world_transform={1!r}, resolved "
+                "location={2!r}. An item in the world needs both (CONTRACT "
+                "section 2)".format(record.get("id"), transform, cell_id))
         return cls(item_id=record["id"], cell_id=cell_id,
                    transform=Transform.from_dict(transform),
                    model_ref=record.get("model_ref") or "")
@@ -115,8 +124,7 @@ def place_ops(item_id: str, cell_id: str,
     2. `current_location_ref` second. **This is the commit point** - the index
        keys on it, so the item arrives on this write and not before.
 
-    Removal runs the same argument backwards: clear the location first, and the
-    item is gone from the index before its transform is cleared.
+    Removal needs no such ordering: it is a single write (see `remove_ops`).
 
     A crash between the two leaves a half-placed record, which is precisely
     what `item_transform_without_location` exists to catch on the next build,
@@ -130,10 +138,26 @@ def place_ops(item_id: str, cell_id: str,
 
 
 def remove_ops(item_id: str) -> List[Dict[str, Any]]:
-    """Take it back out. Location first, so it leaves the index immediately."""
-    return [{"op": "PATCH", "id": item_id, "field": LOCATION_REF,
-             "value": None},
-            {"op": "PATCH", "id": item_id, "field": WORLD_TRANSFORM,
+    """Take the representation out of the world. **One field, deliberately.**
+
+    An earlier version cleared the location too, and that was wrong twice over
+    once Octopus's placement model was read properly (D52, D35):
+
+    1. **It cannot work.** `current_location_ref` falls back to content's
+       `default_location_ref` when unset, so nulling it does not remove a
+       mod-placed sword from its table - it restores it there.
+    2. **It is not Lobster's to say.** Octopus has no inventory record type:
+       *"carried by X is just an item located at X"*. So the location field is
+       where the item **went**, and Lobster does not know whether that is a
+       backpack, a chest or nowhere. Writing it would be guessing, which is
+       policy (L4).
+
+    Clearing `world_transform` alone is sufficient and honest: the index keys
+    presence on it, so the representation leaves the world on this write
+    whatever any location field says. The caller records where it went, if it
+    went anywhere.
+    """
+    return [{"op": "PATCH", "id": item_id, "field": WORLD_TRANSFORM,
              "value": None}]
 
 
@@ -175,11 +199,13 @@ class ItemPlacer:
 
     def remove(self, item_id: str, cell_id: str,
                transform: Transform) -> None:
-        """Take it back out, reporting where it was.
+        """Take the representation out of the world, reporting where it was.
 
         `on_item_removed` carries the cell and transform it *had*, not where it
         went: Lobster does not know whether it was picked up, destroyed or
-        teleported, and guessing would be policy.
+        teleported, and guessing would be policy. For the same reason this
+        clears only `world_transform` and leaves the location alone - see
+        `remove_ops`.
         """
         for op in remove_ops(item_id):
             self._write(op)
