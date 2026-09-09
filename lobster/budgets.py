@@ -30,7 +30,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field as dc_field
 from typing import Any, Dict, Iterable, List, Optional, Set
 
-from .constants import (
+from .constants import (MAX_ITEMS_PER_CELL,
+                        
     DEFAULT_MAX_ACTIVE_SKELETONS_PER_CELL, DEFAULT_MAX_CELL_BYTES,
     DEFAULT_MAX_MICRO_CHUNKS_PER_CELL, DEFAULT_MAX_STRUCTURE_VOXELS_PER_CELL,
     MAX_RESIDENT_CELLS, MAX_TRANSITION_PEAK_BYTES,
@@ -83,6 +84,7 @@ _BUDGET_FIELDS = (
     ("max_micro_chunks", DEFAULT_MAX_MICRO_CHUNKS_PER_CELL),
     ("max_active_skeletons", DEFAULT_MAX_ACTIVE_SKELETONS_PER_CELL),
     ("max_bytes", DEFAULT_MAX_CELL_BYTES),
+    ("max_items", MAX_ITEMS_PER_CELL),
 )
 
 
@@ -95,6 +97,7 @@ class Budget:
     max_micro_chunks: int = DEFAULT_MAX_MICRO_CHUNKS_PER_CELL
     max_active_skeletons: int = DEFAULT_MAX_ACTIVE_SKELETONS_PER_CELL
     max_bytes: int = DEFAULT_MAX_CELL_BYTES
+    max_items: int = MAX_ITEMS_PER_CELL
 
     @classmethod
     def declared(cls, cell_id: str,

@@ -18,7 +18,8 @@ from lobster.cell import CellManager
 from lobster.events import EventBus
 from lobster.geometry import Transform
 from lobster.octopus_bridge import OctopusBridge
-from lobster.selection import (ENTITY, PROP, STRUCTURE, TERRAIN, Selection,
+from lobster.selection import (ENTITY, ITEM, PROP, SELECTION_KINDS,
+                               STRUCTURE, TERRAIN, Selection,
                                SelectionError, Selector, raymarch_structure,
                                raymarch_terrain)
 from lobster.skeleton import Skeleton, humanoid_region_set
@@ -200,7 +201,7 @@ class TestWhatSelectionRefusesToDecide(SelectionFixture):
                                    "field": "limb_state.left_arm",
                                    "value": "severed"})
         found = self.selector().pick((2.0, 1.2, 2.0), NORTH, 40.0,
-                                     kinds=(ENTITY,), view=self.bridge.frame())
+                                     kinds=(ENTITY,), view=self.view)
         self.assertIsNotNone(found)
         self.assertNotEqual(found.region, "left_arm")
 
@@ -268,3 +269,105 @@ class TestRaymarchDirectly(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestPickingItems(SelectionFixture):
+    """Scope §8 step 3: items are a fifth selection kind (D33/D35).
+
+    Not a prop. `PropPlacement` has said so since it was written - *"anything
+    the player can pick up, open or be told about is an Octopus `Item` record
+    [...] it does not live here"* - and collapsing them would mean `target_id`
+    stopped being a record id a caller can resolve.
+    """
+
+    def drop(self, item_id="item-sword", cell=None, at=(6.0, 0.0, 6.0)):
+        """Place an item, then reopen the frame.
+
+        A `FrameView` holds the resolution it was opened on, so one taken
+        before a write cannot see it - which is the "never cached beyond the
+        current frame" rule working, not a fixture quirk.
+        """
+        cell_id = cell or VILLAGE
+        self.session.engine.write({"op": "CREATE", "record": {
+            "id": item_id, "type": "Item", "display_name": item_id}})
+        self.manager.session = self.session
+        placed = self.manager.place_item(self.view, item_id, cell_id,
+                                         Transform(position=at))
+        self.view = self.bridge.frame()
+        return placed
+
+    def take(self, item_id="item-sword"):
+        self.manager.remove_item(self.view, item_id)
+        self.view = self.bridge.frame()
+
+    def test_a_dropped_item_can_be_pointed_at(self):
+        self.drop()
+        found = self.selector().pick((6.0, 0.2, 2.0), NORTH, 20.0,
+                                     view=self.view)
+        self.assertEqual((found.kind, found.target_id), (ITEM, "item-sword"))
+        self.assertEqual(found.cell_id, VILLAGE)
+
+    def test_the_target_id_is_the_record_id(self):
+        """Which is the whole reason items are not props: you can resolve it."""
+        self.drop()
+        found = self.selector().pick((6.0, 0.2, 2.0), NORTH, 20.0,
+                                     kinds=(ITEM,), view=self.view)
+        self.assertIsNotNone(self.session.resolution().get(found.target_id))
+
+    def test_a_removed_item_is_no_longer_pickable(self):
+        """A pick has to agree with what is on screen."""
+        self.drop()
+        selector = self.selector()
+        self.assertIsNotNone(selector.pick((6.0, 0.2, 2.0), NORTH, 20.0,
+                                           kinds=(ITEM,), view=self.view))
+        self.take()
+        self.assertIsNone(self.selector().pick((6.0, 0.2, 2.0), NORTH, 20.0,
+                                               kinds=(ITEM,), view=self.view))
+
+    def test_items_need_a_view_because_they_are_not_baked(self):
+        """Unlike props, items live in records. A caller asking about baked
+        geometry alone gets no items rather than a crash."""
+        self.drop()
+        self.assertIsNone(self.selector().pick((6.0, 0.2, 2.0), NORTH, 20.0,
+                                               kinds=(ITEM,)))
+
+    def test_an_item_across_the_cell_boundary_is_pickable(self):
+        self.drop("item-bow", FIELD, (2.0, 0.0, 4.0))
+        found = self.selector().pick((2.0, 0.2, 100.0), NORTH, 60.0,
+                                     kinds=(ITEM,), view=self.view)
+        self.assertEqual((found.target_id, found.cell_id), ("item-bow", FIELD))
+        self.assertGreater(found.point[2], 128.0,
+                           "the point must come back in world space")
+
+    def test_nearest_still_wins_across_kinds(self):
+        self.drop(at=(2.0, 0.0, 5.0))
+        self.stand(self.village, "ada", (2.0, 0.0, 9.0))
+        found = self.selector().pick((2.0, 0.3, 2.0), NORTH, 40.0,
+                                     view=self.view)
+        self.assertEqual(found.target_id, "item-sword",
+                         "the sword at 3 m beats ada at 7 m - selection has no "
+                         "opinion about which matters (L4)")
+
+    def test_an_item_is_interactable_by_default(self):
+        """`interact` covers entities, structures, props and items - the four
+        things a player can point at that have an id worth reporting."""
+        self.drop()
+        bus = EventBus()
+        found = self.selector().interact(bus, (6.0, 0.2, 2.0), NORTH, 20.0,
+                                         view=self.view)
+        self.assertEqual(found.target_id, "item-sword")
+        self.assertEqual([e.to_dict() for e in bus.events_of("on_interact")],
+                         [{"event": "on_interact", "target_id": "item-sword"}])
+
+
+class TestTheKindSetGrewDeliberately(unittest.TestCase):
+
+    def test_there_are_five_kinds(self):
+        self.assertEqual(sorted(SELECTION_KINDS),
+                         ["entity", "item", "prop", "structure", "terrain"])
+
+    def test_items_and_props_are_separate_radii(self):
+        """Both are invented numbers - neither declares an extent - so keeping
+        them apart means tuning one never silently moves the other."""
+        from lobster.selection import ITEM_PICK_RADIUS_M, PROP_PICK_RADIUS_M
+        self.assertNotEqual(ITEM_PICK_RADIUS_M, PROP_PICK_RADIUS_M)

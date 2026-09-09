@@ -768,8 +768,8 @@ optional `view=` (see below).
 
 | `Selection` field | Meaning |
 |---|---|
-| `kind` | one of `"entity"`, `"structure"`, `"prop"`, `"terrain"` — the closed set `SELECTION_KINDS`; anything else raises `SelectionError` |
-| `target_id` | the entity, structure or prop id. For terrain it is the **cell id**, because a cell's ground has no other name |
+| `kind` | one of `"entity"`, `"structure"`, `"prop"`, `"item"`, `"terrain"` — the closed set `SELECTION_KINDS`; anything else raises `SelectionError` |
+| `target_id` | the entity, structure, prop or **`Item` record** id. For terrain it is the **cell id**, because a cell's ground has no other name |
 | `cell_id` | which resident cell the thing lives in |
 | `point` | where the ray met the surface, **world space** — already through the cell placement |
 | `normal` | surface normal at that point, world space. `(0, 0, 0)` where none was measured (props) |
@@ -778,6 +778,28 @@ optional `view=` (see below).
 | `region` | entities only — one of the rig's regions |
 
 `.to_dict()` is the wire form, same as an Event payload.
+
+### Items are not props
+
+A prop is decoration baked into the bundle with no gameplay identity. An item is
+an Octopus `Item` record, so `target_id` is something you can resolve — which is
+the whole reason they are separate kinds rather than one.
+
+Items need a `view`, because they live in records rather than in the bundle; a
+caller that passes none is asking about baked geometry and gets no items. Both
+`ITEM_PICK_RADIUS_M` and `PROP_PICK_RADIUS_M` are invented numbers — neither
+declares an extent — and they are kept separate so tuning one never silently
+moves the other.
+
+**A cell may hold `MAX_ITEMS_PER_CELL` placed items (26), and `place_item`
+refuses past it before writing anything.** That ceiling is derived, not chosen:
+a pick tests every item in every resident cell, so
+`SELECTION_PICK_BUDGET_US / (PER_PICKED_ITEM_US × MAX_RESIDENT_CELLS)`. It is
+low because item picking has **no broad phase** — items are not in the cell's
+`SpatialIndex`, since their positions live in records. If content needs hundreds
+of dropped items per cell the fix is to index them, not to raise the number:
+raising it moves the cost from a loud refusal at placement to a silent
+millisecond every frame. See DECISIONS.md D36.
 
 ### It is not hit-testing
 

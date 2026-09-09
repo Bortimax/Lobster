@@ -13,7 +13,10 @@ from __future__ import annotations
 
 import unittest
 
+from lobster.budgets import BudgetViolation
 from lobster.cell import CellError, CellManager
+from lobster.constants import (MAX_ITEMS_PER_CELL, MAX_RESIDENT_CELLS,
+                               PER_PICKED_ITEM_US, SELECTION_PICK_BUDGET_US)
 from lobster.events import EventBus
 from lobster.geometry import Transform
 from lobster.items import (ItemError, ItemPlacer, PlacedItem, place_ops,
@@ -352,3 +355,94 @@ class TestContentPlacedItems(ItemFixture):
                          "these re-derive Octopus's placement fallback instead "
                          "of calling resolve_item_location: {0}".format(
                              offenders))
+
+
+class TestTheItemCeiling(ItemFixture):
+    """A cell full of dropped loot must not silently blow the pick budget
+    (DECISIONS.md D36).
+
+    `Selector` tests every item in **every** resident cell on every pick, and
+    that scan has no broad phase: items live in records, not in the cell's
+    `SpatialIndex`. So the cost is linear and the ceiling is derived from it -
+    a declared pick slice, divided by the measured per-item cost and by the
+    resident-cell count, because the worst case is all of them full at once.
+    """
+
+    def make(self, item_id):
+        self.session.engine.write({"op": "CREATE", "record": {
+            "id": item_id, "type": "Item", "display_name": item_id}})
+
+    def fill(self, count, cell_id=VILLAGE):
+        for i in range(count):
+            item_id = "itm-%d" % i
+            self.make(item_id)
+            self.manager.place_item(self.view(), item_id, cell_id,
+                                    Transform(position=(float(i), 0.0, 0.0)))
+
+    def test_the_ceiling_is_derived_from_the_measured_cost(self):
+        self.assertEqual(
+            MAX_ITEMS_PER_CELL,
+            int(SELECTION_PICK_BUDGET_US
+                / (PER_PICKED_ITEM_US * MAX_RESIDENT_CELLS)),
+            "this number is derived, not chosen - if it is edited directly the "
+            "budget stops meaning anything (D20's method)")
+
+    def test_filling_a_cell_past_the_ceiling_is_refused_loudly(self):
+        self.fill(MAX_ITEMS_PER_CELL)
+        self.make("one-too-many")
+        with self.assertRaises(BudgetViolation) as ctx:
+            self.manager.place_item(self.view(), "one-too-many", VILLAGE,
+                                    Transform(position=(1.0, 0.0, 1.0)))
+        violation = ctx.exception
+        self.assertEqual(violation.metric, "max_items")
+        self.assertEqual(violation.cell_id, VILLAGE)
+        self.assertEqual(violation.record_id, "one-too-many")
+        self.assertIn("crosshair", str(violation),
+                      "the message must say what the ceiling protects")
+
+    def test_a_refusal_leaves_nothing_behind(self):
+        """Checked before the write, so there is no half-placed record to
+        clean up and no phantom `on_item_placed`."""
+        self.fill(MAX_ITEMS_PER_CELL)
+        self.make("one-too-many")
+        before = len(self.manager.items_in(self.view(), VILLAGE))
+        del self.bus.log[:]
+        with self.assertRaises(BudgetViolation):
+            self.manager.place_item(self.view(), "one-too-many", VILLAGE,
+                                    Transform(position=(1.0, 0.0, 1.0)))
+        self.assertEqual(len(self.manager.items_in(self.view(), VILLAGE)),
+                         before)
+        self.assertEqual(self.session.resolution().get("one-too-many")
+                         .get("world_transform"), None)
+        self.assertEqual([e for e in self.bus.log
+                          if e.name.startswith("on_item")], [])
+
+    def test_moving_an_item_already_here_is_not_a_new_one(self):
+        """Otherwise a full cell could never rearrange itself."""
+        self.fill(MAX_ITEMS_PER_CELL)
+        self.manager.place_item(self.view(), "itm-0", VILLAGE,
+                                Transform(position=(99.0, 0.0, 99.0)))
+        found = {i.item_id: i for i in self.manager.items_in(self.view(),
+                                                             VILLAGE)}
+        self.assertEqual(found["itm-0"].position, (99.0, 0.0, 99.0))
+        self.assertEqual(len(found), MAX_ITEMS_PER_CELL)
+
+    def test_the_ceiling_is_per_cell_not_per_world(self):
+        """L6: budgets are declared and enforced per cell."""
+        self.fill(MAX_ITEMS_PER_CELL)
+        self.make("elsewhere")
+        self.manager.place_item(self.view(), "elsewhere", FIELD,
+                                Transform(position=(1.0, 0.0, 1.0)))
+        self.assertEqual([i.item_id for i in
+                          self.manager.items_in(self.view(), FIELD)],
+                         ["elsewhere"])
+
+    def test_a_cell_may_declare_a_lower_ceiling_but_never_a_higher_one(self):
+        """The existing budget discipline, which items inherit for free."""
+        from lobster.budgets import Budget
+        self.assertEqual(
+            Budget.declared(VILLAGE, {"lobster_budget": {"max_items": 4}})
+            .max_items, 4)
+        with self.assertRaises(BudgetViolation):
+            Budget.declared(VILLAGE, {"lobster_budget": {
+                "max_items": MAX_ITEMS_PER_CELL + 1}})

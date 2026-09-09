@@ -1876,3 +1876,84 @@ resolved answer rather than one field. The runtime index keys presence on the
 transform, which is why a save can legitimately hold "located, not manifested"
 while the *content* lint still rejects it - the lint is an authoring check, run
 on a content-only resolution.
+
+---
+
+## D36 — `ITEM` is a fifth selection kind, and it is budgeted (Scope §8, step 3)
+
+**Approved by the project owner** as decisions 2 and 4 of the §8 proposal.
+
+### Not a prop
+
+`SELECTION_KINDS` was closed at four and pinned by a test, so a fifth is a
+contract change. It is the right one: `PropPlacement` has said so since it was
+written —
+
+> Anything the player can pick up, open or be told about is an Octopus `Item`
+> record placed through the ordinary path […] it does not live here.
+
+Collapsing them would erase a line the code already drew, and `target_id` would
+stop being a record id a caller can resolve. Items also need a `view`, because
+they live in records rather than in the bundle; a caller passing none is asking
+about baked geometry and correctly gets no items.
+
+### The budget, and the number it produced
+
+The owner's condition was explicit: *"Items must participate in the same
+selection cost accounting as props so a cell full of dropped loot cannot
+silently blow the per-frame pick budget."*
+
+Measured first, as always. 25 → 200 items in one cell, fitted on the slope:
+
+| | µs per item per pick |
+|---|---|
+| first implementation | **8.28** |
+| after the fix below | **4.15** |
+
+**Half of that cost was construction, not geometry.** `_items` called
+`placed_items`, which builds a `PlacedItem` — and a `Transform`, and a rotation
+quaternion — for *every* item in the cell, when the capsule test needs a
+position and nothing else. On a typical frame the ray misses all of them, so
+that was full construction cost paid entirely for misses. It now tests raw
+records and constructs nothing until something hits.
+
+That is D31's lesson applied again: **fix the cost before budgeting it**, or the
+budget enshrines the inefficiency.
+
+Then the ceiling, derived rather than chosen (D20's method):
+
+```
+MAX_ITEMS_PER_CELL = SELECTION_PICK_BUDGET_US
+                     / (PER_PICKED_ITEM_US * MAX_RESIDENT_CELLS)
+                   = 1000 / (4.2 * 9)
+                   = 26
+```
+
+`SELECTION_PICK_BUDGET_US = 1000` — about 6% of a 60 FPS frame for a
+once-per-frame crosshair question. Dividing by `MAX_RESIDENT_CELLS` is not
+pessimism: a pick tests every item in **every** resident cell, so the worst case
+is all nine full at once.
+
+### 26 is low, and that is the honest number
+
+Item picking has **no broad phase.** Entities are in the cell's `SpatialIndex`
+and get a grid walk; items are not, because their positions live in Octopus
+records rather than in a structure Lobster owns and keeps in sync.
+
+So the scan is linear, and the ceiling reflects it. **If content needs hundreds
+of dropped items per cell, the fix is to index them, not to raise this number** —
+raising it moves the cost from a loud refusal at placement time to a silent
+millisecond every frame, which is precisely the trade L6 exists to forbid. Logged
+as the remedy rather than done now: indexing items means keeping an index in step
+with records that anything may write, which is a real design question and not a
+tuning knob.
+
+### Enforcement
+
+`place_item` checks `max_items` **before** writing, so a refusal leaves no
+half-placed record and fires no phantom `on_item_placed`. Moving an item already
+in the cell is not a new item, or a full cell could never rearrange itself.
+
+The ceiling is per cell (L6), declarable in `lobster_budget`, and inherits the
+existing discipline for free: a cell may declare a **lower** ceiling than the
+shell default, never a higher one.

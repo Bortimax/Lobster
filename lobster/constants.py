@@ -191,6 +191,36 @@ MAX_BROAD_CANDIDATES_PER_FRAME = int(HIT_TEST_FRAME_BUDGET_US / PER_CANDIDATE_US
 MAX_CAPSULE_TESTS_PER_FRAME = int(HIT_TEST_FRAME_BUDGET_US / PER_CAPSULE_TEST_US)
 
 # ---------------------------------------------------------------------------
+# Item selection budget (Scope 8, DECISIONS.md D36)
+# ---------------------------------------------------------------------------
+
+#: What one `Selector.pick` may spend. A crosshair asks "what am I looking at"
+#: about once a frame, so this is ~6% of a 60 FPS frame for a once-per-frame
+#: question - generous, and it has to be, because the alternative is a ceiling
+#: so tight that content cannot drop loot at all.
+SELECTION_PICK_BUDGET_US = 1_000.0
+
+#: Marginal cost of one placed item in a resident cell, per pick. Measured:
+#: 25 to 200 items in one cell, fitted on the slope rather than the intercept.
+#: It was 8.3 us before `Selector._items` stopped building a `PlacedItem` (and
+#: a Transform, and a quaternion) for every item the ray misses.
+PER_PICKED_ITEM_US = 4.2
+
+#: Placed items one cell may hold.
+#:
+#: Derived, not chosen (D20's method): a pick tests every item in **every**
+#: resident cell, so the worst case is all of them at the ceiling at once.
+#:
+#: **This number is low, and it is honest about a linear scan.** Item picking
+#: has no broad phase - unlike entities, items are not in the cell's
+#: `SpatialIndex`, because their positions live in records rather than in a
+#: structure Lobster owns. If content needs hundreds of dropped items per cell,
+#: the fix is to index them, not to raise this: raising it would move the cost
+#: from a loud refusal at placement time to a silent 2 ms every frame.
+MAX_ITEMS_PER_CELL = int(SELECTION_PICK_BUDGET_US
+                         / (PER_PICKED_ITEM_US * MAX_RESIDENT_CELLS))
+
+# ---------------------------------------------------------------------------
 # Zone shape primitives - FROZEN (§4)
 # ---------------------------------------------------------------------------
 

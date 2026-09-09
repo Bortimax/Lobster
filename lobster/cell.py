@@ -592,6 +592,11 @@ class CellManager:
         against terrain, structures or the cell's own extent. Loud beats a
         sword resolving inside a hill.
 
+        Refuses a cell that is already at its `max_items` ceiling, **before**
+        writing anything, so a refusal leaves no half-placed record. Moving an
+        item that is already in this cell is not a new item and does not count
+        against it.
+
         `placer` is injectable so a caller may batch writes or supply its own
         session; by default one is built from this manager's own.
         """
@@ -600,6 +605,15 @@ class CellManager:
             raise CellError(
                 "cannot place {0!r} into {1!r}: that cell is not resident, so "
                 "its coordinates mean nothing here".format(item_id, cell_id))
+        cell = self.resident[cell_id]
+        already = [r["id"] for r in view.items_in_location(cell_id)]
+        if item_id not in already:
+            # Checked *before* the write, so a refusal leaves nothing behind.
+            cell.budget.check("max_items", len(already) + 1, record_id=item_id,
+                              detail="a pick tests every item in every "
+                                     "resident cell, so this is what keeps "
+                                     "the crosshair inside its slice "
+                                     "(DECISIONS.md D36)")
         writer = placer if placer is not None else ItemPlacer(
             self._session_for_writes(view), self.bus)
         return writer.place(item_id, cell_id, transform)
