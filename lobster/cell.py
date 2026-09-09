@@ -458,21 +458,84 @@ class CellManager:
         self.ledger.release(cell_id)
         self.bus.exit_cell(cell_id)
 
+    def is_continuous_move(self, view: Any, cell_id: str, *,
+                           from_location_id: Optional[str] = None) -> bool:
+        """Can the player get to `cell_id` from where they are without a jump?
+
+        True when the destination is already resident (they can see it) or an
+        authored connection leads there from the cell they are leaving (a door,
+        a path). False for fast travel, first-time dungeon entry, a scripted
+        relocation - anything Scope describes as *"an entry that did not come
+        through an authored connection"*.
+
+        Public because the answer is a fact about geometry residency that a
+        caller may want before it commits: it is exactly the question "does
+        this need a loading screen". Lobster reports it and decides nothing
+        about it (L4).
+        """
+        if cell_id in self.resident:
+            return True
+        origin = from_location_id or self.player_cell
+        if origin is None:
+            return False
+        return any(target == cell_id for target, _cost in view.connections(origin))
+
     def set_player_cell(self, view: Any, cell_id: str, *,
                         from_location_id: Optional[str] = None) -> ResidentCell:
-        """The player moved to `cell_id`. Load first, then unload.
+        """The player moved to `cell_id`. Load first, then unload - **if they
+        walked.** If they jumped, release first (Shrimp finding #6, D32).
 
-        Load-then-unload is the whole reason the transition has a peak worth
-        budgeting: for the length of this call the old and new residency sets
-        are both charged, and the ledger asserts the union fits. Unloading first
-        would hide the cost and drop the floor out from under anything still
-        standing in the old cell.
+        **A walk holds the union.** Adjacent cells are in each other's rings, so
+        for the length of this call both residency sets are charged and the
+        ledger asserts the union fits. That is the whole reason a transition has
+        a peak worth budgeting, and unloading first would hide the cost and drop
+        the floor out from under anything still standing in the old cell.
+
+        **A jump has no continuity to preserve**, and holding it is what broke.
+        Two exterior rings that share nothing sum to `2 x ring`, which for the
+        4-connected case is `2 x 5 = 10` against a ceiling of 9. That is
+        structural arithmetic, not a content mistake, and fast travel is a
+        documented first-class entry path (`default_spawn_transform` names it),
+        so the first player to use it hit a `BudgetViolation` naming a third
+        cell with nothing to do with either endpoint.
+
+        **The test for "jump" is that the destination is neither resident nor
+        connected to where the player is standing.** Residency alone is not
+        enough, and the first draft of this fix got it wrong: an interior is
+        never in an exterior's ring (D8), so "not resident" would classify
+        every walk through a keep door as a teleport and quietly delete the
+        transition peak that `MAX_TRANSITION_PEAK_BYTES` exists to bound. The
+        connection check restores it - a door is an authored edge, and walking
+        through one is continuous even though the room behind it was not
+        preloaded.
+
+        That leaves exactly the case Scope names: an entry that did not come
+        through an authored connection. Nothing is gained by holding the old
+        set across one - the player is not in it, and no geometry there needs
+        to survive the frame.
+
+        Cells in both sets are untouched either way: `load` is idempotent and
+        `unload` only takes cells outside `desired`, so a jump whose rings
+        happen to overlap keeps the overlap rather than churning it.
+
+        One observable consequence, since §13 fixes the Events but not their
+        order: across a jump `on_exit_cell` now precedes `on_enter_cell`. That
+        is the truer sequence for a teleport anyway - you leave, then you
+        arrive - and a walk is unchanged.
         """
         desired = self.desired_residency(view, cell_id)
+        walked = self.is_continuous_move(view, cell_id,
+                                         from_location_id=from_location_id)
+        doomed = [c for c in self.resident if c not in desired]
+
+        if not walked:
+            for cid in doomed:
+                self.unload(cid)
         for cid in desired:
             self.load(view, cid)
-        for cid in [c for c in self.resident if c not in desired]:
-            self.unload(cid)
+        if walked:
+            for cid in doomed:
+                self.unload(cid)
         self.player_cell = cell_id
         cell = self.resident[cell_id]
         if self.sink is not None:

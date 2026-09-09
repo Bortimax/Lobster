@@ -18,12 +18,14 @@ import unittest
 
 from lobster.budgets import (Budget, BudgetViolation, MemoryLedger,
                              POOL_STRUCTURES, POOL_TERRAIN)
-from lobster.cell import CellManager
+from lobster.cell import CellManager, residency_ring
 from lobster.constants import (DEFAULT_MAX_CELL_BYTES, MAX_RESIDENT_CELLS,
                                MAX_TRANSITION_PEAK_BYTES)
+from lobster.events import EventBus
 from lobster.octopus_bridge import OctopusBridge
-from tests.fixtures import (FIELD, GATEHOUSE, KEEP, VILLAGE, BundleWorkspace,
-                            build_session, plain_bundle, standard_workspace,
+from tests.fixtures import (FAR_CELL, FIELD, GATEHOUSE, HOME_CELL, KEEP,
+                            VILLAGE, BundleWorkspace, build_session,
+                            disjoint_world, plain_bundle, standard_workspace,
                             village_bundle)
 
 
@@ -220,3 +222,132 @@ class TestCellTransitionBudget(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestFastTravelBetweenDisjointRings(unittest.TestCase):
+    """Shrimp finding #6 (DECISIONS.md D32).
+
+    `set_player_cell` held the union of both residency sets across every move.
+    For a walk that is correct and budgeted. For a jump between two exterior
+    cells whose rings share nothing it is `2 x ring` - 10 against a ceiling of
+    9 - and the failure surfaced as a `BudgetViolation` naming a third cell
+    with nothing to do with either endpoint.
+    """
+
+    def setUp(self):
+        self.session, self.ws, self.ids = disjoint_world()
+        self.addCleanup(self.ws.close)
+        self.bridge = OctopusBridge(self.session)
+        self.manager = CellManager(self.ws.path)
+
+    def view(self):
+        return self.bridge.frame()
+
+    def test_the_two_rings_really_are_disjoint(self):
+        """Otherwise the rest of this class proves nothing."""
+        view = self.view()
+        home = set(residency_ring(view, HOME_CELL, ring=1))
+        far = set(residency_ring(view, FAR_CELL, ring=1))
+        self.assertEqual(len(home), 5)
+        self.assertEqual(len(far), 5)
+        self.assertEqual(home & far, set())
+        self.assertGreater(len(home | far), MAX_RESIDENT_CELLS,
+                           "the union must exceed the ceiling or there is "
+                           "nothing here to fix")
+
+    def test_fast_travel_stays_within_the_ceiling(self):
+        self.manager.set_player_cell(self.view(), HOME_CELL)
+        self.manager.set_player_cell(self.view(), FAR_CELL)
+
+        self.assertEqual(len(self.manager.resident), 5)
+        self.assertEqual(self.manager.player_cell, FAR_CELL)
+        peak = max(e["resident_cells"] for e in self.manager.ledger.history)
+        self.assertLessEqual(peak, MAX_RESIDENT_CELLS, "the jump held both rings")
+
+    def test_a_walk_still_holds_the_union(self):
+        """The fix must not buy fast travel by deleting the transition peak
+        that `MAX_TRANSITION_PEAK_BYTES` exists to bound."""
+        self.manager.set_player_cell(self.view(), HOME_CELL)
+        before = max(e["resident_cells"] for e in self.manager.ledger.history)
+        self.manager.set_player_cell(self.view(), "cell-home-2-1")
+        during = max(e["resident_cells"] for e in self.manager.ledger.history)
+        self.assertGreater(during, before,
+                           "stepping to a neighbour must still peak above "
+                           "either ring alone")
+
+    def test_a_jump_reports_exit_before_enter(self):
+        """§13 fixes the Events, not their order. Across a teleport the truer
+        sequence is leaving and then arriving, and that is now what happens."""
+        bus = EventBus()
+        manager = CellManager(self.ws.path, bus=bus)
+        manager.set_player_cell(self.view(), HOME_CELL)
+        del bus.log[:]
+        manager.set_player_cell(self.view(), FAR_CELL)
+
+        names = [e.name for e in bus.log]
+        self.assertIn("on_exit_cell", names)
+        self.assertIn("on_enter_cell", names)
+        self.assertLess(names.index("on_exit_cell"), names.index("on_enter_cell"))
+
+
+class TestWhatCountsAsAJump(unittest.TestCase):
+    """`is_continuous_move` is the whole rule, so it gets its own truth table.
+
+    The first version of this fix tested only "is the destination resident",
+    which classified every walk through a keep door as a teleport: an interior
+    is never in an exterior's ring (D8). The connection check is what makes a
+    door continuous.
+    """
+
+    def setUp(self):
+        self.session = build_session()
+        self.bridge = OctopusBridge(self.session)
+
+    def test_a_cell_already_resident_is_a_walk(self):
+        with standard_workspace() as ws:
+            manager = CellManager(ws.path)
+            manager.set_player_cell(self.bridge.frame(), VILLAGE)
+            self.assertIn(FIELD, manager.resident)
+            self.assertTrue(
+                manager.is_continuous_move(self.bridge.frame(), FIELD))
+
+    def test_an_unloaded_interior_behind_a_door_is_still_a_walk(self):
+        """The case the first draft got wrong."""
+        with standard_workspace() as ws:
+            manager = CellManager(ws.path)
+            manager.set_player_cell(self.bridge.frame(), VILLAGE)
+            self.assertNotIn(KEEP, manager.resident,
+                             "an interior is not preloaded (D8) - that is why "
+                             "residency alone is the wrong test")
+            self.assertTrue(
+                manager.is_continuous_move(self.bridge.frame(), KEEP),
+                "walking through a door is continuous even though the room "
+                "behind it was not resident")
+
+    def test_an_unconnected_unloaded_cell_is_a_jump(self):
+        session, ws, _ids = disjoint_world()
+        self.addCleanup(ws.close)
+        bridge = OctopusBridge(session)
+        manager = CellManager(ws.path)
+        manager.set_player_cell(bridge.frame(), HOME_CELL)
+        self.assertFalse(manager.is_continuous_move(bridge.frame(), FAR_CELL))
+
+    def test_the_first_move_of_a_session_is_a_jump(self):
+        with standard_workspace() as ws:
+            manager = CellManager(ws.path)
+            self.assertIsNone(manager.player_cell)
+            self.assertFalse(
+                manager.is_continuous_move(self.bridge.frame(), VILLAGE),
+                "nothing is resident, so there is nothing to preserve")
+
+    def test_an_explicit_origin_overrides_where_the_player_is(self):
+        """`from_location_id` is what the caller says it came through, and it
+        is more authoritative than the manager's own last position."""
+        with standard_workspace() as ws:
+            manager = CellManager(ws.path)
+            manager.set_player_cell(self.bridge.frame(), VILLAGE)
+            self.assertTrue(manager.is_continuous_move(
+                self.bridge.frame(), KEEP, from_location_id=VILLAGE))
+            self.assertFalse(manager.is_continuous_move(
+                self.bridge.frame(), KEEP, from_location_id=FIELD),
+                "no authored connection runs from the field into the keep")

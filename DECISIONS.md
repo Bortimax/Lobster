@@ -1589,3 +1589,81 @@ sampled range (ratios 1.02–1.13).
 calibrated on one counter mix is not valid on another. Optimising the thing the
 budget counts obliges you to re-derive the budget. Doing these two changes in
 one commit would have hidden that entirely.
+
+---
+
+## D32 — Fast travel releases before it loads (Shrimp finding #6)
+
+**Their ask, with the shape left to Lobster.** Reproduced first, on a purpose-built
+world of two 3×3 exterior clusters, because the standard fixture has two
+exterior cells and they are neighbours:
+
+```
+walked into cell-home-1-1: 5 resident
+fast travel to cell-far-1-1 FAILED:
+  cell 'cell-far-1-0': exceeds 'max_resident_cells': 10 > 9 (during charge)
+```
+
+The finding's sharpest observation is in that last line: the violation names
+`cell-far-1-0`, which has nothing to do with either endpoint. Whoever hit this
+first would have gone looking at the wrong cell.
+
+**The arithmetic is structural.** A 4-connected ring is 5 cells; two rings that
+share nothing sum to 10 against a ceiling of 9. Fast travel is a documented
+first-class entry path — `default_spawn_transform` is defined as *"where an
+entry that did not come through an authored connection arrives — fast travel,
+first-time dungeon entry"* — so this is not an exotic case.
+
+Shrimp offered two remedies and preferred the second: raise the ceiling to
+`2 × max_ring`, or skip the load-then-unload overlap on a discontinuous move.
+
+**Decision: the second.** Raising the ceiling would make it mean less — 9 was
+derived to bound a *walk*, and doubling it to accommodate a case that does not
+need the memory at all would stop it catching the case it was for. A jump has no
+continuity to preserve.
+
+### The ambiguity: what is a jump?
+
+Shrimp's rule was "the target is not already resident". **That is wrong, and the
+first version of this fix shipped it and broke a test that caught it
+immediately.**
+
+An interior is never in an exterior's ring (D8: only exteriors preload). So
+"not resident" classifies **every walk through a keep door** as a teleport, which
+silently deletes the transition peak that `MAX_TRANSITION_PEAK_BYTES` exists to
+bound — trading one budget defect for another, quieter one.
+
+The discriminator is not residency, it is the **authored connection**, and Scope
+names it in the definition of `default_spawn_transform` quoted above. A move is
+continuous when:
+
+1. the destination is already resident — you can see where you are going, or
+2. an authored connection runs there from where the player stands — a door, a
+   path, even into a room that was never preloaded.
+
+Everything else is an entry that did not come through a connection, which is
+exactly the set Scope calls fast travel and first-time dungeon entry.
+
+`is_continuous_move(view, cell_id, from_location_id=None)` is **public**, because
+the answer is a fact about residency a caller may want before it commits: it is
+the question "does this need a loading screen". Lobster reports it and decides
+nothing about it (L4). `from_location_id` overrides the manager's own last
+position, since a caller saying what it came through is more authoritative.
+
+### Consequences
+
+- Cells in both sets are untouched either way. `load` is idempotent and `unload`
+  only takes cells outside `desired`, so a jump whose rings happen to overlap
+  keeps the overlap rather than churning it.
+- **Across a jump, `on_exit_cell` now precedes `on_enter_cell`.** §13 fixes the
+  Events, not their order, and for a teleport this is the truer sequence anyway.
+  A walk is unchanged. Documented rather than left to be discovered.
+- Shrimp's `Scene.enter` workaround can go: the behaviour is in the layer that
+  owns residency.
+
+### Verified in both directions
+
+Mutation, because a rule with two branches needs both pinned. Forcing
+`walked = True` (the old behaviour) fails the two fast-travel tests; forcing
+`walked = False` fails the two transition-peak tests. Neither half can be
+deleted without the suite saying so.

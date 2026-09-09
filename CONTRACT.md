@@ -545,6 +545,39 @@ A cell declaring a *higher* ceiling than the shell default is itself a
 violation. `python -m lobster.cli budgets --cells DIR` prints declared versus
 actual per cell.
 
+### Walking holds both cells; jumping does not
+
+`set_player_cell` loads before unloading **when the move is continuous**, so a
+transition peaks at the union of both residency sets — that peak is the thing
+`MAX_TRANSITION_PEAK_BYTES` bounds, and unloading first would hide it.
+
+A move is continuous when the destination is already resident, or an authored
+connection leads there from where the player is standing. Walking to a
+neighbouring exterior cell is the first; walking through a keep door into an
+unloaded interior is the second.
+
+**Everything else is a jump** — fast travel, first-time dungeon entry, a
+scripted relocation — and there the old set is released *first*. Two exterior
+rings that share nothing sum to `2 × ring`, which for a 4-connected layout is
+10 against a ceiling of 9, so holding the union across a teleport failed with a
+`BudgetViolation` naming a third cell unrelated to either endpoint. Nothing is
+gained by holding it: the player is not in the old set and no geometry there
+needs to survive the frame.
+
+```python
+if not manager.is_continuous_move(view, target):
+    show_loading_screen()          # your call, not Lobster's
+manager.set_player_cell(view, target)
+```
+
+`is_continuous_move(view, cell_id, from_location_id=None)` is public because the
+answer is a fact about residency a caller may want *before* it commits — it is
+exactly the question "does this need a loading screen". Lobster reports it and
+decides nothing about it.
+
+Across a jump `on_exit_cell` precedes `on_enter_cell`; a walk is unchanged. §13
+fixes the Events, not their order. See DECISIONS.md D32.
+
 ### A cell's budget must leave room for its ring, not just for itself
 
 This is the one that bites. A transition holds the **union of both residency

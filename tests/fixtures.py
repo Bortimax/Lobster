@@ -501,3 +501,51 @@ def demo_manifest_cells(**extra_a: Any) -> List[Dict[str, Any]]:
     return [cell_a,
             {"location_id": "cell-b", "terrain_vox": "slab.vox",
              "terrain_side": 24}]
+
+
+# ---------------------------------------------------------------------------
+# Two disjoint exterior clusters - Shrimp finding #6 (DECISIONS.md D32)
+# ---------------------------------------------------------------------------
+#
+# A 4-connected ring is 5 cells, so two rings that share nothing sum to 10
+# against a ceiling of 9. The standard world cannot show this: it has two
+# exterior cells and they are neighbours.
+
+HOME_CELL = "cell-home-1-1"
+FAR_CELL = "cell-far-1-1"
+
+
+def disjoint_cluster_ops(clusters=(("home", 0, 0), ("far", 10, 10)), side=3):
+    """`side` x `side` patches of 4-connected exterior cells, far apart."""
+    ops, ids = [], []
+    for tag, ox, oz in clusters:
+        for gx in range(side):
+            for gz in range(side):
+                cid = "cell-%s-%d-%d" % (tag, gx, gz)
+                ids.append(cid)
+                links = []
+                for dx, dz in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+                    nx, nz = gx + dx, gz + dz
+                    if 0 <= nx < side and 0 <= nz < side:
+                        links.append({
+                            "target_location_id": "cell-%s-%d-%d" % (tag, nx, nz),
+                            "label": "path",
+                            "spawn_transform": spawn(64, 0, 64)})
+                ops.append(C(cid, "Location", display_name=cid,
+                             tags=["exterior"],
+                             exterior_grid=[ox + gx, oz + gz],
+                             connections=links,
+                             default_spawn_transform=spawn(64, 0, 64)))
+    return ops, ids
+
+
+def disjoint_world():
+    """A session and a workspace holding two clusters that share no ring."""
+    ops, ids = disjoint_cluster_ops()
+    session = build_session()
+    for op in ops:
+        session.engine.write(op)
+    ws = BundleWorkspace()
+    for cid in ids:
+        ws.write(plain_bundle(cid))
+    return session, ws, ids
