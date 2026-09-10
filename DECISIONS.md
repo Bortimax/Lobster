@@ -2306,3 +2306,146 @@ it is now the only thing between these kernels and a frame-rate difference.
 **L7 still holds.** Nothing outside `lobster/accel/` imports numpy, and a test
 walks the tree to keep it that way — the shell drags in no dependency even
 though one is installed and used.
+
+---
+
+## D41 — The refinement measured two different rays (found by differential testing)
+
+**Found by writing a second implementation**, which is the entire argument for
+D28 arriving as a concrete defect rather than a principle.
+
+`nearest_region` answered two questions about one ray and used a different reach
+for each:
+
+* **"Did it strike?"** went through `ray_capsule_hit`, which **normalises**
+  the direction internally. Reach = `max_distance` metres.
+* **"What was nearest?"** used `far = origin + direction * max_distance`, the
+  **raw** direction. Reach = `max_distance × |direction|` metres.
+
+For a unit direction these are the same point and nothing is wrong. For a
+direction of length 4, `precise` was judged over 20 metres and `region` over 80.
+
+**Every caller in the tree passes a unit vector**, which is exactly why nothing
+caught it: `Selector.pick` normalises, and the conformance generator normalised
+every direction it produced. The numpy kernel normalised once and used that
+reach for both - the consistent reading - and agreed with the reference on all
+2,000 generated cases. It took a hand-built case with a bone beyond the
+normalised reach and inside the raw one to separate them.
+
+**Decision: normalise once, in the kernel.** Both questions now measure the same
+ray. The reference is authoritative (D28), so the alternative was to replicate
+the inconsistency in every future implementation - which would have meant
+enshrining a bug as a contract.
+
+No committed vector moved, confirming the change touches only non-unit
+directions.
+
+**The generator now emits a non-unit direction in a quarter of cases**, because
+a blind spot that hides one bug hides a class of them. That is the second time
+this harness has had to grow: D28 recorded the first draft producing 35 empty
+results out of 40.
+
+---
+
+## D42 — The native kernel, built and tested twice before anyone runs it
+
+**The project owner's workflow, adopted**: write the source, build locally, run
+the differential suite locally, commit the source and not the binary, and let CI
+compile it from scratch on three platforms and run the same suite. That is two
+independent executions before a player sees it, and it dissolves D22's objection
+completely — the rule was never "no native code", it was "no code that has never
+executed".
+
+### C, not Rust — and no install was needed
+
+D40 recorded no compiler on this machine. That was true of `PATH` and false of
+the disk: **Visual Studio 2019 Build Tools and the Windows 10 SDK are installed**,
+and `setuptools` finds them by itself. A trivial extension compiled and imported
+on the first try, so the toolchain question answered itself with **zero
+installs**.
+
+Given that, plain C against the CPython API over Rust + PyO3:
+
+* **No build dependency at all.** Not cargo, not maturin, not Cython, not
+  pybind11. Any machine that can build a CPython extension can build this, and
+  the CI step is `python setup.py build_ext` with nothing before it.
+* **The surface is tiny and numeric** — a few hundred lines of `double`
+  arithmetic over fixed-size vectors, with no allocation beyond the result
+  list. That is the case where Rust's safety advantage is smallest and its
+  toolchain cost is largest.
+
+Rust remains a reasonable future choice and now needs only `rustup`. Nothing
+here is a judgement about the language.
+
+### What it is worth
+
+Measured per call against the reference, and then against a **warm**
+`SpatialIndex` because the seam's reference rebuilds one per call and that would
+have flattered the result:
+
+| | python (seam) | numpy | **native** | vs warm index |
+|---|---|---|---|---|
+| `segment_query`, 50 | 361 µs | 47 µs | **2.1 µs** | 107× |
+| `segment_query`, 1,000 | 3,351 µs | 350 µs | **42.6 µs** | 11× |
+| `segment_query`, 5,000 | 16,658 µs | 1,803 µs | **183 µs** | 7× |
+| `nearest_region`, 6 bones | 47 µs | 103 µs | **0.7 µs** | 64× |
+
+**C wins the case NumPy lost.** A six-bone refinement has no array to build, so
+the per-call overhead that made NumPy 2.2× *slower* than the reference simply is
+not there. `KERNEL_PREFERENCE` puts native first for both, keeps NumPy as the
+middle rung for the broad phase where it genuinely wins on a machine with no
+compiler, and **excludes it from the refinement** rather than leaving it in to
+lose.
+
+### Correctness, before speed
+
+**2,400 differential cases across six seeds, zero divergences**, plus the
+committed vectors and the degenerate shapes most likely to take a C kernel down:
+empty crowd, empty rig, zero-length ray, zero-length direction, and malformed
+payloads that must raise rather than crash.
+
+The C mirrors `lobster/geometry.py` branch for branch, deliberately. The
+reference is authoritative (D28), so a change here that is not a change there is
+a divergence waiting to be found. Two details that look cosmetic and are not are
+called out in the source: candidates sort by `(distance, entity_id)` and not by
+distance alone, and `nearest_region` breaks ties toward the **earlier** capsule
+because the reference compares with a strict `<`.
+
+Writing it also found D41, which was a real defect in the reference.
+
+### The binary is not committed
+
+`.gitignore` excludes `*.pyd`, `*.so`, `*.dylib` and `build/`. Only
+`lobster_accel.c` is in the repo, and every platform compiles its own. A
+committed binary would be a private build artefact nobody could reproduce — the
+same objection §5 invariant 1 makes about a private save format.
+
+`setup.py` **anchors itself to the repo root**, because `build_ext --inplace`
+resolves the package path against the current directory: run from anywhere else
+it dropped the binary where the loader would never look, and failed with a
+compiler error rather than saying so.
+
+### CI runs both paths — D26 condition (c), discharged
+
+`.github/workflows/ci.yml`:
+
+* a **pure-python job** that asserts NumPy is *absent*, runs the suite, runs
+  conformance, and asserts the selected accelerator is `python`. The
+  configuration L7 promises is now tested rather than assumed.
+* an **accelerated matrix** — Linux, Windows, macOS × 3.11, 3.12 — that compiles
+  the C from source, **asserts the kernel actually built** (without that check
+  the job would pass by silently falling back, which is the exact failure the
+  matrix exists to catch), then runs the suite and both differential
+  comparisons.
+
+D26 asked for three things. All three now hold: differential testing against a
+real alternative, a declared tolerance with a named authority, and CI running
+both paths.
+
+### Still not integrated
+
+The kernels sit behind the seam, proven and fast, and `HitTester` does not call
+them. D26 fixed the seam at **volley** granularity and `resolve_projectile` is
+still per-arrow; wiring a per-call kernel into it would buy the broad-phase win
+and hand back a chunk of it in dispatch. That path is the one remaining piece
+between these numbers and a frame rate.

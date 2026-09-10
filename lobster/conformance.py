@@ -283,12 +283,19 @@ def generate_cases(seed: int = 20260909, count: int = 80) -> List[Case]:
         origin = (stand[0] + rng.uniform(-1.0, 1.0), 1.2, stand[2] - 8.0)
         delta = tuple(target[k] - origin[k] for k in range(3))
         length = math.sqrt(sum(d * d for d in delta)) or 1.0
+        # Every fourth case gets a **non-unit** direction. Every generated case
+        # used to be normalised, and that blind spot hid a real divergence: the
+        # reference judged `precise` over a normalised reach and `region` over a
+        # scaled one, so a direction of length 4 measured two different rays
+        # (D41). Nothing in the tree passes a non-unit direction, which is
+        # exactly why nothing caught it.
+        scale_by = rng.choice([1.0, 1.0, 1.0, rng.uniform(0.25, 4.0)])
         cases.append(Case(
             case_id="reg-%03d-%s" % (i, aim), kernel=NEAREST_REGION,
             payload={"boxes": [[r, list(c.a), list(c.b), c.radius]
                                for r, c in boxes],
                      "origin": list(origin),
-                     "direction": [d / length for d in delta],
+                     "direction": [d / length * scale_by for d in delta],
                      "max_distance": 40.0}))
     return cases
 

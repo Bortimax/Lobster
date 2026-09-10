@@ -54,7 +54,7 @@ from .constants import (HIT_TEST_FRAME_BUDGET_US,
                         modelled_cost_us,
                         PROJECTILE_BROAD_RADIUS_M)
 from .events import EventBus
-from .geometry import (Capsule, Vec3, capsules_overlap, distance,
+from .geometry import (Capsule, Vec3, capsules_overlap, distance, normalize,
                        ray_capsule_hit, segment_segment_distance)
 from .octopus_bridge import HIT_TEST_ONLY
 from .skeleton import Skeleton
@@ -198,11 +198,20 @@ def nearest_region(boxes: Sequence[Tuple[str, Capsule]], origin: Vec3,
     """
     best_hit: Optional[Tuple[float, str]] = None
     best_near: Optional[Tuple[float, str]] = None
-    far = tuple(origin[i] + direction[i] * max_distance for i in range(3))
+    # Normalised once, so "did it strike" and "what was nearest" measure the
+    # same reach. They did not: `ray_capsule_hit` normalises internally while
+    # this line used the raw direction, so a caller passing a direction of
+    # length 4 got `precise` judged over `max_distance` metres and `region`
+    # judged over four times that. Both cannot be right, and the disagreement
+    # was invisible because every caller in the tree happens to pass a unit
+    # vector - found by differential-testing a second implementation, which is
+    # what D28 exists for (D41).
+    heading = normalize(direction)
+    far = tuple(origin[i] + heading[i] * max_distance for i in range(3))
     for region, capsule in boxes:
         centre = tuple((capsule.a[i] + capsule.b[i]) * 0.5 for i in range(3))
         along = distance(origin, centre)
-        if ray_capsule_hit(origin, direction, capsule, max_distance):
+        if ray_capsule_hit(origin, heading, capsule, max_distance):
             if best_hit is None or along < best_hit[0]:
                 best_hit = (along, region)
         gap = segment_segment_distance(origin, far, capsule.a, capsule.b)
@@ -646,7 +655,6 @@ class WorldHitTester:
         decided after every cell has answered, not by taking whichever cell was
         asked first, or a shot would hit the far bandit through the near one.
         """
-        from .geometry import normalize
         heading = normalize(direction)
         if heading == (0.0, 0.0, 0.0):
             raise HitTestError("a projectile needs a direction")

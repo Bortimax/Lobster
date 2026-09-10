@@ -16,7 +16,15 @@ from lobster.conformance import (AUTHORITY, NEAREST_REGION, SEAM_KERNELS,
 
 
 def numpy_present() -> bool:
-    return any(i["name"] == "numpy" and i["available"] for i in available())
+    return _present("numpy")
+
+
+def native_present() -> bool:
+    return _present("native")
+
+
+def _present(name: str) -> bool:
+    return any(i["name"] == name and i["available"] for i in available())
 
 
 class TestTheRegistry(unittest.TestCase):
@@ -45,19 +53,101 @@ class TestTheRegistry(unittest.TestCase):
         """Not one switch. Measurement put numpy on one side of the seam and
         the reference on the other (D40)."""
         self.assertEqual(sorted(KERNEL_PREFERENCE), sorted(SEAM_KERNELS))
-        self.assertEqual(KERNEL_PREFERENCE[NEAREST_REGION], ("python",),
-                         "numpy is 2.3x slower over six bones; using it there "
-                         "would make the seam a loss")
+        self.assertNotIn("numpy", KERNEL_PREFERENCE[NEAREST_REGION],
+                         "numpy is 2.2x slower than the reference over six "
+                         "bones; leaving it in would make the seam a loss")
         self.assertIn("numpy", KERNEL_PREFERENCE[SEGMENT_QUERY])
+        for kernel, order in KERNEL_PREFERENCE.items():
+            self.assertEqual(order[-1], "python",
+                             "{0}: the reference must be the floor".format(kernel))
+            self.assertEqual(order[0], "native",
+                             "{0}: C wins both, measured".format(kernel))
 
     def test_the_composed_name_does_not_overclaim(self):
-        """Calling the mix "numpy" would be a lie when half of it is the
+        """Calling the mix "native" would be a lie when half of it is the
         reference, and somebody reading a log would draw the wrong conclusion."""
         name, _kernels = select()
-        if numpy_present():
+        parts = set(name.split("+"))
+        for impl in parts:
+            self.assertTrue(_present(impl),
+                            "{0} named but not available".format(impl))
+        if native_present():
+            self.assertEqual(name, "native")
+        elif numpy_present():
             self.assertEqual(name, "numpy+python")
         else:
             self.assertEqual(name, "python")
+
+
+@unittest.skipUnless(native_present(), "the C extension is not built here")
+class TestTheNativeKernelAgrees(unittest.TestCase):
+    """D26 conditions (a) and (c), with a real native module behind them.
+
+    Built locally, differentially tested locally, and built again from source
+    in CI on three platforms - which is two independent executions before a
+    player sees it, and the opposite of D22's failure mode.
+    """
+
+    def kernels(self):
+        return select("native")[1]
+
+    def test_it_agrees_on_the_committed_vectors(self):
+        cases = generate_cases()
+        self.assertEqual(
+            compare(cases, run(cases), run(cases, impl=self.kernels())), [])
+
+    def test_it_agrees_across_many_seeds(self):
+        kernels = self.kernels()
+        for seed in (1, 7, 20260909, 424242, 99991, 2024):
+            cases = generate_cases(seed=seed, count=200)
+            divergences = compare(cases, run(cases), run(cases, impl=kernels))
+            self.assertEqual(divergences, [],
+                             "seed {0}: {1}".format(seed, divergences[:3]))
+
+    def test_it_matches_the_tie_break_by_entity_id(self):
+        """Sorting by distance alone passes most cases and reorders ties."""
+        from lobster.conformance import REFERENCE
+        from lobster.tiers import ACTIVE
+        payload = {"entries": [["b", [1.0, 0.0, 0.0], ACTIVE],
+                               ["a", [1.0, 0.0, 0.0], ACTIVE]],
+                   "start": [0.0, 0.0, 0.0], "end": [0.0, 0.0, 4.0],
+                   "radius": 2.0, "cell_size_m": 2.5, "tiers": None}
+        self.assertEqual(self.kernels()[SEGMENT_QUERY](payload),
+                         REFERENCE[SEGMENT_QUERY](payload))
+
+    def test_it_survives_the_degenerate_inputs(self):
+        """Empty crowd, empty rig, zero-length ray, zero-length direction -
+        the four shapes most likely to segfault a C kernel."""
+        from lobster.conformance import REFERENCE
+        payloads = [
+            (SEGMENT_QUERY, {"entries": [], "start": [0.0, 0.0, 0.0],
+                             "end": [1.0, 0.0, 0.0], "radius": 1.0,
+                             "cell_size_m": 2.5, "tiers": None}),
+            (SEGMENT_QUERY, {"entries": [["a", [0.0, 0.0, 0.0], "ACTIVE"]],
+                             "start": [0.0, 0.0, 0.0], "end": [0.0, 0.0, 0.0],
+                             "radius": 1.0, "cell_size_m": 2.5,
+                             "tiers": None}),
+            (NEAREST_REGION, {"boxes": [], "origin": [0.0, 0.0, 0.0],
+                              "direction": [0.0, 0.0, 1.0],
+                              "max_distance": 10.0}),
+            (NEAREST_REGION, {"boxes": [["head", [0.0, 1.0, 0.0],
+                                         [0.0, 1.0, 0.0], 0.1]],
+                              "origin": [0.0, 0.0, 0.0],
+                              "direction": [0.0, 0.0, 0.0],
+                              "max_distance": 10.0}),
+        ]
+        for kernel, payload in payloads:
+            self.assertEqual(self.kernels()[kernel](payload),
+                             REFERENCE[kernel](payload), payload)
+
+    def test_a_bad_payload_raises_rather_than_crashing(self):
+        for payload in ({"entries": "not a list"},
+                        {"boxes": [["head", [0.0], [0.0], 0.1]],
+                         "origin": [0.0, 0.0, 0.0],
+                         "direction": [0.0, 0.0, 1.0], "max_distance": 1.0}):
+            with self.assertRaises(Exception):
+                for kernel in self.kernels().values():
+                    kernel(payload)
 
 
 @unittest.skipUnless(numpy_present(), "numpy is not installed here")

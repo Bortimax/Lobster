@@ -37,14 +37,30 @@ truth about semantics, but editing it does not change what executes. Both paths
 are held to the same answers by differential tests, with a declared float
 tolerance and a named authority where they differ. See DECISIONS.md D26.
 
-**The arithmetic accelerator exists; the GPU backend does not.**
-`lobster/accel/` holds NumPy kernels for the broad phase, proven against the
-reference by 2,000 differential cases and **7–9.5× faster**. They are not yet
-wired into `HitTester`, because D26 fixed the seam at *volley* granularity and
-the per-arrow path would pay the speed back in dispatch — the refinement kernel
-measured 2.3× *slower* at six bones, which is that same argument one level down.
-So selection is per kernel (`accel.KERNEL_PREFERENCE`) and reports itself as
-`numpy+python` rather than overclaiming.
+**The arithmetic accelerator exists in two forms; the GPU backend does not.**
+`lobster/accel/` holds a **C extension** and NumPy kernels for the seam's two
+operations, both proven against the reference by thousands of differential cases:
+
+| kernel | numpy | native (C) |
+|---|---|---|
+| `segment_query`, 1,000 entities | 9.6× | **79×** (7–107× against a warm index) |
+| `nearest_region`, 6 bones | *0.46×* | **64×** |
+
+NumPy **loses** the refinement — six bones cannot pay for six array
+constructions — so selection is **per kernel** (`accel.KERNEL_PREFERENCE`), C
+first, NumPy only where it wins, the reference always the floor. `select()`
+names what it actually composed rather than overclaiming.
+
+**The C source is committed; the binary is not.** Build it with
+`python lobster/accel/native/setup.py build_ext --inplace` (a C compiler and
+nothing else — no cargo, no Cython, no maturin). Without it the chain drops to
+NumPy, then to pure Python, and the whole suite still passes. CI compiles it
+from source on Linux, Windows and macOS and runs the same differential suite,
+plus a job with no accelerator at all to keep the pure path honest.
+
+They are still **not wired into `HitTester`**: D26 fixed the seam at *volley*
+granularity, and that path is the remaining work between these kernels and a
+frame-rate difference.
 
 The GPU backend (D22/D29) still names its chosen answer and reports itself
 unimplemented rather than pretending. Today the runtime path is pure Python

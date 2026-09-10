@@ -22,8 +22,9 @@ import unittest
 from lobster.conformance import (AUTHORITY, DISTANCE_TOLERANCE_M,
                                  NEAREST_REGION, SEAM_KERNELS, SEGMENT_QUERY,
                                  Case, ConformanceError, build_vectors,
-                                 compare, dump_vectors, generate_cases,
-                                 load_vectors, run)
+                                 _region_is_ambiguous, compare,
+                                 dump_vectors, generate_cases, load_vectors,
+                                 run)
 from lobster.spatial import SpatialIndex
 from lobster.tiers import ACTIVE, PROJECTILE
 
@@ -97,8 +98,11 @@ class TestTheHarnessCanFail(ConformanceFixture):
 
     def test_a_changed_region_is_caught(self):
         def resolved(case, r):
-            return case.kernel == NEAREST_REGION and r["region"] not in (
-                None, "head")
+            # Must be unambiguous, or the comparator is *right* to allow the
+            # change and this test would be asserting the opposite of the rule.
+            return (case.kernel == NEAREST_REGION
+                    and r["region"] not in (None, "head")
+                    and not _region_is_ambiguous(case.payload))
 
         def rename(r, c):
             r["region"] = "head"
@@ -109,7 +113,8 @@ class TestTheHarnessCanFail(ConformanceFixture):
 
     def test_a_flipped_precise_flag_is_caught(self):
         def resolved(case, r):
-            return case.kernel == NEAREST_REGION and r["region"] is not None
+            return (case.kernel == NEAREST_REGION and r["region"] is not None
+                    and not _region_is_ambiguous(case.payload))
 
         def flip(r, c):
             r["precise"] = not r["precise"]

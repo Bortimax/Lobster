@@ -51,27 +51,49 @@ def _numpy_kernels() -> Optional[Dict[str, Callable]]:
     return numpy_kernels.kernels()
 
 
+def _native_kernels():
+    """The C extension, if it has been built for this interpreter.
+
+    Not committed as a binary and not built automatically: a machine that has
+    not run `setup.py build_ext` simply does not have it, and the chain drops
+    to the next implementation without drama (D42).
+    """
+    try:
+        from .native import lobster_accel
+    except Exception:
+        return None
+    from ..conformance import NEAREST_REGION, SEGMENT_QUERY
+    return {SEGMENT_QUERY: lobster_accel.segment_query,
+            NEAREST_REGION: lobster_accel.nearest_region}
+
+
 register("python", _python_kernels)
 register("numpy", _numpy_kernels)
+register("native", _native_kernels)
 
 #: Preference order for `select()`. Python is the floor and never fails.
-PREFERENCE: Tuple[str, ...] = ("numpy", "python")
+PREFERENCE: Tuple[str, ...] = ("native", "numpy", "python")
 
-#: **Per kernel, because measurement said so** (D40).
+#: **Per kernel, because measurement said so** (D40, D42).
 #:
-#: The seam is not one switch. NumPy wins `segment_query` 7-9.5x at every size
-#: from 10 entities to 5,000, because a broad phase is a long array of the same
-#: operation. It *loses* `nearest_region` by 2.3x, because a rig has six bones
-#: and building six arrays costs more than looping over six capsules.
+#: The seam is not one switch. Measured per call, against the reference:
 #:
-#: That is D26's own argument about seam granularity, arriving one level down
-#: than expected: a per-call kernel over six items is too fine, exactly as a
-#: per-`dot()` kernel would have been. `nearest_region` would pay off batched
-#: across many targets at once - which is the volley shape D26 specified and
-#: which is not built. Until it is, the reference wins this one on merit.
+#: | kernel | numpy | native (C) |
+#: |---|---|---|
+#: | `segment_query`, 1,000 entities | 9.6x | **79x** |
+#: | `nearest_region`, 6 bones | **0.46x** | **64x** |
+#:
+#: NumPy *loses* the refinement, because a rig has six bones and building six
+#: arrays costs more than looping over six capsules - D26's seam-granularity
+#: argument arriving one level down than it was aimed. C has no per-call array
+#: to build and wins both.
+#:
+#: So numpy stays as the middle rung for the broad phase, where it is a real
+#: win on a machine with no compiler, and is **excluded from the refinement**
+#: rather than left in to be slower than the reference.
 KERNEL_PREFERENCE: Dict[str, Tuple[str, ...]] = {
-    "segment_query": ("numpy", "python"),
-    "nearest_region": ("python",),
+    "segment_query": ("native", "numpy", "python"),
+    "nearest_region": ("native", "python"),
 }
 
 

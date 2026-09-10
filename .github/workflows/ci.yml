@@ -1,0 +1,72 @@
+# Lobster CI.
+#
+# The point of the matrix is D26 condition (c): **CI runs both paths.** A
+# native kernel that only ever ran on its author's machine is the D22 failure
+# mode wearing a hat, so every platform compiles the C source itself and puts
+# it through the same differential suite the author ran locally.
+#
+# The binary is never committed. Only `lobster/accel/native/lobster_accel.c` is
+# in the repo, and each runner builds its own.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  pure-python:
+    # The floor. No compiler, no numpy, no accelerator of any kind - the
+    # configuration L7 promises still works, asserted rather than assumed.
+    name: pure python (no accelerator)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Confirm nothing is installed
+        run: |
+          python -c "import importlib.util as u; assert u.find_spec('numpy') is None, 'numpy must be absent in this job'"
+      - name: Suite
+        run: python -m unittest discover -s tests -t .
+      - name: Conformance against the committed vectors
+        run: python -m lobster.cli conformance
+      - name: The chosen accelerator must be the reference
+        run: |
+          python -c "from lobster.accel import select; n,_=select(); assert n=='python', n; print('accelerator:', n)"
+
+  accelerated:
+    name: ${{ matrix.os }} · py${{ matrix.python }} · native + numpy
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        python: ["3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Build deps
+        run: python -m pip install --upgrade pip setuptools numpy
+      - name: Compile the native kernel from source
+        run: python lobster/accel/native/setup.py build_ext --inplace
+        working-directory: ${{ github.workspace }}
+      - name: Report what is live
+        run: |
+          python -c "from lobster.accel import available, select; [print(a) for a in available()]; print('selected:', select()[0])"
+      - name: The native kernel must actually have built
+        # Without this the job would pass by silently falling back, which is
+        # exactly the failure this matrix exists to catch.
+        run: |
+          python -c "from lobster.accel import available; assert any(a['name']=='native' and a['available'] for a in available()), 'native kernel did not build'"
+      - name: Suite
+        run: python -m unittest discover -s tests -t .
+      - name: Differential - native vs the reference
+        run: python -m lobster.cli conformance --impl native
+      - name: Differential - numpy vs the reference
+        run: python -m lobster.cli conformance --impl numpy

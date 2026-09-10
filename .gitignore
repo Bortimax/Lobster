@@ -2,3 +2,13 @@ __pycache__/
 *.pyc
 cells/
 *.lobster_cell
+
+# Native accelerator: the source is committed, the binary is not (D42).
+# Every platform builds and differentially tests its own.
+*.pyd
+*.so
+*.dylib
+*.o
+*.obj
+build/
+*.egg-info/
