@@ -3299,3 +3299,132 @@ the *arithmetic* of the derivation - which was correct - rather than the
 There is now a test for the property itself: nine exterior cells at their
 ceiling, everything on screen, still inside the frame budget. It fails under
 either defect. Thirteen mutants, thirteen caught.
+
+---
+
+## D53 — The third kernel, and what was actually left after it
+
+The project owner asked for it, having been told the lever on the placement
+ceiling was the 12.8 us unit rather than the constant. Two things in this
+conversation had been called "the third kernel" - the pose-to-capsule one on the
+backlog (D45) and this one - and the one that was asked for is the one the
+sentence before the question named. Pose-to-capsules stays on the backlog.
+
+### The seam, and why it goes where it does
+
+`place_batch(payload)` culls one cell's placements against the camera and packs
+the instance data for the survivors, **in the same call**.
+
+One call per resident cell per model per frame. That granularity is D26's
+argument for the third time: the intermediate between culling and packing - a
+world transform, a frustum verdict, a 4x4 - never crosses the boundary, because
+crossing it per placement *is* the cost. And returning both answers together is
+not a convenience: the culler has the world transform and the sampled light in
+registers at the moment it decides the thing is visible, so handing them back
+would mean computing them twice.
+
+**The input rows are built once per residency, not per frame.** A prop does not
+move. Rebuilding a flat array of them every frame would be per-placement Python
+work in front of a kernel whose whole purpose is removing per-placement Python
+work - the same trap one level up, and the same answer `upload_cell` gives.
+
+Items are the exception and are rebuilt each frame: they are records that can be
+dropped or picked up mid-residency, so caching them needs an invalidation story.
+Reading seven floats out of a dict is a fraction of what the kernel removes, so
+it is still most of the win. Measure before caching that.
+
+### Harness first, again
+
+`lobster/conformance.py` gained the kernel, the reference, 34 generated cases
+and a comparator **before** a line of C was written - the order D26/D28 fixed,
+and for the reason that entry gives: a native implementer gets a target to hit
+rather than a description to interpret.
+
+The reference calls the real `Camera.sees_sphere`, the real `Transform.compose`
+and the real `geometry.matrix4`/`pack_matrix4`. Getting the last of those meant
+**moving them out of `gl_backend` into `geometry`**, where a `Transform` as a
+4x4 belongs anyway - the alternative was a reference that kept its own copy of
+the maths it is the reference for, which is exactly the drift
+`reference_segment_query` avoids by calling `SpatialIndex.query_segment` itself.
+
+Two declarations the existing kernels did not need:
+
+* **`UNIT_TOLERANCE`**, separate from `DISTANCE_TOLERANCE_M`. Comparing a
+  direction cosine against a metre tolerance is a category error that happens
+  to work while the numbers are near 1.
+* **A bytes-aware vector encoding.** The payload carries a lightmap and the
+  result carries packed instances; both are `bytes` at runtime, which is the
+  point, since hex on the hot path would cost more than the kernel saves. So
+  the *file format* tags them and the runtime never sees it.
+
+### The measurement that set the preference, and the one that overturned it
+
+| batch | python | numpy | native |
+|---|---|---|---|
+| 10 | 7.9 us/pl | 32.0 (0.2x) | 0.43 (18x) |
+| 800 | 7.4 us/pl | 0.90 (**8.2x**) | 0.15 (**50x**) |
+
+On that table numpy looks like an obvious middle rung. It is not, and seeing why
+took measuring the **aggregate rather than the single call**:
+
+| a real frame | python | numpy | native |
+|---|---|---|---|
+| exterior ring: 9 cells x 4 models x 9 props | 2.6 ms | **10.0 ms** | 0.10 ms |
+| one interior: 6 models x 52 items | 2.4 ms | 1.8 ms | 0.05 ms |
+
+The kernel is called once per cell per model, so a real frame is dozens of small
+batches - and across an exterior ring numpy is **four times worse than not
+accelerating at all.** Not marginally: it would have taken a frame that fitted
+and broken it.
+
+That is D40's finding a third time. The granularity that makes C fast is exactly
+the granularity that makes numpy slow, and a benchmark of one big call would
+have shipped the wrong preference with a table to back it up. `place_batch` gets
+`("native", "python")`; numpy still *implements* it, so the differential suite
+holds it to the same answers and a caller may ask for it by name.
+
+### What the wiring found
+
+**A module import per draw item.** `_draw_item` opened with
+`from ..visibility import ENTITY, ITEM, PROP, STRUCTURE, TERRAIN` - 2,020 trips
+through `importlib` for a 400-prop frame. Pre-existing, invisible in every
+functional test, and worth 1.4 us a placement. Found by profiling the kernel's
+own result and wondering what the rest of the time was.
+
+The unit, end to end: **29.9 -> 15.3 -> 12.8 -> 5.6 -> 4.2 us.** The ceiling:
+**312 -> 952** visible placements a frame, 34 -> 105 per exterior cell, and a
+player's house from 312 to 952.
+
+### What is left is not the kernel
+
+The kernel measures **0.15 us a placement**. The remaining 4.2 is the Python
+either side: a `DrawItem` (1.41 us) and a `Transform` per survivor, both frozen
+dataclasses and both contract surfaces. `slots=True` was measured on that shape
+and buys nothing - on a frozen dataclass the `object.__setattr__` calls dominate
+either way.
+
+So the next reduction is not a faster kernel. It is a different draw list, and
+that is a contract change rather than an optimisation. Worth saying plainly so
+that nobody spends a week on the kernel again.
+
+### Mutation, in three places
+
+* **The comparator**, at the result level: dropped placements, spurious ones,
+  reordering, nudged centres and distances, a translated instance, a rotated
+  one, a changed light, a truncated block. Nine, all caught - and the
+  truncation found the comparator *raising* on a wrong answer instead of
+  reporting it, which would have turned a caught mutant into an error in the
+  harness.
+* **The wiring**, twenty mutants. Five survived the first pass, all five in
+  `_place_payload` - the bridge between the runtime and the kernel. They were
+  invisible because the *software* path recomputes from
+  `DrawItem.cell_placement` and never reads what the kernel returned, so only
+  culling and the packed instances depend on the payload and no test varied
+  them. A dropped cell placement, a wrong field of view and a dropped lightmap
+  all drew a correct picture.
+* **The C itself**, mutated, recompiled and run: composing the wrong way round,
+  a row-major matrix, a dropped cell translation, truncation instead of floor
+  in the light index, a forgotten aspect ratio, a near plane tested without the
+  radius. Six for six, hundreds of divergences each. That is the first time the
+  differential suite has been shown to catch a *broken build* rather than a
+  broken dict, and it is what D28 was written for.

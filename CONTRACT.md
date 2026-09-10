@@ -38,18 +38,30 @@ are held to the same answers by differential tests, with a declared float
 tolerance and a named authority where they differ. See DECISIONS.md D26.
 
 **The arithmetic accelerator exists in two forms; the GPU backend does not.**
-`lobster/accel/` holds a **C extension** and NumPy kernels for the seam's two
-operations, both proven against the reference by thousands of differential cases:
+`lobster/accel/` holds a **C extension** and NumPy kernels for the seam's three
+operations, all proven against the reference by thousands of differential cases:
 
 | kernel | numpy | native (C) |
 |---|---|---|
 | `segment_query`, 1,000 entities | 9.6× | **79×** (7–107× against a warm index) |
 | `nearest_region`, 6 bones | *0.46×* | **64×** |
+| `place_batch`, 800 in one call | 8.2× | **50×** |
+| `place_batch`, a real frame — 36 small calls | *0.26×* | **27×** |
 
 NumPy **loses** the refinement — six bones cannot pay for six array
-constructions — so selection is **per kernel** (`accel.KERNEL_PREFERENCE`), C
-first, NumPy only where it wins, the reference always the floor. `select()`
-names what it actually composed rather than overclaiming.
+constructions — and loses placement for the same reason at a different scale:
+the kernel is called once per resident cell per model, so a real frame is
+dozens of batches of ten, where NumPy comes out **four times worse than not
+accelerating at all**. So selection is **per kernel**
+(`accel.KERNEL_PREFERENCE`), C first, NumPy only where it wins, the reference
+always the floor. `select()` names what it actually composed rather than
+overclaiming.
+
+`place_batch` is the one the runtime leans on hardest: it culls a cell's
+placements and packs their instance data in the same call, and the draw list
+carries the packed bytes straight to the GPU backend. It took the measured
+per-placement cost from 12.8 µs to 4.2 and the on-screen ceiling from 312 to
+952 (§6, D53).
 
 **The C source is committed; the binary is not.** Build it with
 `python lobster/accel/native/setup.py build_ext --inplace` (a C compiler and
@@ -647,10 +659,10 @@ Declared in `lobster/constants.py`, overridable **downward** per cell via
 | `DEFAULT_MAX_CELL_BYTES` | **19.2 MiB — derived**, `MAX_TRANSITION_PEAK_BYTES // RESIDENT_MEMORY_SHARES` |
 | `MAX_MODEL_LIBRARY_BYTES` | **19.2 MiB — derived**, one share, on the same terms as a cell |
 | `MODEL_DRAW_BUDGET_US` | 4,000 — declared slice for assembling one frame's model instances |
-| `PER_PLACEMENT_US` | **12.8 — measured** on the slope, 25 to 800 placements |
-| `MAX_VISIBLE_PLACEMENTS_PER_FRAME` | **312 — derived**, slice ÷ measured unit |
-| `MAX_DRAWABLE_PLACEMENTS_PER_CELL` | **34 — derived**, frame ceiling ÷ `MAX_RESIDENT_CELLS`, for an **exterior** cell |
-| `MAX_DRAWABLE_PLACEMENTS_PER_INTERIOR` | **312 — derived**, the whole frame: an interior brings no ring (D8) |
+| `PER_PLACEMENT_US` | **4.2 — measured** on the slope, 25 to 800 placements; was 29.9 before four rounds of removing work (D51, D53) |
+| `MAX_VISIBLE_PLACEMENTS_PER_FRAME` | **952 — derived**, slice ÷ measured unit |
+| `MAX_DRAWABLE_PLACEMENTS_PER_CELL` | **105 — derived**, frame ceiling ÷ `MAX_RESIDENT_CELLS`, for an **exterior** cell |
+| `MAX_DRAWABLE_PLACEMENTS_PER_INTERIOR` | **952 — derived**, the whole frame: an interior brings no ring (D8) |
 | `PROJECTILE_BROAD_RADIUS_M` | 2.5 — a *floor*; the real margin is derived per rig |
 
 A cell declaring a *higher* ceiling than the shell default is itself a
@@ -680,8 +692,8 @@ Three ceilings, all derived (ASSET_SCOPE §6, D51, corrected by D52):
 
 | cell | resident with it | ceiling |
 |---|---|---|
-| exterior (tagged `exterior`) | itself plus its ring, up to 9 | **34** |
-| interior — a house, a dungeon | itself, and nothing else (D8) | **312** |
+| exterior (tagged `exterior`) | itself plus its ring, up to 9 | **105** |
+| interior — a house, a dungeon | itself, and nothing else (D8) | **952** |
 
 That is the only per-cell default in the shell that is not global, and it is not
 global because `residency_ring` is explicit: *"an exterior cell brings its
@@ -691,17 +703,25 @@ the ring for a player's house charges it for eight neighbours it can never have.
 **`MAX_ITEMS_PER_CELL` (173) is a different ceiling on a different cost.** A pick
 tests every item in a resident cell whether or not it has a mesh, so 173 bounds
 *items*; `max_drawable_placements` bounds *meshes*, of which items are one
-source and props the other. A cell may hold more items than it can draw — the
-extra ones simply have no `model_ref` and appear as impostors. Neither number
-contains the other, and `place_item` checks both before it writes.
+source and props the other. Neither number contains the other, and `place_item`
+checks both before it writes.
+
+Since D53 an **interior** can draw more than it can hold (952 against 173), so a
+player's house may give every item a mesh and still have room for 779 props. An
+**exterior** cell still cannot (105 against 173) — the extra items there simply
+have no `model_ref` and appear as impostors, which costs neither ceiling
+anything.
 
 NPCs are in neither: an entity has no `model_ref` at all, because skinning is an
 ASSET_SCOPE §5 non-goal. `DEFAULT_MAX_ACTIVE_SKELETONS_PER_CELL` is their own
 ceiling.
 
 Raising any of these means making a placement cheaper, not editing the number.
-`PER_PLACEMENT_US` has already come down from 29.9 to 12.8 that way, and the
-accelerator seam (D26) is where the next reduction would come from.
+`PER_PLACEMENT_US` has come down from 29.9 to 4.2 that way, across four rounds,
+the last of which was the accelerator seam's third kernel (D53). What is left is
+not the kernel — it measures 0.15 µs a placement — but the `DrawItem` and
+`Transform` built for each survivor, which are contract surfaces. Raising it
+again means changing what a draw list *is*.
 
 ### Walking holds both cells; jumping does not
 

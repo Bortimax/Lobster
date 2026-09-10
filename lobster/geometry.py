@@ -11,6 +11,7 @@ Units are metres, right-handed, Y up. Rotations are quaternions (x, y, z, w).
 from __future__ import annotations
 
 import math
+import struct
 from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
@@ -160,6 +161,40 @@ class Transform:
         which quietly bends every cross-cell ray.
         """
         return quat_rotate(quat_conjugate(self.rotation), direction)
+
+
+def identity4() -> List[List[float]]:
+    """The 4x4 identity, row-major nested lists."""
+    return [[1.0 if r == c else 0.0 for c in range(4)] for r in range(4)]
+
+
+def matrix4(placement: Optional["Transform"]) -> List[List[float]]:
+    """A rigid placement as a 4x4, row-major. Rotation then translation.
+
+    Here rather than in the renderer because it is the matrix form of a
+    `Transform` and nothing about it is about drawing - and because the
+    accelerator seam's reference needs the *real* one. A reference that kept
+    its own copy of the maths it references would drift from it, which is why
+    `reference_segment_query` calls `SpatialIndex.query_segment` itself.
+    """
+    if placement is None:
+        return identity4()
+    x, y, z, w = placement.rotation
+    rot = [
+        [1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)],
+        [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
+        [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)],
+    ]
+    px, py, pz = placement.position
+    return [[rot[0][0], rot[0][1], rot[0][2], px],
+            [rot[1][0], rot[1][1], rot[1][2], py],
+            [rot[2][0], rot[2][1], rot[2][2], pz],
+            [0.0, 0.0, 0.0, 1.0]]
+
+
+def pack_matrix4(m: Sequence[Sequence[float]]) -> bytes:
+    """A 4x4 as sixteen little-endian f32, **column-major** - what GLSL wants."""
+    return struct.pack("16f", *[m[r][c] for c in range(4) for r in range(4)])
 
 
 @dataclass(frozen=True)

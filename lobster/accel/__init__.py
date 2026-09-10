@@ -62,9 +62,10 @@ def _native_kernels():
         from .native import lobster_accel
     except Exception:
         return None
-    from ..conformance import NEAREST_REGION, SEGMENT_QUERY
+    from ..conformance import NEAREST_REGION, PLACE_BATCH, SEGMENT_QUERY
     return {SEGMENT_QUERY: lobster_accel.segment_query,
-            NEAREST_REGION: lobster_accel.nearest_region}
+            NEAREST_REGION: lobster_accel.nearest_region,
+            PLACE_BATCH: lobster_accel.place_batch}
 
 
 register("python", _python_kernels)
@@ -82,18 +83,32 @@ PREFERENCE: Tuple[str, ...] = ("native", "numpy", "python")
 #: |---|---|---|
 #: | `segment_query`, 1,000 entities | 9.6x | **79x** |
 #: | `nearest_region`, 6 bones | **0.46x** | **64x** |
+#: | `place_batch`, 800 in one call | 8.2x | **50x** |
+#: | `place_batch`, **a real frame** - 36 small calls | **0.26x** | **27x** |
 #:
 #: NumPy *loses* the refinement, because a rig has six bones and building six
 #: arrays costs more than looping over six capsules - D26's seam-granularity
 #: argument arriving one level down than it was aimed. C has no per-call array
 #: to build and wins both.
 #:
+#: **`place_batch` is the same finding a third time, and worth reading twice.**
+#: One batch of 800 is numpy's best case and it wins 8.2x there. But the kernel
+#: is called once per resident cell per model, so a real frame is dozens of
+#: batches of ten - and across an exterior ring numpy comes out at 10.0 ms
+#: against the reference's 2.6 ms. Not marginally worse: **four times worse
+#: than not accelerating at all.** The granularity that makes C fast is exactly
+#: the granularity that makes numpy slow, and measuring the aggregate rather
+#: than the single call is what showed it (D53).
+#:
 #: So numpy stays as the middle rung for the broad phase, where it is a real
-#: win on a machine with no compiler, and is **excluded from the refinement**
-#: rather than left in to be slower than the reference.
+#: win on a machine with no compiler, and is **excluded from the refinement and
+#: from placement** rather than left in to be slower than the reference. It
+#: still *implements* both, so the differential suite holds it to the same
+#: answers and a caller may ask for it by name.
 KERNEL_PREFERENCE: Dict[str, Tuple[str, ...]] = {
     "segment_query": ("native", "numpy", "python"),
     "nearest_region": ("native", "python"),
+    "place_batch": ("native", "python"),
 }
 
 

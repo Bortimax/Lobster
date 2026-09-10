@@ -274,18 +274,22 @@ MODEL_DRAW_BUDGET_US = 4_000.0
 #:
 #: Measured on the slope, 25 to 800 placements in one cell, taking the *worst*
 #: slope rather than the median - the same choice D38 made and for the same
-#: reason. It has come down twice, both times by removing work:
+#: reason. It has come down four times, every time by removing work:
 #:
 #: | | us/placement | what changed |
 #: |---|---|---|
 #: | first cut | 29.9 | two 4x4 matrices and a 64-multiply product per placement, and a bound radius recomputed from eight square roots every frame |
 #: | compose | 15.3 | rigid transforms composed as a quaternion product; `ModelMesh` computes its radius once |
-#: | camera | **12.8** | `Camera.basis()` and `tan_half_fov()` computed at birth instead of inside every cull test |
+#: | camera | 12.8 | `Camera.basis()` and `tan_half_fov()` computed at birth instead of inside every cull test |
+#: | `place_batch` | 5.6 | the third seam kernel: cull, compose, sample and pack a whole cell's batch in C, with the input rows built once per residency (D53) |
+#: | imports | **4.2** | `_draw_item` was running a module import per draw item - 2,020 trips through `importlib` for a 400-prop frame, found while profiling the line above |
 #:
-#: Raising the ceiling below means making a placement cheaper again - the
-#: accelerator seam (D26) is where a fourth line of that table would come from -
-#: not editing this number.
-PER_PLACEMENT_US = 12.8
+#: What is left is not the kernel: it measures 0.15 us a placement. It is the
+#: Python either side - a `DrawItem` and a `Transform` per survivor, which are
+#: contract surfaces - and `slots` was measured on both and buys nothing on a
+#: frozen dataclass. Raising the ceiling again means changing what the draw
+#: list *is*, not making this faster.
+PER_PLACEMENT_US = 4.2
 
 #: Visible model placements one frame may assemble, across every resident cell.
 #:

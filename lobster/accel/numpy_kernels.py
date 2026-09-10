@@ -1,4 +1,4 @@
-"""NumPy implementations of the two seam kernels (D26's seam, D40).
+"""NumPy implementations of the three seam kernels (D26's seam, D40, D53).
 
 Both mirror `lobster.conformance.REFERENCE` exactly in signature and in answer,
 and the differential harness (D28) is what proves the second part rather than
@@ -19,6 +19,14 @@ things that look like details and are not:
   reference compares with a strict `<`. Ordering is part of the input.
 * `precise` is "a capsule was intersected", decided by the same
   `gap <= radius` test rather than by a re-derived one.
+* `place_batch` returns survivors **in input order**, and packs f32 in the
+  column-major order GLSL wants.
+
+**`place_batch` is the one this library was made for.** `nearest_region` loses
+to the reference because a rig has six bones and building six arrays costs more
+than looping over them (D40) - the seam-granularity argument arriving one level
+down. A placement batch is tens to hundreds of rows of identical work, which is
+the far side of that same trade.
 """
 
 from __future__ import annotations
@@ -163,6 +171,131 @@ def nearest_region(payload: Mapping[str, Any]) -> Dict[str, Any]:
     return {"region": regions[int(np.argmin(gaps))], "precise": False}
 
 
+def _quat_rotate(q: np.ndarray, v: np.ndarray) -> np.ndarray:
+    """`geometry.quat_rotate`, over a stack of vectors."""
+    u, s = q[:3], q[3]
+    return (2.0 * (u @ v.T)[:, None] * u
+            + (s * s - u @ u) * v
+            + 2.0 * s * np.cross(np.broadcast_to(u, v.shape), v))
+
+
+def _quat_mul(a: np.ndarray, b: np.ndarray) -> np.ndarray:
+    """`geometry.quat_mul`, `a` against a stack of `b`. Order is not
+    symmetric and the reference composes outer-then-inner."""
+    ax, ay, az, aw = a
+    bx, by, bz, bw = b[:, 0], b[:, 1], b[:, 2], b[:, 3]
+    return np.stack([
+        aw * bx + ax * bw + ay * bz - az * by,
+        aw * by - ax * bz + ay * bw + az * bx,
+        aw * bz + ax * by - ay * bx + az * bw,
+        aw * bw - ax * bx - ay * by - az * bz,
+    ], axis=1)
+
+
+def place_batch(payload: Mapping[str, Any]) -> Dict[str, Any]:
+    """Cull one cell's placements and pack what survived.
+
+    Every step is over the whole batch at once: one composition, one frustum
+    test, one matrix build, one `tobytes`. The float64 maths is the reference's
+    and only the last step narrows, which is the same thing the native kernel
+    does and the reason both land inside the declared tolerance.
+    """
+    from ..conformance import INSTANCE_FLOATS, PLACEMENT_FLOATS
+
+    flat = np.asarray(payload["placements"], dtype=np.float64)
+    total = flat.size // PLACEMENT_FLOATS
+    if total == 0:
+        return {"visible": [], "centers": [], "distances": [],
+                "instances": b""}
+    rows = flat.reshape(total, PLACEMENT_FLOATS)
+    local_pos, local_rot = rows[:, 0:3], rows[:, 3:7]
+
+    cell = payload["cell"]
+    cell_pos = np.asarray(cell["position"], dtype=np.float64)
+    cell_rot = np.asarray(cell["rotation"], dtype=np.float64)
+
+    centres = cell_pos + _quat_rotate(cell_rot, local_pos)
+    rot = _quat_mul(cell_rot, local_rot)
+
+    # Camera.__post_init__, then Camera.sees_sphere - the same four
+    # comparisons, evaluated for every row at once.
+    cam = payload["camera"]
+    position = np.asarray(cam["position"], dtype=np.float64)
+    forward = np.asarray(cam["forward"], dtype=np.float64)
+    up_in = np.asarray(cam["up"], dtype=np.float64)
+    forward = forward / (np.linalg.norm(forward) or 1.0)
+    right = np.cross(up_in, forward)
+    right = right / (np.linalg.norm(right) or 1.0)
+    up = np.cross(forward, right)
+    up = up / (np.linalg.norm(up) or 1.0)
+    tan_y = np.tan(np.radians(float(cam["fov_y_deg"])) * 0.5)
+    tan_x = tan_y * float(cam["aspect"])
+    near, far = float(cam["near"]), float(cam["far"])
+    radius = float(payload["radius"])
+
+    rel = centres - position
+    vx, vy, vz = rel @ right, rel @ up, rel @ forward
+    keep = (vz + radius >= near) & (vz - radius <= far)
+    keep &= np.abs(vx) <= vz * tan_x + radius * np.sqrt(1.0 + tan_x * tan_x)
+    keep &= np.abs(vy) <= vz * tan_y + radius * np.sqrt(1.0 + tan_y * tan_y)
+
+    visible = np.flatnonzero(keep)
+    if visible.size == 0:
+        return {"visible": [], "centers": [], "distances": [],
+                "instances": b""}
+    kept_centres = centres[visible]
+    distances = np.linalg.norm(rel[visible], axis=1)
+
+    x, y, z, w = (rot[visible, 0], rot[visible, 1], rot[visible, 2],
+                  rot[visible, 3])
+    packed = np.zeros((visible.size, INSTANCE_FLOATS), dtype=np.float64)
+    # Column-major, which is what `pack_matrix4` produces and GLSL reads.
+    packed[:, 0] = 1 - 2 * (y * y + z * z)
+    packed[:, 1] = 2 * (x * y + z * w)
+    packed[:, 2] = 2 * (x * z - y * w)
+    packed[:, 4] = 2 * (x * y - z * w)
+    packed[:, 5] = 1 - 2 * (x * x + z * z)
+    packed[:, 6] = 2 * (y * z + x * w)
+    packed[:, 8] = 2 * (x * z + y * w)
+    packed[:, 9] = 2 * (y * z - x * w)
+    packed[:, 10] = 1 - 2 * (x * x + y * y)
+    packed[:, 12:15] = kept_centres
+    packed[:, 15] = 1.0
+    packed[:, 16] = _sample_light(payload.get("lightmap"), kept_centres)
+
+    return {"visible": [int(i) for i in visible],
+            "centers": kept_centres.tolist(),
+            "distances": [float(d) for d in distances],
+            "instances": packed.astype(np.float32).tobytes()}
+
+
+def _sample_light(lightmap: Any, points: np.ndarray) -> np.ndarray:
+    """`ResidentCell.ambient_at`, over a stack of points.
+
+    `np.floor_divide` on floats floors towards negative infinity, which is what
+    Python's `//` does and what a C cast does *not* - the same trap the native
+    kernel calls out.
+    """
+    ones = np.ones(points.shape[0], dtype=np.float64)
+    if not lightmap:
+        return ones
+    data = lightmap.get("data")
+    side = int(lightmap.get("side") or 0)
+    if data is None or side <= 0 or len(data) == 0:
+        return ones
+    voxel = float(lightmap.get("voxel_size") or 1.0) or 1.0
+    table = np.frombuffer(data, dtype=np.uint8) if isinstance(
+        data, (bytes, bytearray)) else np.asarray(data, dtype=np.uint8)
+    ix = np.clip(np.floor(points[:, 0] / voxel).astype(np.int64), 0, side - 1)
+    iz = np.clip(np.floor(points[:, 2] / voxel).astype(np.int64), 0, side - 1)
+    index = iz * side + ix
+    inside = index < table.size
+    out = ones.copy()
+    out[inside] = table[index[inside]] / 255.0
+    return out
+
+
 def kernels() -> Dict[str, Callable[[Mapping[str, Any]], Dict[str, Any]]]:
-    from ..conformance import NEAREST_REGION, SEGMENT_QUERY
-    return {SEGMENT_QUERY: segment_query, NEAREST_REGION: nearest_region}
+    from ..conformance import NEAREST_REGION, PLACE_BATCH, SEGMENT_QUERY
+    return {SEGMENT_QUERY: segment_query, NEAREST_REGION: nearest_region,
+            PLACE_BATCH: place_batch}

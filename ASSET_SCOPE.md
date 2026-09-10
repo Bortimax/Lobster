@@ -1,6 +1,10 @@
 # Asset scope — making `model_ref` mean something
 
-**Status: built.** All six steps of §7 are done. The kind registry and its lint
+**Status: built, and the budget has been re-derived once since.** All six
+steps of §7 are done, and §6's ceiling moved from 312 visible placements a
+frame to 952 when the accelerator seam gained a third kernel (D53) - which is
+the mechanism §6 named: *"raising it means making a placement cheaper again,
+not editing the number."* The kind registry and its lint
 (step 1); `models.lobster_lib`, both kinds meshed once into the vertex format
 the GL backend already draws (step 2, D47); reference-counted model residency
 across resident cells, props *and* items, with `drift()` extended to catch a

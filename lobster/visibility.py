@@ -30,6 +30,7 @@ from typing import (Any, Dict, Iterable, List, Optional, Sequence, Tuple)
 
 from .budgets import BudgetViolation
 from .camera import Camera
+from .conformance import PLACE_BATCH
 from .constants import (MAX_VISIBLE_PLACEMENTS_PER_FRAME,
                         MODEL_DRAW_BUDGET_US, PER_PLACEMENT_US)
 from .geometry import AABB, Transform, Vec3, distance
@@ -131,6 +132,12 @@ class DrawList:
     camera: Camera
     items: Tuple[DrawItem, ...] = ()
     stats: VisibilityStats = dc_field(default_factory=VisibilityStats)
+    #: `(cell_id, model_ref)` -> the instance bytes for that group, already
+    #: packed by the seam kernel that did the culling (D53). The GPU backend
+    #: uploads these directly; a draw list built without a library has none and
+    #: the backend packs per item as it always did. Not part of `to_dict`: it
+    #: is a buffer, not a description.
+    instances: Dict[Tuple[str, str], bytes] = dc_field(default_factory=dict)
 
     def of_kind(self, kind: str) -> List[DrawItem]:
         return [i for i in self.items if i.kind == kind]
@@ -158,6 +165,42 @@ def _placed(box: AABB, placement: Transform) -> AABB:
     corners = [(x, y, z) for x in (lo[0], hi[0]) for y in (lo[1], hi[1])
                for z in (lo[2], hi[2])]
     return AABB.from_points(placement.apply(c) for c in corners)
+
+
+def _has_mesh(library: Any, model_ref: str) -> bool:
+    """Would this model ever be drawn as geometry?
+
+    The packed instances exist for the GPU backend, and it draws from buffers
+    residency uploaded - so a blob for a model the library cannot satisfy can
+    never be used, and packing one is work with no consumer. An empty mesh
+    counts as unresolvable for the same reason `_mesh_for` treats it that way.
+    """
+    if not model_ref or library is None:
+        return False
+    mesh = library.models.get(model_ref)
+    return mesh is not None and not mesh.is_empty()
+
+
+def _place_payload(camera: Camera, placement: Transform, radius: float,
+                   flat: Sequence[float], lightmap: Any) -> Dict[str, Any]:
+    """One `place_batch` call's input.
+
+    The camera goes over as its *fields* rather than its derived basis, so an
+    implementation has to reproduce the orthonormalisation rather than be
+    handed it - which is the derivation most likely to differ, and therefore
+    the one the differential suite most needs to see.
+    """
+    return {
+        "camera": {"position": camera.position, "forward": camera.forward,
+                   "up": camera.up, "fov_y_deg": camera.fov_y_deg,
+                   "aspect": camera.aspect, "near": camera.near,
+                   "far": camera.far},
+        "cell": {"position": placement.position,
+                 "rotation": placement.rotation},
+        "radius": radius,
+        "placements": flat,
+        "lightmap": lightmap,
+    }
 
 
 def _model_radius(library: Any, model_ref: str,
@@ -204,6 +247,13 @@ def build_draw_list(camera: Camera,
     placements = placements or {}
     stats = VisibilityStats()
     items: List[DrawItem] = []
+    packed: Dict[Tuple[str, str], bytes] = {}
+    # Selected once per draw list, not per cell: `select` walks the registry,
+    # and doing that nine times a frame would be the dispatch cost this seam
+    # exists to avoid. Not cached across calls either - a test that swaps
+    # `KERNEL_PREFERENCE` has to be able to.
+    from .accel import select as _select_accel
+    place = _select_accel()[1][PLACE_BATCH]
 
     def charge_placement(cell_id: str) -> None:
         """One more thing with a mesh on screen. Raises when the frame is full.
@@ -230,6 +280,8 @@ def build_draw_list(camera: Camera,
     for cell in cells:
         stats.cells_considered += 1
         placement = placements.get(cell.cell_id, Transform())
+        lightmap = (cell.lightmap_block()
+                    if hasattr(cell, "lightmap_block") else None)
         drew_any = False
 
         # -- terrain (its own pool; L2) -------------------------------------
@@ -262,20 +314,33 @@ def build_draw_list(camera: Camera,
             drew_any = True
 
         # -- props ------------------------------------------------------------
-        for prop in getattr(getattr(cell, "bundle", None), "props", ()) or ():
-            stats.items_considered += 1
-            center = placement.apply(prop.transform.position)
-            radius, model_ref = _model_radius(library, prop.model_ref, 1.0)
-            if not camera.sees_sphere(center, radius):
-                continue
-            items.append(DrawItem(
-                kind=PROP, cell_id=cell.cell_id, item_id=prop.prop_id,
-                cell_placement=placement, center=center, radius=radius,
-                distance=camera.distance_to(center),
-                model_ref=model_ref, transform=prop.transform))
-            if model_ref:
-                charge_placement(cell.cell_id)
-            drew_any = True
+        # One kernel call per model rather than a Python loop per prop. The
+        # rows are built once per residency (`prop_rows`); what crosses the
+        # boundary here is a batch, which is the whole of D26's argument.
+        rows = cell.prop_rows() if hasattr(cell, "prop_rows") else {}
+        for model_ref, (flat, prop_ids) in sorted(rows.items()):
+            stats.items_considered += len(prop_ids)
+            radius, model_ref = _model_radius(library, model_ref, 1.0)
+            result = place(_place_payload(camera, placement, radius, flat,
+                                          lightmap))
+            for slot, index in enumerate(result["visible"]):
+                center = tuple(result["centers"][slot])
+                base = index * 7
+                items.append(DrawItem(
+                    kind=PROP, cell_id=cell.cell_id,
+                    item_id=prop_ids[index], cell_placement=placement,
+                    center=center, radius=radius,
+                    distance=result["distances"][slot],
+                    model_ref=model_ref,
+                    transform=Transform(
+                        position=(flat[base], flat[base + 1], flat[base + 2]),
+                        rotation=(flat[base + 3], flat[base + 4],
+                                  flat[base + 5], flat[base + 6]))))
+                if model_ref:
+                    charge_placement(cell.cell_id)
+                drew_any = True
+            if result["visible"] and _has_mesh(library, model_ref):
+                packed[(cell.cell_id, model_ref)] = result["instances"]
 
         # -- placed items (Scope 8) --------------------------------------------
         # Same shape as props and deliberately a separate kind: a prop is
@@ -284,28 +349,49 @@ def build_draw_list(camera: Camera,
         # for an item whose `model_ref` names nothing the library holds - which
         # after ASSET_SCOPE step 2 is a build error rather than the normal case.
         if view is not None:
+            # Items get their rows built per frame rather than cached: they are
+            # records that move, and a cache of them needs an invalidation
+            # story. Reading seven floats out of a dict is a fraction of what
+            # the kernel removes, so this is still most of the win (D53).
+            item_rows: Dict[str, Tuple[List[float], List[str]]] = {}
             for record in view.items_in_location(cell.cell_id):
                 transform = record.get("world_transform") or {}
                 raw = transform.get("position")
                 if not raw:
                     continue
                 stats.items_considered += 1
-                center = placement.apply((float(raw[0]), float(raw[1]),
-                                          float(raw[2])))
-                radius, model_ref = _model_radius(
-                    library, record.get("model_ref") or "", ITEM_DRAW_RADIUS_M)
-                if not camera.sees_sphere(center, radius):
-                    continue
-                items.append(DrawItem(
-                    kind=ITEM, cell_id=cell.cell_id, item_id=record["id"],
-                    cell_placement=placement, center=center,
-                    radius=radius,
-                    distance=camera.distance_to(center),
-                    model_ref=model_ref,
-                    transform=Transform.from_dict(transform)))
-                if model_ref:
-                    charge_placement(cell.cell_id)
-                drew_any = True
+                spin = transform.get("rotation") or (0.0, 0.0, 0.0, 1.0)
+                flat, ids = item_rows.setdefault(
+                    record.get("model_ref") or "", ([], []))
+                flat.extend((float(raw[0]), float(raw[1]), float(raw[2]),
+                             float(spin[0]), float(spin[1]), float(spin[2]),
+                             float(spin[3])))
+                ids.append(record["id"])
+
+            for model_ref, (flat, item_ids) in sorted(item_rows.items()):
+                radius, model_ref = _model_radius(library, model_ref,
+                                                  ITEM_DRAW_RADIUS_M)
+                result = place(_place_payload(camera, placement, radius, flat,
+                                              lightmap))
+                for slot, index in enumerate(result["visible"]):
+                    base = index * 7
+                    items.append(DrawItem(
+                        kind=ITEM, cell_id=cell.cell_id,
+                        item_id=item_ids[index], cell_placement=placement,
+                        center=tuple(result["centers"][slot]), radius=radius,
+                        distance=result["distances"][slot],
+                        model_ref=model_ref,
+                        transform=Transform(
+                            position=(flat[base], flat[base + 1],
+                                      flat[base + 2]),
+                            rotation=(flat[base + 3], flat[base + 4],
+                                      flat[base + 5], flat[base + 6]))))
+                    if model_ref:
+                        charge_placement(cell.cell_id)
+                    drew_any = True
+                if result["visible"] and _has_mesh(library, model_ref):
+                    key = (cell.cell_id, model_ref)
+                    packed[key] = packed.get(key, b"") + result["instances"]
 
         # -- entities ----------------------------------------------------------
         index = getattr(cell, "index", None)
@@ -335,4 +421,5 @@ def build_draw_list(camera: Camera,
     # and a viewer that wants painter's order can reverse it.
     items.sort(key=lambda i: (i.distance, i.kind, i.item_id))
     stats.items_drawn = len(items)
-    return DrawList(camera=camera, items=tuple(items), stats=stats)
+    return DrawList(camera=camera, items=tuple(items), stats=stats,
+                    instances=packed)

@@ -35,7 +35,12 @@ import struct
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
 from ..constants import MODEL_VERTEX_STRIDE
-from ..geometry import Vec3
+from ..geometry import Vec3, identity4, matrix4, pack_matrix4
+# Hoisted out of `_draw_item`, which ran this import once per draw item -
+# 2,020 trips through `importlib` for a 400-prop frame, found by profiling
+# the per-placement cost the budget is derived from (D53). `visibility`
+# does not import the renderer, so there is no cycle to avoid here.
+from ..visibility import ENTITY, ITEM, PROP, STRUCTURE, TERRAIN
 from .backend import BackendError, BackendInfo, RenderBackend
 
 VERTEX_SHADER = """
@@ -229,6 +234,10 @@ class ModernGLBackend(RenderBackend):
         #: process shared one set and a test could inherit another test's
         #: complaint. Found by the first assertion that looked at teardown.
         self._missing: Set[str] = set()
+        #: instances this backend had to pack itself because the draw list did
+        #: not carry them. Zero on the normal path; a test asserts that, since
+        #: silently repacking would make the kernel look wired when it is not.
+        self._repacked = 0
         self._program = self.ctx.program(vertex_shader=VERTEX_SHADER,
                                          fragment_shader=FRAGMENT_SHADER)
         # A second program rather than one with a branch. The static path
@@ -350,7 +359,11 @@ class ModernGLBackend(RenderBackend):
 
         drawn = set()
         impostors = bytearray()
-        instances: Dict[str, bytearray] = {}
+        #: (cell_id, model_ref) -> the draw items in that group, in order. The
+        #: bytes usually come from the draw list, already packed by the seam
+        #: kernel that culled them (D53); the items are kept so a draw list
+        #: built without one can still be packed here.
+        groups: Dict[Tuple[str, str], List[Any]] = {}
         placed: Optional[str] = None
         for item in draw_list.items:
             buffers = self.cells.get(item.cell_id)
@@ -371,9 +384,10 @@ class ModernGLBackend(RenderBackend):
                 self._program["model"].write(
                     _pack_matrix(_model_matrix(item.cell_placement)))
                 placed = item.cell_id
-            self._draw_item(buffers, item, settings, impostors, instances,
+            self._draw_item(buffers, item, settings, impostors, groups,
                             cells_by_id.get(item.cell_id))
 
+        instances = self._instance_streams(groups, draw_list, cells_by_id)
         if instances:
             self._draw_instanced(instances)
         if impostors:
@@ -384,9 +398,9 @@ class ModernGLBackend(RenderBackend):
         return GLFrame(self, self.width, self.height)
 
     def _draw_item(self, buffers: CellBuffers, item: Any, settings: Any,
-                   impostors: bytearray, instances: Dict[str, bytearray],
+                   impostors: bytearray,
+                   groups: Dict[Tuple[str, str], List[Any]],
                    cell: Any) -> None:
-        from ..visibility import ENTITY, ITEM, PROP, STRUCTURE, TERRAIN
         if item.kind == TERRAIN and buffers.terrain is not None:
             _, vao, count = buffers.terrain
             vao.render(vertices=count)
@@ -403,10 +417,43 @@ class ModernGLBackend(RenderBackend):
                 self._missing_models.add(item.model_ref)
                 impostors.extend(_impostor_vertices(item, settings))
                 return
-            instances.setdefault(item.model_ref, bytearray()).extend(
-                _instance_bytes(item, cell))
+            groups.setdefault((item.cell_id, item.model_ref), []).append(item)
         elif item.kind in (ENTITY, PROP, ITEM):
             impostors.extend(_impostor_vertices(item, settings))
+
+    def _instance_streams(self, groups: Dict[Tuple[str, str], List[Any]],
+                          draw_list: Any,
+                          cells_by_id: Dict[str, Any]
+                          ) -> Dict[str, bytearray]:
+        """One byte stream per model, from whoever already has the bytes.
+
+        The culler packs these as a side effect of culling - it has the world
+        transform and the light in registers at that moment, and handing them
+        back would mean computing them twice (D53). So the normal path is a
+        copy, and `_instance_bytes` runs only for a draw list that was built
+        without a kernel: a hand-made one in a test, or a caller that culled
+        for itself.
+
+        The **length check is the guard**, not an optimisation. A blob is used
+        only if it holds exactly one instance per item actually being drawn;
+        anything else - a cell that was culled in but never uploaded, a draw
+        list edited after the fact - falls back rather than uploading a stream
+        that does not line up with the models it is drawn against.
+        """
+        packed = getattr(draw_list, "instances", None) or {}
+        streams: Dict[str, bytearray] = {}
+        for key in sorted(groups):
+            cell_id, model_ref = key
+            items = groups[key]
+            stream = streams.setdefault(model_ref, bytearray())
+            blob = packed.get(key)
+            if blob is not None and len(blob) == len(items) * INSTANCE_STRIDE:
+                stream.extend(blob)
+                continue
+            self._repacked += len(items)
+            for item in items:
+                stream.extend(_instance_bytes(item, cells_by_id.get(cell_id)))
+        return streams
 
     def _draw_instanced(self, instances: Dict[str, bytearray]) -> None:
         """One draw per distinct model, however many placements it has.
@@ -625,7 +672,6 @@ def _impostor_vertices(item: Any, settings: Any) -> bytes:
     """
     from ..render.raster import (ENTITY_COLOUR, ITEM_COLOUR,
                                  ITEM_IMPOSTOR_HEIGHT_M, PROP_COLOUR)
-    from ..visibility import ENTITY, ITEM
     if item.kind == ENTITY:
         colour, height, half = ENTITY_COLOUR, 1.8, 0.45
     elif item.kind == ITEM:
@@ -703,25 +749,12 @@ def _view_projection(camera: Any) -> List[List[float]]:
     return _matmul(projection, view)
 
 
-def _identity() -> List[List[float]]:
-    return [[1.0 if r == c else 0.0 for c in range(4)] for r in range(4)]
-
-
-def _model_matrix(placement: Any) -> List[List[float]]:
-    """Where a cell sits, as a 4x4. Rigid: rotation then translation."""
-    if placement is None:
-        return _identity()
-    x, y, z, w = placement.rotation
-    rot = [
-        [1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)],
-        [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
-        [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)],
-    ]
-    px, py, pz = placement.position
-    return [[rot[0][0], rot[0][1], rot[0][2], px],
-            [rot[1][0], rot[1][1], rot[1][2], py],
-            [rot[2][0], rot[2][1], rot[2][2], pz],
-            [0.0, 0.0, 0.0, 1.0]]
+# These moved to `geometry`, where a `Transform` as a 4x4 belongs and where the
+# accelerator seam's reference can reach them without importing the renderer.
+# Aliased rather than renamed at every call site, the same way `VERTEX_STRIDE`
+# is - one definition, and no diff in the drawing code.
+_identity = identity4
+_model_matrix = matrix4
 
 
 def _matmul(a: List[List[float]], b: List[List[float]]) -> List[List[float]]:
@@ -733,9 +766,7 @@ def _dot(a: Vec3, b: Vec3) -> float:
     return a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
 
 
-def _pack_matrix(m: List[List[float]]) -> bytes:
-    """Column-major, which is what GLSL expects."""
-    return struct.pack("16f", *[m[r][c] for c in range(4) for r in range(4)])
+_pack_matrix = pack_matrix4
 
 
 def _release(*resources: Any) -> None:

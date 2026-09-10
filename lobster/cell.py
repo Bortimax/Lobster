@@ -159,6 +159,8 @@ class ResidentCell:
         self.quarantined: List[Dict[str, Any]] = []
         grid_m = self.location_record.get("spatial_grid_cell_m") or SPATIAL_GRID_CELL_M
         self.index = SpatialIndex(self.cell_id, cell_size_m=float(grid_m))
+        #: `prop_rows` builds this on first use and never again - see there.
+        self._prop_rows: Optional[Dict[str, Tuple[List[float], List[str]]]] = None
 
     # -- models --------------------------------------------------------------
     def model_refs(self) -> List[str]:
@@ -180,6 +182,47 @@ class ResidentCell:
             if prop.model_ref:
                 seen.setdefault(prop.model_ref)
         return sorted(seen)
+
+    def prop_rows(self) -> Dict[str, Tuple[List[float], List[str]]]:
+        """This cell's props as flat kernel input, grouped by model, cached.
+
+        Built **once per residency** rather than per frame, for the reason
+        `upload_cell` exists: a prop does not move. Rebuilding it every frame
+        would be per-placement Python work in front of a kernel that exists to
+        remove per-placement Python work - D26's dispatch argument, one layer
+        up (D53).
+
+        Items deliberately are **not** in here. They are records that can be
+        dropped or picked up mid-residency, so a cache of them needs an
+        invalidation story; their rows are built per frame instead, which is
+        still a fraction of what the kernel removes. Measure before caching.
+        """
+        if self._prop_rows is None:
+            rows: Dict[str, Tuple[List[float], List[str]]] = {}
+            for prop in self.bundle.props:
+                flat, ids = rows.setdefault(prop.model_ref, ([], []))
+                position = prop.transform.position
+                rotation = prop.transform.rotation
+                flat.extend((float(position[0]), float(position[1]),
+                             float(position[2]), float(rotation[0]),
+                             float(rotation[1]), float(rotation[2]),
+                             float(rotation[3])))
+                ids.append(prop.prop_id)
+            self._prop_rows = rows
+        return self._prop_rows
+
+    def lightmap_block(self) -> Optional[Dict[str, Any]]:
+        """The baked lightmap as a kernel payload, or None for an unlit cell.
+
+        The same three numbers `ambient_at` reads, handed over as data so a
+        native kernel never needs a `ResidentCell`.
+        """
+        data = self.bundle.lightmap
+        side = self.bundle.lightmap_dims[0] if self.bundle.lightmap_dims else 0
+        if not data or side <= 0:
+            return None
+        return {"data": data, "side": int(side),
+                "voxel_size": float(self.bundle.lightmap_voxel_size or 1.0)}
 
     def drawable_placements(self, view: Any = None) -> int:
         """Things resident in this cell that draw as a mesh.

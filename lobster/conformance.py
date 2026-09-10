@@ -10,16 +10,24 @@ module on purpose: it needs no toolchain, so it cannot become a third
 named-but-unwritten thing, and a native implementer gets a target to hit rather
 than a description to interpret.
 
-**The seam is two pure kernels.** Everything else stays Python.
+**The seam is three pure kernels.** Everything else stays Python.
 
 | kernel | question |
 |---|---|
 | `segment_query` | which entities lie within `radius` of this segment |
 | `nearest_region` | which bone a ray struck, over an already-filtered capsule list |
+| `place_batch` | which of these placements are on screen, and their instance data |
 
-**Both sit below the `limb_state` read.** The caller filters severed limbs and
-hands over only the capsules that survived, so a native kernel never touches
-limb state and the L8 boundary stays in Python permanently.
+The first two sit **below the `limb_state` read**: the caller filters severed
+limbs and hands over only the capsules that survived, so a native kernel never
+touches limb state and the L8 boundary stays in Python permanently.
+
+`place_batch` is the third (D53), and its granularity is D26's argument applied
+again: one call per resident cell per model per frame. The intermediate between
+culling and packing - which placements survived and where they ended up - never
+crosses the boundary, because crossing it per placement is the cost. The input
+buffer is built **once per residency**, not per frame, for the same reason
+`upload_cell` exists: a prop does not move.
 
 ## What "agree" means
 
@@ -64,12 +72,14 @@ from __future__ import annotations
 import json
 import math
 import random
+import struct
 from dataclasses import dataclass, field as dc_field
 from typing import (Any, Callable, Dict, Iterable, List, Mapping, Optional,
                     Sequence, Tuple)
 
+from .camera import Camera
 from .constants import SPATIAL_GRID_CELL_M
-from .geometry import Capsule, Transform, Vec3
+from .geometry import Capsule, Transform, Vec3, matrix4, pack_matrix4
 from .hittest import nearest_region
 from .skeleton import Skeleton, humanoid_region_set
 from .spatial import SpatialIndex
@@ -80,12 +90,26 @@ from .tiers import ACTIVE, PROJECTILE
 #: tolerance rather than one discovered by loosening until the suite passes.
 DISTANCE_TOLERANCE_M = 1e-4
 
+#: Tolerance for the dimensionless numbers `place_batch` returns - rotation
+#: cosines and a 0..1 light level. Declared separately from the metre tolerance
+#: because comparing a direction cosine against a distance tolerance is a
+#: category error that happens to work while the numbers are near 1.
+UNIT_TOLERANCE = 1e-4
+
 #: Which path is right when they differ inside tolerance.
 AUTHORITY = "python"
 
 SEGMENT_QUERY = "segment_query"
 NEAREST_REGION = "nearest_region"
-SEAM_KERNELS = (SEGMENT_QUERY, NEAREST_REGION)
+PLACE_BATCH = "place_batch"
+SEAM_KERNELS = (SEGMENT_QUERY, NEAREST_REGION, PLACE_BATCH)
+
+#: floats per placement in a `place_batch` payload: position, then rotation.
+PLACEMENT_FLOATS = 7
+
+#: floats per instance in its result: a column-major 4x4, then the baked light
+#: where that instance stands. The same seventeen `gl_backend` uploads.
+INSTANCE_FLOATS = 17
 
 
 class ConformanceError(Exception):
@@ -168,9 +192,92 @@ def reference_nearest_region(payload: Mapping[str, Any]) -> Dict[str, Any]:
     return {"region": region, "precise": precise}
 
 
+def camera_from(payload: Mapping[str, Any]) -> Camera:
+    """A `Camera` from a `place_batch` payload's camera block.
+
+    The payload carries a camera's *fields*, not its derived basis, so the
+    reference builds a real `Camera` and the native path has to reproduce the
+    same orthonormalisation. That is deliberate: a payload carrying the basis
+    would hide the one derivation most likely to differ.
+    """
+    cam = payload["camera"]
+    return Camera(position=tuple(cam["position"]),
+                  forward=tuple(cam["forward"]), up=tuple(cam["up"]),
+                  fov_y_deg=float(cam["fov_y_deg"]),
+                  aspect=float(cam["aspect"]),
+                  near=float(cam["near"]), far=float(cam["far"]))
+
+
+def sample_lightmap(lightmap: Optional[Mapping[str, Any]],
+                    point: Vec3) -> float:
+    """`ResidentCell.ambient_at`, over the bytes rather than over a cell.
+
+    Split out so the kernel can be handed a lightmap without being handed a
+    `ResidentCell`, and so this file and `cell.py` cannot drift: a test asserts
+    they agree on the same bake.
+    """
+    if not lightmap:
+        return 1.0
+    data = lightmap.get("data") or b""
+    side = int(lightmap.get("side") or 0)
+    if not data or side <= 0:
+        return 1.0
+    voxel = float(lightmap.get("voxel_size") or 1.0) or 1.0
+    ix = int(point[0] // voxel)
+    iz = int(point[2] // voxel)
+    ix = 0 if ix < 0 else (side - 1 if ix >= side else ix)
+    iz = 0 if iz < 0 else (side - 1 if iz >= side else iz)
+    index = iz * side + ix
+    if index >= len(data):
+        return 1.0
+    return data[index] / 255.0
+
+
+def reference_place_batch(payload: Mapping[str, Any]) -> Dict[str, Any]:
+    """Cull a cell's placements and pack what survived.
+
+    Calls the real `Camera.sees_sphere`, the real `Transform.compose` and the
+    real `geometry.matrix4`/`pack_matrix4` - a reference that reimplemented any
+    of them would drift from the thing it is the reference for.
+    """
+    camera = camera_from(payload)
+    cell = payload["cell"]
+    cell_placement = Transform(position=tuple(cell["position"]),
+                               rotation=tuple(cell["rotation"]))
+    radius = float(payload["radius"])
+    flat = payload["placements"]
+    lightmap = payload.get("lightmap")
+
+    visible: List[int] = []
+    centers: List[List[float]] = []
+    distances: List[float] = []
+    packed = bytearray()
+
+    for index in range(len(flat) // PLACEMENT_FLOATS):
+        base = index * PLACEMENT_FLOATS
+        local = Transform(
+            position=(float(flat[base]), float(flat[base + 1]),
+                      float(flat[base + 2])),
+            rotation=(float(flat[base + 3]), float(flat[base + 4]),
+                      float(flat[base + 5]), float(flat[base + 6])))
+        world = cell_placement.compose(local)
+        centre = world.position
+        if not camera.sees_sphere(centre, radius):
+            continue
+        visible.append(index)
+        centers.append([centre[0], centre[1], centre[2]])
+        distances.append(camera.distance_to(centre))
+        packed.extend(pack_matrix4(matrix4(world)))
+        packed.extend(struct.pack("f", sample_lightmap(lightmap, centre)))
+
+    return {"visible": visible, "centers": centers, "distances": distances,
+            "instances": bytes(packed)}
+
+
 REFERENCE: Dict[str, Callable[[Mapping[str, Any]], Dict[str, Any]]] = {
     SEGMENT_QUERY: reference_segment_query,
     NEAREST_REGION: reference_nearest_region,
+    PLACE_BATCH: reference_place_batch,
 }
 
 
@@ -297,7 +404,134 @@ def generate_cases(seed: int = 20260909, count: int = 80) -> List[Case]:
                      "origin": list(origin),
                      "direction": [d / length * scale_by for d in delta],
                      "max_distance": 40.0}))
+    cases.extend(generate_place_batch_cases(seed + 1,
+                                            count=max(8, count // 2)))
     return cases
+
+
+def _spin(rng: random.Random) -> List[float]:
+    axis = [rng.uniform(-1.0, 1.0) for _ in range(3)]
+    norm = math.sqrt(sum(c * c for c in axis)) or 1.0
+    angle = rng.uniform(-math.pi, math.pi)
+    scale = math.sin(angle * 0.5) / norm
+    return [axis[0] * scale, axis[1] * scale, axis[2] * scale,
+            math.cos(angle * 0.5)]
+
+
+def _camera_block(position, forward, up=(0.0, 1.0, 0.0), fov=60.0,
+                  aspect=16.0 / 9.0, near=0.1, far=500.0):
+    return {"position": list(position), "forward": list(forward),
+            "up": list(up), "fov_y_deg": fov, "aspect": aspect,
+            "near": near, "far": far}
+
+
+def _lightmap(rng: random.Random, side: int = 8, as_bytes: bool = True):
+    data = bytes(rng.randrange(256) for _ in range(side * side))
+    return {"data": data if as_bytes else list(data), "side": side,
+            "voxel_size": 1.0}
+
+
+def generate_place_batch_cases(seed: int = 20260910,
+                               count: int = 34) -> List[Case]:
+    """Cases across the shapes that actually break a cull-and-pack.
+
+    The awkward ones on purpose: spheres straddling each frustum plane, a
+    rotated *cell* placement (so composition order matters), rotations on the
+    placements themselves (so a dropped quaternion shows), points outside the
+    lightmap (so the clamp shows), and a lightmap given as bytes *and* as a
+    list, because the native path has a fast route for the first and would
+    otherwise never see the second.
+    """
+    rng = random.Random(seed)
+    cases: List[Case] = []
+
+    def add(name, camera, cell, radius, placements, lightmap=None):
+        cases.append(Case(
+            case_id="place-%s" % name, kernel=PLACE_BATCH,
+            payload={"camera": camera, "cell": cell, "radius": radius,
+                     "placements": placements, "lightmap": lightmap}))
+
+    here = {"position": [0.0, 0.0, 0.0], "rotation": [0.0, 0.0, 0.0, 1.0]}
+    ahead = _camera_block((0.0, 2.0, -10.0), (0.0, 0.0, 1.0))
+    identity = [0.0, 0.0, 0.0, 1.0]
+
+    add("empty", ahead, here, 1.0, [])
+    add("one-visible", ahead, here, 1.0, [0.0, 0.0, 5.0] + identity)
+    add("one-behind", ahead, here, 1.0, [0.0, 0.0, -50.0] + identity)
+    add("one-beyond-far", ahead, here, 1.0, [0.0, 0.0, 900.0] + identity)
+    add("one-far-left", ahead, here, 1.0, [-500.0, 0.0, 5.0] + identity)
+    add("zero-radius", ahead, here, 0.0, [0.0, 0.0, 5.0] + identity)
+    add("huge-radius", ahead, here, 400.0, [0.0, 0.0, 900.0] + identity)
+
+    # straddling each plane: the sphere is outside but its radius reaches in
+    add("straddle-near", ahead, here, 4.0, [0.0, 2.0, -12.0] + identity)
+    add("straddle-far", ahead, here, 6.0, [0.0, 2.0, 493.0] + identity)
+    add("straddle-side", ahead, here, 6.0, [30.0, 2.0, 20.0] + identity)
+    add("straddle-top", ahead, here, 6.0, [0.0, 40.0, 20.0] + identity)
+
+    # a rotated cell, so composing in the wrong order is visible
+    for i in range(3):
+        cell = {"position": [rng.uniform(-40, 40), rng.uniform(-3, 3),
+                             rng.uniform(-40, 40)],
+                "rotation": _spin(rng)}
+        flat: List[float] = []
+        for _ in range(12):
+            flat.extend([rng.uniform(-20, 20), rng.uniform(-2, 4),
+                         rng.uniform(-20, 20)])
+            flat.extend(_spin(rng))
+        add("rotated-cell-%d" % i, ahead, cell, 1.0, flat)
+
+    # cameras pointing in awkward directions
+    for i, forward in enumerate(((0.0, 0.0, -1.0), (1.0, 0.0, 0.0),
+                                 (0.0, 0.999, 0.05), (-0.4, -0.6, 0.7))):
+        flat = []
+        for _ in range(16):
+            flat.extend([rng.uniform(-30, 30), rng.uniform(-5, 5),
+                         rng.uniform(-30, 30)])
+            flat.extend(identity)
+        add("aim-%d" % i, _camera_block((0.0, 2.0, 0.0), forward), here,
+            1.2, flat)
+
+    # lightmaps: bytes, list, absent, and points that fall outside it
+    crowd: List[float] = []
+    for _ in range(20):
+        crowd.extend([rng.uniform(-2, 10), 0.0, rng.uniform(-2, 10)])
+        crowd.extend(identity)
+    add("light-bytes", ahead, here, 1.5, crowd, _lightmap(rng))
+    add("light-list", ahead, here, 1.5, crowd, _lightmap(rng, as_bytes=False))
+    add("light-none", ahead, here, 1.5, crowd, None)
+    add("light-outside", ahead, here, 40.0,
+        [-90.0, 0.0, -90.0] + identity + [900.0, 0.0, 900.0] + identity,
+        _lightmap(rng, side=4))
+    add("light-empty", ahead, here, 1.5, crowd,
+        {"data": b"", "side": 0, "voxel_size": 1.0})
+
+    # crowds, which is the case the kernel exists for
+    for i, n in enumerate((1, 2, 50, 200)):
+        flat = []
+        for _ in range(n):
+            flat.extend([rng.uniform(-40, 40), rng.uniform(-4, 6),
+                         rng.uniform(-10, 60)])
+            flat.extend(_spin(rng))
+        add("crowd-%d" % i, ahead, here, 1.0, flat, _lightmap(rng, side=16))
+
+    while len(cases) < count:
+        flat = []
+        for _ in range(rng.randrange(1, 24)):
+            flat.extend([rng.uniform(-60, 60), rng.uniform(-8, 8),
+                         rng.uniform(-60, 60)])
+            flat.extend(_spin(rng))
+        add("fuzz-%d" % len(cases),
+            _camera_block((rng.uniform(-5, 5), rng.uniform(0, 6),
+                           rng.uniform(-20, 0)),
+                          (rng.uniform(-1, 1), rng.uniform(-0.4, 0.4), 1.0),
+                          fov=rng.uniform(35.0, 100.0),
+                          aspect=rng.uniform(1.0, 2.4)),
+            {"position": [rng.uniform(-20, 20), 0.0, rng.uniform(-20, 20)],
+             "rotation": _spin(rng)},
+            rng.uniform(0.2, 4.0), flat,
+            _lightmap(rng, side=8) if len(cases) % 2 else None)
+    return cases[:count]
 
 
 # ---------------------------------------------------------------------------
@@ -397,8 +631,127 @@ def _compare_nearest_region(case: Case, ref: Mapping[str, Any],
     return out
 
 
+def _place_ambiguous(payload: Mapping[str, Any], index: int) -> bool:
+    """Is this placement sitting on a frustum plane?
+
+    `sees_sphere` is four comparisons, and a sphere within tolerance of
+    equality in any of them may be decided either way by rounding. The same
+    hazard `_BOUND_EPSILON` exists for, and the same rule `segment_query` uses
+    for a candidate sitting on the radius.
+    """
+    camera = camera_from(payload)
+    radius = float(payload["radius"])
+    flat = payload["placements"]
+    cell = payload["cell"]
+    base = index * PLACEMENT_FLOATS
+    world = Transform(position=tuple(cell["position"]),
+                      rotation=tuple(cell["rotation"])).compose(
+        Transform(position=(float(flat[base]), float(flat[base + 1]),
+                            float(flat[base + 2])),
+                  rotation=(float(flat[base + 3]), float(flat[base + 4]),
+                            float(flat[base + 5]), float(flat[base + 6]))))
+    view = camera.to_view(world.position)
+    tan_x, tan_y = camera.tan_half_fov()
+    margins = (
+        (view[2] + radius) - camera.near,
+        camera.far - (view[2] - radius),
+        view[2] * tan_x + radius * math.sqrt(1.0 + tan_x * tan_x)
+        - abs(view[0]),
+        view[2] * tan_y + radius * math.sqrt(1.0 + tan_y * tan_y)
+        - abs(view[1]),
+    )
+    return any(abs(m) <= DISTANCE_TOLERANCE_M for m in margins)
+
+
+def _instances_by_index(result: Mapping[str, Any]) -> Dict[int, Tuple[float, ...]]:
+    """Instance floats keyed by the placement they belong to.
+
+    Keyed rather than positional because the two sides may legitimately
+    disagree about one boundary placement, and a positional comparison would
+    then report every instance after it as wrong.
+    """
+    raw = result.get("instances") or b""
+    if isinstance(raw, str):                     # a vector file that was not decoded
+        raw = bytes.fromhex(raw)
+    out: Dict[int, Tuple[float, ...]] = {}
+    stride = INSTANCE_FLOATS * 4
+    for slot, index in enumerate(result.get("visible") or ()):
+        offset = slot * stride
+        if offset + stride > len(raw):
+            # Short block: the answer is wrong, and the *comparator* must say
+            # so rather than raise. `struct.unpack_from` threw here on the
+            # first truncation test, which would have turned a caught mutant
+            # into an error in the harness.
+            continue
+        out[int(index)] = struct.unpack_from("%df" % INSTANCE_FLOATS, raw,
+                                             offset)
+    return out
+
+
+def _compare_place_batch(case: Case, ref: Mapping[str, Any],
+                         cand: Mapping[str, Any]) -> List[Divergence]:
+    out: List[Divergence] = []
+    ref_visible = [int(i) for i in ref["visible"]]
+    cand_visible = [int(i) for i in cand["visible"]]
+
+    for index in sorted(set(ref_visible) - set(cand_visible)):
+        if _place_ambiguous(case.payload, index):
+            continue
+        out.append(Divergence(case.case_id, case.kernel, "visible.missing",
+                              index, None, "the reference drew it"))
+    for index in sorted(set(cand_visible) - set(ref_visible)):
+        if _place_ambiguous(case.payload, index):
+            continue
+        out.append(Divergence(case.case_id, case.kernel, "visible.spurious",
+                              None, index, "the reference culled it"))
+
+    shared = set(ref_visible) & set(cand_visible)
+    if ([i for i in ref_visible if i in shared]
+            != [i for i in cand_visible if i in shared]):
+        out.append(Divergence(case.case_id, case.kernel, "visible.order",
+                              ref_visible, cand_visible,
+                              "placements come back in input order"))
+
+    ref_centre = {i: ref["centers"][s] for s, i in enumerate(ref_visible)}
+    cand_centre = {i: cand["centers"][s] for s, i in enumerate(cand_visible)}
+    ref_dist = {i: ref["distances"][s] for s, i in enumerate(ref_visible)}
+    cand_dist = {i: cand["distances"][s] for s, i in enumerate(cand_visible)}
+    for index in sorted(shared):
+        for axis in range(3):
+            if not _close(ref_centre[index][axis], cand_centre[index][axis]):
+                out.append(Divergence(
+                    case.case_id, case.kernel, "centers", ref_centre[index],
+                    cand_centre[index], "placement %d" % index))
+                break
+        if not _close(ref_dist[index], cand_dist[index]):
+            out.append(Divergence(case.case_id, case.kernel, "distances",
+                                  ref_dist[index], cand_dist[index],
+                                  "placement %d" % index))
+
+    ref_inst = _instances_by_index(ref)
+    cand_inst = _instances_by_index(cand)
+    for index in sorted(shared):
+        a, b = ref_inst.get(index), cand_inst.get(index)
+        if a is None or b is None:
+            out.append(Divergence(case.case_id, case.kernel, "instances.length",
+                                  a, b, "placement %d has no instance" % index))
+            continue
+        for slot in range(INSTANCE_FLOATS):
+            # Column-major, so 12..14 are the translation and are metres;
+            # everything else is a direction cosine, a constant, or a light
+            # level, and is compared against the dimensionless tolerance.
+            tol = (DISTANCE_TOLERANCE_M if slot in (12, 13, 14)
+                   else UNIT_TOLERANCE)
+            if not _close(a[slot], b[slot], tol):
+                out.append(Divergence(
+                    case.case_id, case.kernel, "instances[%d]" % slot,
+                    a[slot], b[slot], "placement %d" % index))
+    return out
+
+
 _COMPARATORS = {SEGMENT_QUERY: _compare_segment_query,
-                NEAREST_REGION: _compare_nearest_region}
+                NEAREST_REGION: _compare_nearest_region,
+                PLACE_BATCH: _compare_place_batch}
 
 
 def compare(cases: Sequence[Case], reference: Sequence[Mapping[str, Any]],
@@ -419,15 +772,43 @@ def compare(cases: Sequence[Case], reference: Sequence[Mapping[str, Any]],
 # Golden vectors
 # ---------------------------------------------------------------------------
 
+def _encode(value: Any) -> Any:
+    """JSON-safe, with `bytes` tagged rather than lost.
+
+    `place_batch` takes a lightmap and returns packed instances, and both are
+    bytes at runtime - which is the point, since hex on the hot path would cost
+    more than the kernel saves. So the *file format* carries the tag and the
+    runtime never sees it.
+    """
+    if isinstance(value, (bytes, bytearray)):
+        return {"__bytes__": bytes(value).hex()}
+    if isinstance(value, dict):
+        return {k: _encode(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_encode(v) for v in value]
+    return value
+
+
+def _decode(value: Any) -> Any:
+    if isinstance(value, dict):
+        if list(value) == ["__bytes__"]:
+            return bytes.fromhex(value["__bytes__"])
+        return {k: _decode(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_decode(v) for v in value]
+    return value
+
+
 def build_vectors(seed: int = 20260909, count: int = 80) -> Dict[str, Any]:
     cases = generate_cases(seed, count)
     return {"format": "lobster-conformance/1",
             "seed": seed,
             "authority": AUTHORITY,
             "distance_tolerance_m": DISTANCE_TOLERANCE_M,
+            "unit_tolerance": UNIT_TOLERANCE,
             "kernels": list(SEAM_KERNELS),
-            "cases": [c.to_dict() for c in cases],
-            "expected": run(cases)}
+            "cases": [_encode(c.to_dict()) for c in cases],
+            "expected": [_encode(r) for r in run(cases)]}
 
 
 def load_vectors(path: str) -> Tuple[List[Case], List[Dict[str, Any]]]:
@@ -437,7 +818,8 @@ def load_vectors(path: str) -> Tuple[List[Case], List[Dict[str, Any]]]:
         raise ConformanceError(
             "{0}: not a conformance vector file (format={1!r})".format(
                 path, raw.get("format")))
-    return [Case.from_dict(c) for c in raw["cases"]], list(raw["expected"])
+    return ([Case.from_dict(_decode(c)) for c in raw["cases"]],
+            [_decode(r) for r in raw["expected"]])
 
 
 def dump_vectors(seed: int = 20260909, count: int = 80) -> str:
