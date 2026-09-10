@@ -30,6 +30,8 @@ from .backend import (BackendError, BackendInfo, RenderBackend,
                       SelectionReport, probe, probe_with, select_backend,
                       selection_report)
 from .png import write_png
+from .recording import RecordingBackend, RecordingContext
+from .residency import GpuResidency, ResidencyError
 from .raster import (Framebuffer, RenderSettings, render_cell,
                      render_draw_list, render_resident)
 from .software_backend import SoftwareBackend
@@ -37,4 +39,6 @@ from .software_backend import SoftwareBackend
 __all__ = ["BackendError", "BackendInfo", "Framebuffer", "RenderBackend",
            "RenderSettings", "SelectionReport", "SoftwareBackend", "probe",
            "probe_with", "render_cell", "render_draw_list", "render_resident",
-           "select_backend", "selection_report", "write_png"]
+           "select_backend", "selection_report", "write_png",
+           "GpuResidency", "RecordingBackend", "RecordingContext",
+           "ResidencyError"]

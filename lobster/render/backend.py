@@ -55,7 +55,7 @@ enough that filling it in is mechanical once there is something to test against.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 
 class BackendError(Exception):
@@ -206,6 +206,28 @@ class RenderBackend:
     def release_cell(self, cell_id: str) -> None:
         """Drop a cell's geometry. Called on unload, so residency and GPU
         memory stay in step with each other."""
+
+    def upload_structure(self, cell: Any, structure_id: str,
+                         chunk_indices: Sequence[int]) -> None:
+        """Refresh one structure after a chunk was destroyed.
+
+        The only geometry that changes at runtime. A cell's meshes are static
+        for its residency *except* that bringing a wall down moves
+        `geometry_version` on that frame, and a re-upload of the touched
+        structure is cheaper than one of the cell.
+        """
+
+    def attach(self, bus: Any, manager: Any) -> Any:
+        """Bind this backend's buffer lifetime to residency (RENDER_SCOPE §4).
+
+        Subscribes to `on_enter_cell`, `on_exit_cell` and
+        `on_structure_damaged`. Nothing calls `upload_cell` directly, and
+        `CellManager` learns nothing about rendering - residency is geometry,
+        and reaching from there into presentation is the L8 mistake at a
+        different boundary.
+        """
+        from .residency import GpuResidency
+        return GpuResidency(self, manager).attach(bus)
 
     def render(self, draw_list: Any, cells_by_id: Dict[str, Any],
                settings: Any) -> Any:       # pragma: no cover - overridden

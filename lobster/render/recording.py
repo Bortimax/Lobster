@@ -312,3 +312,63 @@ def _buffers_in(values: Sequence[Any]) -> List[RecordingBuffer]:
         elif isinstance(value, (list, tuple)):
             found.extend(_buffers_in(value))
     return found
+
+
+# ---------------------------------------------------------------------------
+# A backend that records instead of drawing
+# ---------------------------------------------------------------------------
+
+class RecordingBackend:
+    """A `RenderBackend` that remembers what it was asked to do.
+
+    The companion to `RecordingContext`, one level up: that one stands in for
+    the GL library, this one stands in for the backend while there is not yet a
+    real GPU backend to bind residency to. It is what step 3's assertions are
+    written against, and it stays useful afterwards - a test about *residency*
+    should not need a GL context at all.
+    """
+
+    name = "recording"
+
+    def __init__(self) -> None:
+        self.uploaded: List[str] = []
+        self.released: List[str] = []
+        self.structure_uploads: List[Tuple[str, str, Tuple[int, ...]]] = []
+        self.frames = 0
+
+    @classmethod
+    def available(cls) -> Any:
+        from .backend import BackendInfo
+        return BackendInfo(name=cls.name, available=True,
+                           detail="records calls; draws nothing")
+
+    def upload_cell(self, cell: Any) -> None:
+        self.uploaded.append(cell.cell_id)
+
+    def release_cell(self, cell_id: str) -> None:
+        self.released.append(cell_id)
+
+    def upload_structure(self, cell: Any, structure_id: str,
+                         chunk_indices: Sequence[int]) -> None:
+        self.structure_uploads.append(
+            (cell.cell_id, structure_id, tuple(chunk_indices)))
+
+    def render(self, draw_list: Any, cells_by_id: Dict[str, Any],
+               settings: Any) -> Any:
+        self.frames += 1
+        return None
+
+    # -- queries -------------------------------------------------------------
+    def live_cells(self) -> List[str]:
+        """Uploaded and not released, in upload order."""
+        out: List[str] = []
+        released = list(self.released)
+        for cell_id in self.uploaded:
+            if cell_id in released:
+                released.remove(cell_id)
+            else:
+                out.append(cell_id)
+        return out
+
+    def upload_count(self, cell_id: str) -> int:
+        return self.uploaded.count(cell_id)

@@ -176,7 +176,9 @@ on one path and leak GPU memory silently, which is the argument for the bus.
    static per residency. Break-state changes structure geometry *at runtime*
    (`geometry_version` moves), so a damaged structure needs a re-upload of the
    touched chunk, not the cell. That is the one genuinely dynamic case and it
-   has a version number to key on already.
+   has a version number to key on already. **Settled:**
+   `RenderBackend.upload_structure(cell, structure_id, chunk_indices)`, driven
+   by `on_structure_damaged`.
 2. **Entities and props are impostors**, rebuilt per frame from poses. They do
    not belong in a residency buffer.
 3. **A budget.** GPU memory is memory (L6). `MAX_RESIDENT_CELLS` bounds the
@@ -212,15 +214,17 @@ draw-list construction or any geometry, all of which are already covered.
 
 ## 6. Build order
 
-1. **Fix the item-rendering gap** in the software backend, so the GPU backend is
-   written against a complete draw list rather than reproducing a hole.
-   *(Project owner: "Fix the software backend's item bug first.")*
-2. **The mock context and its assertions**, before the backend — same discipline
-   as D28 building the harness before the kernels, and for the same reason: it
-   cannot become a third named-but-unwritten thing.
-3. **`upload_cell`/`release_cell` wiring** via the event bus, with pairing
-   asserted.
-4. **The backend itself**: shaders, buffer packing, draw loop.
+1. ~~**Fix the item-rendering gap**~~ — **done** (`6f07e16`). Items were culled
+   in and dropped at draw time; they now render as their own impostor, pinned
+   by a dispatch check and a frame diff.
+2. ~~**The mock context and its assertions**~~ — **done** (`6482a28`).
+   `render/recording.py`, with its surface asserted against the installed
+   ModernGL so the fake cannot drift from the real API.
+3. ~~**`upload_cell`/`release_cell` wiring**~~ — **done**.
+   `render/residency.py`; the backend subscribes to `on_enter_cell`,
+   `on_exit_cell` and `on_structure_damaged`, `CellManager` learns nothing, and
+   `drift()` reports any disagreement between the GPU and the resident set.
+4. **The backend itself**: shaders, buffer packing, draw loop. ← *next*
 5. **`read_pixels`**, and a screenshot compared by eye.
 6. **CI**: the accelerated matrix gains an llvmpipe job on Linux — Mesa is one
    `apt` line, and it exercises the real GL path with no GPU present.
