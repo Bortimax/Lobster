@@ -238,6 +238,38 @@ MAX_ITEMS_PER_CELL = int(SELECTION_PICK_BUDGET_US
 ZONE_SHAPE_PRIMITIVES = ("box", "cylinder", "polygon")
 
 # ---------------------------------------------------------------------------
+# Model kinds - FROZEN (ASSET_SCOPE §1)
+# ---------------------------------------------------------------------------
+#
+# A model declares what kind it is; the pipeline dispatches. A scope that said
+# "a model is .vox" would make every exception an `if` in the loader, and the
+# project owner asked for exceptions. This is the same shape as the render
+# backend chain (D29) and the accelerator kernels (D40): a declared set, a
+# chooser that reports which it picked, every implementation held to the same
+# tests.
+
+#: `voxel` - a MagicaVoxel `.vox` file, named by `Model.asset_ref`. The default,
+#: and the Scope's own choice (§4.5).
+MODEL_VOXEL = "voxel"
+
+#: `primitive` - a shape and dimensions declared in the record itself. No file,
+#: no importer, no art tool. Removes the *need* for most exceptions rather than
+#: being one.
+MODEL_PRIMITIVE = "primitive"
+
+#: Frozen at two, for the reason `ZONE_SHAPE_PRIMITIVES` is frozen at three:
+#: adding a third is a decision with its own DECISIONS entry, not a one-line
+#: addition. Sprites and conventional meshes were both considered and declined
+#: with reasons (ASSET_SCOPE §1).
+MODEL_KINDS = (MODEL_VOXEL, MODEL_PRIMITIVE)
+
+#: The shapes a `primitive` model may be. Frozen on the same argument: three
+#: cover the cases that are genuinely geometric, and a fourth is a decision.
+#: Anything wanting a *file* is the mesh importer wearing a primitive's
+#: clothes, which ASSET_SCOPE §1 refuses in writing.
+PRIMITIVE_SHAPES = ("box", "cylinder", "quad")
+
+# ---------------------------------------------------------------------------
 # Bundle format
 # ---------------------------------------------------------------------------
 

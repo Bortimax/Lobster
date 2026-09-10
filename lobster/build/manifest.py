@@ -21,6 +21,7 @@ becoming a second authority on any of it.
       "version": 1,
       "packages": ["packages/world.json"],
       "vox_dir": "art",
+      "models": [{"model_ref": "model-barrel", "vox": "barrel.vox"}],
       "cells": [
         {
           "location_id": "cell-village",
@@ -144,10 +145,40 @@ class CellEntry:
 
 
 @dataclass(frozen=True)
+class ModelEntry:
+    """Which `.vox` file a `Model` record's `asset_ref` means.
+
+    Only `voxel` models need one: a `primitive` declares its geometry in the
+    record and resolves with no file, no `vox_dir` and no art pipeline at all
+    (ASSET_SCOPE §1).
+    """
+
+    model_ref: str
+    vox: str
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {"model_ref": self.model_ref, "vox": self.vox}
+
+    @classmethod
+    def from_dict(cls, raw: Mapping[str, Any]) -> "ModelEntry":
+        model_ref = raw.get("model_ref")
+        if not model_ref:
+            raise ManifestError("a models entry has no model_ref")
+        vox = raw.get("vox")
+        if not vox:
+            raise ManifestError(
+                "models entry {0!r} has no vox file. A model with no file is a "
+                "primitive, and declares its geometry in the record rather "
+                "than here".format(model_ref))
+        return cls(model_ref=model_ref, vox=vox)
+
+
+@dataclass(frozen=True)
 class Manifest:
     """The whole world's geometry inputs."""
 
     cells: Tuple[CellEntry, ...] = ()
+    models: Tuple[ModelEntry, ...] = ()
     packages: Tuple[str, ...] = ()
     vox_dir: str = "."
     source_path: Optional[str] = None
@@ -166,6 +197,12 @@ class Manifest:
     def location_ids(self) -> List[str]:
         return [c.location_id for c in self.cells]
 
+    def model(self, model_ref: str) -> Optional[ModelEntry]:
+        for entry in self.models:
+            if entry.model_ref == model_ref:
+                return entry
+        return None
+
     def resolve(self, relative: str) -> str:
         base = os.path.dirname(self.source_path) if self.source_path else "."
         if os.path.isabs(relative):
@@ -181,6 +218,7 @@ class Manifest:
     def to_dict(self) -> Dict[str, Any]:
         return {"format": MANIFEST_FORMAT, "version": MANIFEST_VERSION,
                 "packages": list(self.packages), "vox_dir": self.vox_dir,
+                "models": [m.to_dict() for m in self.models],
                 "cells": [c.to_dict() for c in self.cells]}
 
 
@@ -204,7 +242,17 @@ def manifest_from_dict(raw: Mapping[str, Any], *,
         raise ManifestError(
             "{0}: {1} appears more than once; a Location maps to exactly one "
             "cell (Scope 4)".format(source_path or "<dict>", duplicates))
+    models = tuple(ModelEntry.from_dict(m) for m in raw.get("models") or ())
+    duplicate_models = sorted(
+        {m.model_ref for m in models
+         if [x.model_ref for x in models].count(m.model_ref) > 1})
+    if duplicate_models:
+        raise ManifestError(
+            "{0}: {1} appears more than once in models; a Model maps to "
+            "exactly one file".format(source_path or "<dict>",
+                                      duplicate_models))
     return Manifest(cells=cells,
+                    models=models,
                     packages=tuple(raw.get("packages") or ()),
                     vox_dir=raw.get("vox_dir", "."),
                     source_path=source_path,

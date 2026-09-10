@@ -20,7 +20,9 @@ import unittest
 
 from lobster.build.builder import BuildError, build_from_file, build_world
 from lobster.build.lighting import bake_lightmap
-from lobster.build.lint import check_item_placements, ERROR_CODES, errors, lint_world
+from lobster.build.lint import (check_item_placements, check_models,
+                                ERROR_CODES, errors, lint_world)
+from lobster.constants import MODEL_KINDS, PRIMITIVE_SHAPES
 from lobster.build.manifest import ManifestError, load_manifest
 from lobster.build.navmesh_bake import bake_navmesh, unreachable_portals
 from lobster.build.navmesh_inference import (infer_load_bearing,
@@ -453,3 +455,142 @@ class TestItemPlacementLint(unittest.TestCase):
                      "item_current_location_in_content",
                      "item_placed_on_a_character"):
             self.assertIn(code, ERROR_CODES, code)
+
+
+class TestModelKindLint(unittest.TestCase):
+    """ASSET_SCOPE §1/§3 — a model declares exactly one kind, and the kind is
+    read *before* anything looks for a file.
+
+    That ordering is the whole reason this is a registry rather than an `if`:
+    a `primitive` has no `asset_ref` by construction, so a resolution check
+    running first would fail the cheapest kind against the strictest rule.
+    """
+
+    class FakeView:
+        def __init__(self, models):
+            self.models = models
+
+        def records_of_type(self, type_name):
+            return list(self.models) if type_name == "Model" else []
+
+        def record(self, record_id):
+            return None
+
+    class FakeManifest:
+        vox_dir = "art"
+
+        def __init__(self, entries=(), present=()):
+            self.entries = dict(entries)
+            self.present = set(present)
+            self.cells = ()
+            self.models = tuple(
+                type("E", (), {"model_ref": k, "vox": v})()
+                for k, v in self.entries.items())
+
+        def model(self, model_ref):
+            for entry in self.models:
+                if entry.model_ref == model_ref:
+                    return entry
+            return None
+
+        def resolve(self, relative):
+            return relative
+
+        def vox_path(self, name):
+            return name if name in self.present else "missing/" + name
+
+    def check(self, model, manifest=None):
+        return check_models(self.FakeView([model]), manifest)
+
+    # -- the one-of invariant ------------------------------------------------
+    def test_both_sources_is_an_error(self):
+        found = self.check({"id": "m", "asset_ref": "a",
+                            "primitive": {"shape": "box"}})
+        self.assertEqual([f["code"] for f in found], ["model_has_two_geometries"])
+        self.assertIn(found[0], errors(found))
+
+    def test_neither_source_is_an_error(self):
+        found = self.check({"id": "m"})
+        self.assertEqual([f["code"] for f in found], ["model_has_no_geometry"])
+        self.assertIn("silently does not appear", found[0]["detail"])
+
+    def test_a_primitive_alone_is_clean(self):
+        self.assertEqual(self.check({"id": "m", "primitive": {
+            "shape": "box", "size": [1, 1, 1], "material": 3}}), [])
+
+    def test_a_voxel_alone_is_clean_without_a_manifest(self):
+        """A content package can be linted on its own; only the resolution
+        half needs to know where the art lives."""
+        self.assertEqual(self.check({"id": "m", "asset_ref": "barrel"}), [])
+
+    # -- the ordering that matters -------------------------------------------
+    def test_a_primitive_never_trips_the_file_checks(self):
+        """The interaction ASSET_SCOPE §3 calls out. A manifest that knows
+        nothing about this model must not make it unresolved."""
+        manifest = self.FakeManifest()
+        found = self.check({"id": "m", "primitive": {"shape": "quad",
+                                                     "size": [1, 0, 1]}},
+                           manifest)
+        self.assertEqual(found, [],
+                         "a primitive was asked to resolve a file it does not "
+                         "have: {0}".format([f["code"] for f in found]))
+
+    def test_a_voxel_with_no_manifest_entry_is_unresolved(self):
+        found = self.check({"id": "m", "asset_ref": "barrel"},
+                           self.FakeManifest())
+        self.assertEqual([f["code"] for f in found], ["model_ref_unresolved"])
+
+    def test_a_voxel_whose_file_is_absent_says_the_path(self):
+        manifest = self.FakeManifest({"m": "barrel.vox"})
+        found = self.check({"id": "m", "asset_ref": "barrel"}, manifest)
+        self.assertEqual([f["code"] for f in found], ["model_file_missing"])
+        self.assertIn("barrel.vox", found[0]["detail"])
+
+    def test_a_voxel_that_resolves_is_clean(self):
+        """Against a file that is genuinely on disk. An earlier version of this
+        used a fake path and failed, because `os.path.exists` was right and the
+        fixture was not."""
+        import os
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            real = os.path.join(tmp, "barrel.vox")
+            with open(real, "wb") as handle:
+                handle.write(b"VOX ")
+            manifest = self.FakeManifest({"m": real}, present=[real])
+            self.assertEqual(self.check({"id": "m", "asset_ref": "barrel"},
+                                        manifest), [])
+
+    # -- the frozen shape set ------------------------------------------------
+    def test_the_shape_set_is_frozen_at_three(self):
+        self.assertEqual(PRIMITIVE_SHAPES, ("box", "cylinder", "quad"))
+        self.assertEqual(MODEL_KINDS, ("voxel", "primitive"))
+
+    def test_every_frozen_shape_is_accepted(self):
+        for shape in PRIMITIVE_SHAPES:
+            self.assertEqual(self.check({"id": "m", "primitive": {
+                "shape": shape, "size": [1, 1, 1]}}), [], shape)
+
+    def test_an_unknown_shape_is_refused_and_names_the_set(self):
+        found = self.check({"id": "m", "primitive": {"shape": "teapot"}})
+        self.assertEqual([f["code"] for f in found], ["unknown_primitive_shape"])
+        for shape in PRIMITIVE_SHAPES:
+            self.assertIn(shape, found[0]["detail"])
+
+    def test_a_shape_naming_a_file_is_refused(self):
+        """The slippery slope ASSET_SCOPE §1 refuses in writing: a mesh
+        importer wearing a primitive's clothes."""
+        found = self.check({"id": "m", "primitive": {"shape": "mesh",
+                                                     "path": "sword.gltf"}})
+        self.assertEqual([f["code"] for f in found], ["unknown_primitive_shape"])
+
+    # -- severity ------------------------------------------------------------
+    def test_the_four_real_faults_fail_a_build(self):
+        for code in ("model_has_no_geometry", "model_has_two_geometries",
+                     "unknown_primitive_shape", "model_ref_unresolved",
+                     "model_file_missing"):
+            self.assertIn(code, ERROR_CODES, code)
+
+    def test_an_unused_asset_is_reported_but_does_not_fail_a_build(self):
+        """An art directory mid-iteration is full of them, and failing a build
+        for a file nobody wired up yet teaches authors to ignore the linter."""
+        self.assertNotIn("model_asset_unused", ERROR_CODES)

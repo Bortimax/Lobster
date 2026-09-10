@@ -73,6 +73,14 @@
           "default": null,
           "_doc": "Scope 8: where an item's representation physically sits, once it is in the world rather than in an inventory. {position:[x,y,z], rotation:[x,y,z,w]}, metres, right-handed, Y up, in the coordinates of the cell named by Item.current_location_ref. REPLACE because an item is in one place: two mods that both move the same sword must not average it. Deliberately NOT save_layer_only, mirroring destroyed_chunks (DECISIONS.md D3), so a content package may ship a sword already lying on a table. Octopus's own current_location_ref IS save_layer_only, so a content layer cannot yet say which cell that table is in; the build lint reports that as 'item_placed_without_cell' rather than letting it fail silently. Lobster writes this field only through CellManager.place_item / remove_item, on the ordinary Octopus write path."
         }
+      ],
+      "Model": [
+        {
+          "name": "primitive",
+          "merge_policy": "REPLACE",
+          "default": null,
+          "_doc": "ASSET_SCOPE 1: geometry declared in the record instead of imported from a file. {shape: box|cylinder|quad, size: [x,y,z], material: <palette index>}. A Model carries `asset_ref` (a .vox file) OR `primitive`, never both and never neither - two sources of geometry is a question about which wins, and no sources is a model that silently does not appear. Both are build errors, the same co-null shape as Item.world_transform (D33). REPLACE because a model is one shape: two mods redefining the same crate must not average it."
+        }
       ]
     },
     "new_types": [

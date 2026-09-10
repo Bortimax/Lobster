@@ -38,9 +38,11 @@ must fail a build, so a caller decides policy and this module only reports (L4).
 
 from __future__ import annotations
 
+import os
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Set
 
-from ..constants import ZONE_SHAPE_PRIMITIVES
+from ..constants import (MODEL_KINDS, MODEL_PRIMITIVE, MODEL_VOXEL,
+                         PRIMITIVE_SHAPES, ZONE_SHAPE_PRIMITIVES)
 from ..octopus_bridge import octopus_lint, resolve_item_location
 
 #: Findings that fail a build rather than warn.
@@ -61,6 +63,11 @@ ERROR_CODES = frozenset({
     "item_location_without_transform",
     "item_current_location_in_content",
     "item_placed_on_a_character",
+    "model_has_no_geometry",
+    "model_has_two_geometries",
+    "unknown_primitive_shape",
+    "model_ref_unresolved",
+    "model_file_missing",
 })
 
 #: Manifest keys that would bake record-owned data into the bundle.
@@ -175,6 +182,117 @@ def check_item_placements(view: Any) -> List[Dict[str, Any]]:
                     "also has a world_transform. A carried item has no "
                     "representation lying on the floor".format(where),
                     record_id=item["id"]))
+    return out
+
+
+def model_kind(record: Mapping[str, Any]) -> Optional[str]:
+    """Which kind a `Model` declares, or None if it declares neither or both.
+
+    **Read before anything looks for a file.** A `primitive` has no
+    `asset_ref` by construction, so a resolution check that ran first would
+    fail the cheapest kind against the strictest rule - which is how a whole
+    feature gets written off as broken on first contact (ASSET_SCOPE §3).
+    """
+    has_asset = bool(record.get("asset_ref"))
+    has_primitive = bool(record.get("primitive"))
+    if has_asset and not has_primitive:
+        return MODEL_VOXEL
+    if has_primitive and not has_asset:
+        return MODEL_PRIMITIVE
+    return None
+
+
+def check_models(view: Any, manifest: Any = None) -> List[Dict[str, Any]]:
+    """Every `Model` declares exactly one kind, and a voxel one resolves.
+
+    The invariant is deliberately D33's shape: **`asset_ref` or `primitive`,
+    never both and never neither.** Two sources of geometry for one model is a
+    question about which wins; no sources is a model that silently does not
+    appear. Both fail the build rather than the frame.
+
+    `manifest` is optional so the record-shape half runs without a build tree -
+    a content package can be linted on its own, and only the file-resolution
+    half needs to know where the art lives.
+    """
+    out: List[Dict[str, Any]] = []
+    for model in view.records_of_type("Model"):
+        model_id = model["id"]
+        kind = model_kind(model)
+
+        if kind is None:
+            if model.get("asset_ref"):
+                out.append(finding(
+                    "model_has_two_geometries",
+                    "declares both an asset_ref and a primitive. A model is "
+                    "one shape; two sources is a question about which wins",
+                    record_id=model_id))
+            else:
+                out.append(finding(
+                    "model_has_no_geometry",
+                    "declares neither an asset_ref nor a primitive, so there "
+                    "is nothing to draw and anything referencing it silently "
+                    "does not appear",
+                    record_id=model_id))
+            continue
+
+        if kind == MODEL_PRIMITIVE:
+            shape = (model.get("primitive") or {}).get("shape")
+            if shape not in PRIMITIVE_SHAPES:
+                out.append(finding(
+                    "unknown_primitive_shape",
+                    "declares primitive shape {0!r}; the frozen set is {1} "
+                    "(ASSET_SCOPE §1). A shape naming a file is the mesh "
+                    "importer wearing a primitive's clothes".format(
+                        shape, list(PRIMITIVE_SHAPES)),
+                    record_id=model_id))
+            continue
+
+        # voxel, and only now does a file matter
+        if manifest is None:
+            continue
+        entry = manifest.model(model_id)
+        if entry is None:
+            out.append(finding(
+                "model_ref_unresolved",
+                "is a voxel model and no manifest models entry names it, so "
+                "the build cannot find its .vox",
+                record_id=model_id))
+            continue
+        path = manifest.vox_path(entry.vox)
+        if not os.path.exists(path):
+            out.append(finding(
+                "model_file_missing",
+                "resolves to {0!r}, which is not there".format(path),
+                record_id=model_id))
+    return out
+
+
+def check_unused_model_assets(manifest: Any, view: Any) -> List[Dict[str, Any]]:
+    """`.vox` files in `vox_dir` that nothing names. **A warning, not an error.**
+
+    An unused `.vox` is dead weight, not a broken build, and an art directory
+    mid-iteration is full of them. Failing somebody's build for a file they
+    have not wired up yet teaches them to ignore the linter, which costs more
+    than the dead file does (ASSET_SCOPE §3).
+    """
+    if manifest is None:
+        return []
+    directory = manifest.resolve(manifest.vox_dir)
+    if not os.path.isdir(directory):
+        return []
+    named = {entry.vox for entry in manifest.models}
+    for cell in manifest.cells:
+        if getattr(cell, "terrain_vox", None):
+            named.add(cell.terrain_vox)
+        for structure in getattr(cell, "structures", ()):
+            if getattr(structure, "vox", None):
+                named.add(structure.vox)
+    out: List[Dict[str, Any]] = []
+    for name in sorted(os.listdir(directory)):
+        if name.lower().endswith(".vox") and name not in named:
+            out.append(finding(
+                "model_asset_unused",
+                "{0!r} is in vox_dir and nothing references it".format(name)))
     return out
 
 
@@ -413,6 +531,8 @@ def lint_world(view: Any, manifest: Any) -> List[Dict[str, Any]]:
         findings.append(entry)
     findings.extend(check_spawn_paths(view))
     findings.extend(check_item_placements(view))
+    findings.extend(check_models(view, manifest))
+    findings.extend(check_unused_model_assets(manifest, view))
     findings.extend(check_zone_shapes(view))
     findings.extend(check_exterior_grid(view))
     findings.extend(check_no_bypass_channel(manifest))
