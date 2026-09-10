@@ -1,8 +1,11 @@
 # Asset scope — making `model_ref` mean something
 
-**Status: scoped, not built.** Items and props reach the draw list as bounded
-impostors with no mesh, and `Model.asset_ref` resolves to nothing. This is the
-document for closing that.
+**Status: §7 steps 1 and 2 built; 3-6 outstanding.** The kind registry and its
+lint are in (step 1), and `models.lobster_lib` now holds every `Model` meshed
+once, both kinds, in the vertex format the GL backend already draws (step 2,
+DECISIONS.md D47). What is still true: items and props reach the draw list as
+bounded impostors, because **nothing loads the library or draws from it yet** —
+that is steps 3, 4 and 5. There is still no budget, deliberately (§6).
 
 > **A renderer sized for the actual target.** Baked per-cell lighting, small
 > texture atlases or **vertex-colored voxels**, cell-boundary visibility,

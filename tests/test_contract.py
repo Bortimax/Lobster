@@ -364,6 +364,47 @@ class TestDeclaredInvariants(unittest.TestCase):
                          "the runtime must never write a file - break-state is "
                          "an Octopus record (L5); found {0}".format(offenders))
 
+    def test_every_module_this_package_needs_is_actually_committed(self):
+        """Not an invariant so much as a scar.
+
+        `.gitignore` carried an unanchored `build/` - meant for setuptools'
+        output at the repository root, and it silently matched the
+        `lobster/build/` *package* as well. Two new modules were written into
+        it and ignored; the first sign would have been a fresh clone failing to
+        import, in CI, with a message about the wrong thing entirely.
+
+        Skipped where git is not available rather than guessed at.
+        """
+        import subprocess
+        paths = []
+        for base in ("lobster", "tests"):
+            for root, _dirs, files in os.walk(os.path.join(REPO_ROOT, base)):
+                if "__pycache__" in root:
+                    continue
+                paths.extend(
+                    os.path.relpath(os.path.join(root, name),
+                                    REPO_ROOT).replace(os.sep, "/")
+                    for name in files if name.endswith(".py"))
+        self.assertTrue(paths, "the walk found no modules at all")
+        try:
+            # Bytes, not text: Windows would translate the separator on the way
+            # in, git would see a stray CR on every path and quote it back, and
+            # the failure message would be unreadable exactly when it matters.
+            result = subprocess.run(
+                ["git", "check-ignore", "--stdin"], cwd=REPO_ROOT,
+                input=chr(10).join(paths).encode("utf-8"), capture_output=True)
+        except (OSError, subprocess.SubprocessError) as e:
+            self.skipTest("git is not available here ({0})".format(e))
+        if result.returncode not in (0, 1):
+            self.skipTest("not a git checkout ({0})".format(
+                result.stderr.decode("utf-8", "replace").strip()))
+        ignored = sorted(line for line in
+                         result.stdout.decode("utf-8", "replace").splitlines()
+                         if line)
+        self.assertEqual(ignored, [],
+                         "these modules are git-ignored and would be missing "
+                         "from a fresh clone: {0}".format(ignored))
+
     def test_zone_shape_primitives_are_frozen_at_three(self):
         self.assertEqual(ZONE_SHAPE_PRIMITIVES, ("box", "cylinder", "polygon"))
 

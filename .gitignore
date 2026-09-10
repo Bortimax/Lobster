@@ -10,5 +10,8 @@ cells/
 *.dylib
 *.o
 *.obj
-build/
+# Anchored to the repository root: `lobster/build/` is a *package*, and an
+# unanchored `build/` silently ignored every new file in it. Two modules were
+# written into it before `git status` was read carefully enough to notice.
+/build/
 *.egg-info/

@@ -23,7 +23,7 @@ from lobster.build.builder import BuildError, build_from_file, build_world
 from lobster.build.lighting import bake_lightmap
 from lobster.build.lint import (check_item_placements, check_models,
                                 ERROR_CODES, errors, lint_world)
-from lobster.constants import MODEL_KINDS, PRIMITIVE_SHAPES
+from lobster.constants import LIBRARY_FILENAME, MODEL_KINDS, PRIMITIVE_SHAPES
 from lobster.build.manifest import ManifestError, load_manifest
 from lobster.build.navmesh_bake import bake_navmesh, unreachable_portals
 from lobster.build.navmesh_inference import (infer_load_bearing,
@@ -273,7 +273,10 @@ class TestBuildRoundTrip(unittest.TestCase):
         with BuildWorkspace() as ws:
             report = build_demo(ws)
             self.assertTrue(report.ok(), report.errors())
-            self.assertEqual(len(report.written), 2)
+            self.assertEqual(sorted(os.path.basename(p)
+                                    for p in report.written),
+                             ["cell-a.lobster_cell", "cell-b.lobster_cell",
+                              LIBRARY_FILENAME])
 
             bundle = read_bundle(os.path.join(ws.out, "cell-a.lobster_cell"))
             self.assertEqual(bundle.cell_id, "cell-a")
@@ -530,7 +533,7 @@ class TestModelKindLint(unittest.TestCase):
         nothing about this model must not make it unresolved."""
         manifest = self.FakeManifest()
         found = self.check({"id": "m", "primitive": {"shape": "quad",
-                                                     "size": [1, 0, 1]}},
+                                                     "size": [1, 2]}},
                            manifest)
         self.assertEqual(found, [],
                          "a primitive was asked to resolve a file it does not "
@@ -566,10 +569,56 @@ class TestModelKindLint(unittest.TestCase):
         self.assertEqual(PRIMITIVE_SHAPES, ("box", "cylinder", "quad"))
         self.assertEqual(MODEL_KINDS, ("voxel", "primitive"))
 
+    #: one legal spec per frozen shape. Written out rather than derived, so a
+    #: fourth shape breaks this test instead of quietly skipping itself.
+    LEGAL = {"box": {"size": [1.0, 1.0, 1.0]},
+             "cylinder": {"radius": 0.4, "height": 1.0},
+             "quad": {"size": [1.0, 2.0]}}
+
     def test_every_frozen_shape_is_accepted(self):
+        self.assertEqual(sorted(self.LEGAL), sorted(PRIMITIVE_SHAPES))
         for shape in PRIMITIVE_SHAPES:
-            self.assertEqual(self.check({"id": "m", "primitive": {
-                "shape": shape, "size": [1, 1, 1]}}), [], shape)
+            spec = dict(self.LEGAL[shape], shape=shape)
+            self.assertEqual(self.check({"id": "m", "primitive": spec}), [],
+                             shape)
+
+    # -- dimensions ----------------------------------------------------------
+    def test_a_shape_with_no_dimensions_is_refused(self):
+        """A zero-sized primitive meshes to nothing, and a model that meshes to
+        nothing is indistinguishable at runtime from a missing one."""
+        for shape in PRIMITIVE_SHAPES:
+            found = self.check({"id": "m", "primitive": {"shape": shape}})
+            self.assertEqual([f["code"] for f in found],
+                             ["invalid_primitive_dimensions"], shape)
+
+    def test_every_way_a_dimension_can_be_wrong(self):
+        for spec, why in (
+                ({"shape": "box", "size": [1, 1]}, "too few"),
+                ({"shape": "box", "size": [1, 1, 1, 1]}, "too many"),
+                ({"shape": "box", "size": [1, 0, 1]}, "zero"),
+                ({"shape": "box", "size": [1, -1, 1]}, "negative"),
+                ({"shape": "box", "size": [1, "1", 1]}, "a string"),
+                ({"shape": "box", "size": [1, True, 1]}, "a bool"),
+                ({"shape": "box", "size": [1, float("inf"), 1]}, "infinite"),
+                ({"shape": "box", "size": [1, float("nan"), 1]}, "nan"),
+                ({"shape": "box", "size": 1}, "not a list"),
+                ({"shape": "cylinder", "radius": 0.4}, "no height"),
+                ({"shape": "cylinder", "height": 1.0}, "no radius"),
+                ({"shape": "cylinder", "radius": [0.4], "height": 1.0},
+                 "a list where a number goes"),
+                ({"shape": "quad", "size": [1, 2, 3]}, "a third dimension")):
+            found = self.check({"id": "m", "primitive": spec})
+            self.assertEqual([f["code"] for f in found],
+                             ["invalid_primitive_dimensions"], why)
+
+    def test_the_dimension_rule_has_one_definition(self):
+        """The lint asks the generator, so a rule cannot hold in one and not
+        the other. Mutate the table and both move together."""
+        from lobster.build import model_mesher
+        for shape in PRIMITIVE_SHAPES:
+            spec = dict(self.LEGAL[shape], shape=shape)
+            self.assertIsNone(model_mesher.primitive_dimension_problem(spec))
+            self.assertEqual(self.check({"id": "m", "primitive": spec}), [])
 
     def test_an_unknown_shape_is_refused_and_names_the_set(self):
         found = self.check({"id": "m", "primitive": {"shape": "teapot"}})
@@ -585,10 +634,11 @@ class TestModelKindLint(unittest.TestCase):
         self.assertEqual([f["code"] for f in found], ["unknown_primitive_shape"])
 
     # -- severity ------------------------------------------------------------
-    def test_the_four_real_faults_fail_a_build(self):
+    def test_every_model_fault_fails_a_build(self):
         for code in ("model_has_no_geometry", "model_has_two_geometries",
-                     "unknown_primitive_shape", "model_ref_unresolved",
-                     "model_file_missing"):
+                     "unknown_primitive_shape", "invalid_primitive_dimensions",
+                     "model_ref_unresolved", "model_file_missing",
+                     "model_meshing_failed", "model_meshes_to_nothing"):
             self.assertIn(code, ERROR_CODES, code)
 
     def test_an_unused_asset_is_reported_but_does_not_fail_a_build(self):

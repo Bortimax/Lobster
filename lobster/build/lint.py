@@ -67,8 +67,15 @@ ERROR_CODES = frozenset({
     "model_has_no_geometry",
     "model_has_two_geometries",
     "unknown_primitive_shape",
+    "invalid_primitive_dimensions",
     "model_ref_unresolved",
     "model_file_missing",
+    # emitted by the library build (`library_writer`), not by a check here, for
+    # the reason `over_budget` is: it is only knowable once something has been
+    # meshed. It is an error for the same reason the rest are - a model that
+    # meshes to nothing is indistinguishable at runtime from a missing one.
+    "model_meshing_failed",
+    "model_meshes_to_nothing",
 })
 
 #: Manifest keys that would bake record-owned data into the bundle.
@@ -237,7 +244,8 @@ def check_models(view: Any, manifest: Any = None) -> List[Dict[str, Any]]:
             continue
 
         if kind == MODEL_PRIMITIVE:
-            shape = (model.get("primitive") or {}).get("shape")
+            spec = model.get("primitive") or {}
+            shape = spec.get("shape")
             if shape not in PRIMITIVE_SHAPES:
                 out.append(finding(
                     "unknown_primitive_shape",
@@ -246,6 +254,16 @@ def check_models(view: Any, manifest: Any = None) -> List[Dict[str, Any]]:
                     "importer wearing a primitive's clothes".format(
                         shape, list(PRIMITIVE_SHAPES)),
                     record_id=model_id))
+                continue
+            # Dimensions are checked by the generator that will use them, so
+            # there is one definition of "a legal box" rather than two that
+            # drift. A zero-sized primitive meshes to nothing and is a thing
+            # that silently does not appear - build time, not run time.
+            from .model_mesher import primitive_dimension_problem
+            problem = primitive_dimension_problem(spec)
+            if problem:
+                out.append(finding("invalid_primitive_dimensions", problem,
+                                   record_id=model_id))
             continue
 
         # voxel, and only now does a file matter

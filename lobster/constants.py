@@ -269,6 +269,18 @@ MODEL_KINDS = (MODEL_VOXEL, MODEL_PRIMITIVE)
 #: clothes, which ASSET_SCOPE §1 refuses in writing.
 PRIMITIVE_SHAPES = ("box", "cylinder", "quad")
 
+#: Sides on a `cylinder` primitive. Fixed, not a per-record field: a knob whose
+#: only effect is triangle count is a knob content gets wrong, and freezing it
+#: makes a cylinder's cost a constant the budget (ASSET_SCOPE 6) can multiply
+#: rather than a number it has to look up per model.
+CYLINDER_SEGMENTS = 12
+
+#: Bytes per model-library vertex: position, normal, tint - nine floats. This is
+#: the number `lobster.render.gl_backend.VERTEX_STRIDE` is, and it lives here
+#: because two modules now pack to it and a format with two definitions has one
+#: too many. A test pins them equal.
+MODEL_VERTEX_STRIDE = 9 * 4
+
 # ---------------------------------------------------------------------------
 # Bundle format
 # ---------------------------------------------------------------------------
@@ -276,6 +288,14 @@ PRIMITIVE_SHAPES = ("box", "cylinder", "quad")
 BUNDLE_FORMAT = "lobster-cell"
 BUNDLE_FORMAT_VERSION = 1
 BUNDLE_SUFFIX = ".lobster_cell"
+
+#: The shared model library: one meshed copy of every `Model`, beside the cells.
+#: Cells carry *placements*; baking a barrel's mesh into all fifty cells that
+#: show one would multiply a cell's bytes by its decoration (ASSET_SCOPE 2).
+LIBRARY_FORMAT = "lobster-model-library"
+LIBRARY_FORMAT_VERSION = 1
+LIBRARY_SUFFIX = ".lobster_lib"
+LIBRARY_FILENAME = "models" + LIBRARY_SUFFIX
 
 #: Package id under which Lobster declares its Octopus schema extension.
 GEOMETRY_PACKAGE_ID = "lobster.geometry"

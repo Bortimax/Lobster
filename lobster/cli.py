@@ -93,8 +93,16 @@ def cmd_build(args: argparse.Namespace) -> int:
                                      cell["navmesh"]["polys"],
                                      cell["micro_chunks"],
                                      sum(cell["declared_costs"].values())))
-        print("{0} bundle(s) written to {1}".format(len(report.written),
-                                                    args.out))
+        if report.library:
+            print("models.lobster_lib: {0} model(s), {1} triangles, "
+                  "{2} bytes".format(report.library["models"],
+                                     report.library["triangles"],
+                                     report.library["bytes"]))
+        # Counted, not len(report.written): the library is written too, and a
+        # "3 bundles" line for a two-cell world is the kind of small lie that
+        # gets believed.
+        bundles = [p for p in report.written if p.endswith(BUNDLE_SUFFIX)]
+        print("{0} bundle(s) written to {1}".format(len(bundles), args.out))
     return 0 if report.ok() else 1
 
 

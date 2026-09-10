@@ -38,13 +38,15 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from ..budgets import Budget, BudgetViolation
 from ..bundle import CellBundle, PropPlacement
-from ..constants import BUNDLE_SUFFIX, EXTERIOR_CELL_SIZE_M
+from ..constants import BUNDLE_SUFFIX, EXTERIOR_CELL_SIZE_M, LIBRARY_FILENAME
 from ..geometry import Transform, Vec3
+from ..model_library import ModelLibrary
 from ..navmesh import LoadBearingTable, Navmesh
 from ..octopus_bridge import content_view
 from ..structures import StructureError, StructureVoxelData
 from ..terrain import Terrain
 from .bundle_writer import write_bundle
+from .library_writer import build_library, write_library
 from .lighting import bake_lightmap, lighting_report
 from .lint import (check_exterior_terrain_fills_its_cell,
                    errors as lint_errors, format_findings, lint_world)
@@ -75,6 +77,9 @@ class BuildReport:
     findings: List[Dict[str, Any]] = dc_field(default_factory=list)
     cells: List[Dict[str, Any]] = dc_field(default_factory=list)
     written: List[str] = dc_field(default_factory=list)
+    #: what `models.lobster_lib` cost, per model and in total. Empty on a build
+    #: that never got as far as meshing.
+    library: Dict[str, Any] = dc_field(default_factory=dict)
 
     def errors(self) -> List[Dict[str, Any]]:
         return lint_errors(self.findings)
@@ -86,6 +91,7 @@ class BuildReport:
         return {"manifest": self.manifest_path, "ok": self.ok(),
                 "findings": list(self.findings),
                 "errors": self.errors(),
+                "library": dict(self.library),
                 "cells": list(self.cells), "written": list(self.written)}
 
 
@@ -258,8 +264,19 @@ def build_world(manifest: Manifest, *, out_dir: str,
     if report.errors():
         return report
 
+    # The shared model library, before any cell. A model that meshes to nothing
+    # is a build error the same way a one-way connection is, and the same rule
+    # applies: a world that fails is not baked at all rather than baked partly.
+    library, library_findings = build_library(view, manifest)
+    report.findings.extend(library_findings)
+    report.library = library.report()
+    if report.errors():
+        return report
+
     if write:
         os.makedirs(out_dir, exist_ok=True)
+        report.written.append(
+            write_library(library, os.path.join(out_dir, LIBRARY_FILENAME)))
     for cell in manifest.cells:
         entry = build_cell(view, manifest, cell, out_dir=out_dir, write=write)
         report.cells.append(entry)

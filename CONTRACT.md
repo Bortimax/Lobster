@@ -612,9 +612,10 @@ while ragdolling — is an animation decision and therefore Shrimp's.
 ## 5. Declared invariants
 
 1. **Geometry is data.** No private save format anywhere, including a mod's
-   sound-source list. `.lobster_cell` is a derived build artifact, deletable and
-   rebuildable; everything mutable is an Octopus record or field. The runtime
-   package has no file-write path at all, and a test asserts it.
+   sound-source list. `.lobster_cell` and `models.lobster_lib` are derived build
+   artifacts, deletable and rebuildable; everything mutable is an Octopus record
+   or field. The runtime package has no file-write path at all, and a test
+   asserts it.
 2. **Failure is visible and attributable.** Over-budget content raises
    `BudgetViolation` naming the specific record and the specific cell. Build
    findings carry `record_id` and `cell_id`. Quarantined break-state indices
@@ -818,6 +819,40 @@ relighting — the surviving chunks sample this, at their position, exactly as t
 did before. A cell with no baked lightmap returns `1.0`, so an unbaked or
 hand-made cell renders lit rather than black.
 
+### The model library — `models.lobster_lib`
+
+`lobster-build` writes **one** library beside the cells, holding each distinct
+`Model` meshed once. Cells carry *placements*; fifty barrels in a town are fifty
+`PropPlacement`s of one mesh, not fifty meshes (ASSET_SCOPE §2).
+
+```python
+from lobster.model_library import read_library
+
+library = read_library("cells/models.lobster_lib")
+mesh = library.model("model-crate")     # raises, naming what is there, if absent
+mesh.vertices                            # packed triangles, 36 bytes a vertex
+mesh.bounds                              # model-local AABB
+```
+
+Both model kinds arrive here as **the same thing**: a packed triangle stream of
+`position, normal, tint`, nine floats a vertex — the layout the GL backend
+already draws, and `MODEL_VERTEX_STRIDE` is the one definition of it. A `voxel`
+model is greedy-meshed by the `StructureMesher` that already exists; a
+`primitive` is generated from its record. Nothing downstream can tell which.
+
+Three properties are load-bearing and are asserted by tests:
+
+| property | why |
+|---|---|
+| **model-local, anchored** — centred on X and Z, sitting on `y = 0` | a placement rotates about the model origin, so a corner-anchored model would swing around its corner instead of turning in place |
+| **tints resolved, and unlit** | a `.vox` file's own palette is applied at build time, so nothing at runtime asks *which* palette; and a mesh shared by many cells cannot carry one cell's baked light |
+| **derived** (D1) | reproducible byte-for-byte from content, never authoritative, safe to delete — like `.lobster_cell` |
+
+A model that meshes to zero triangles is a **build error**
+(`model_meshes_to_nothing`), not a quiet gap: at runtime it is indistinguishable
+from a missing one. The library is built before any cell, so a world with a
+broken model bakes nothing at all rather than bakes partly.
+
 ---
 
 ## 8. Object selection
@@ -996,7 +1031,9 @@ invisible costs one wasted draw while culling something visible is a missing
 sword.
 
 Items reach the draw list as bounded entries **with no mesh**, exactly where
-props have always been. There is still no asset pipeline. See DECISIONS.md D37.
+props have always been. `models.lobster_lib` now holds every `Model` meshed once
+(§7, D47), but nothing loads it and nothing draws from it yet, so the impostor is
+still what an item looks like. See DECISIONS.md D37.
 
 ---
 
@@ -1079,8 +1116,11 @@ a runtime symptom weeks later (§15.2).
 | `model_has_no_geometry` | yes | a `Model` with neither `asset_ref` nor `primitive` |
 | `model_has_two_geometries` | yes | a `Model` with both — two sources and no rule for which wins |
 | `unknown_primitive_shape` | yes | a shape outside the frozen `box`/`cylinder`/`quad` |
+| `invalid_primitive_dimensions` | yes | a primitive whose size, radius or height is missing, zero, negative or not a number — it would mesh to nothing |
 | `model_ref_unresolved` | yes | a voxel model that no manifest `models` entry names |
 | `model_file_missing` | yes | a manifest entry whose `.vox` is not there |
+| `model_meshing_failed` | yes | a model the mesher could not turn into geometry; carries the reader's own message and the record id |
+| `model_meshes_to_nothing` | yes | a model that meshed to zero triangles — at runtime that is indistinguishable from a missing one |
 | `model_asset_unused` | **no** | a `.vox` in `vox_dir` nothing references — dead weight, not a broken build |
 | `sound_bypass_channel` | yes | a manifest trying to bake record-owned data (sound lists, zone shapes, spawn transforms) into the bundle (§4.5) |
 | `unknown_zone_shape` | yes | a fourth zone primitive |

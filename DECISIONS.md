@@ -2651,3 +2651,129 @@ The Events themselves are untouched: `on_exit_cell` still fires from
 `CellManager.unload`, still means residency, and is still what `GpuResidency`
 uses to release buffers (D44). It was never the Event that was wrong - only its
 onward journey into a trigger vocabulary where it reads as something else.
+
+---
+
+## D47 — The model library: what a model *is*, by the time anything draws it
+
+ASSET_SCOPE §7 step 2 asked for "the library artifact, both kinds" and named the
+format:
+
+> Mesh each distinct model once — voxels through the existing `StructureMesher`,
+> primitives through a dozen-line generator — **into the same vertex format**;
+> write `models.lobster_lib`; a reader with the same provenance discipline as
+> `read_bundle`. **Primitives first**, because they need no file and so prove the
+> library end to end before the importer is involved.
+
+That is what got built. `models.lobster_lib` holds each `Model` once as a packed
+triangle stream — `position, normal, tint`, nine floats a vertex — and by the
+time geometry is in it, nothing downstream can tell a `.vox` from a box.
+
+Building it forced five questions the scope did not answer. Each is recorded
+here because each is the kind that gets decided by whichever line of code runs
+first.
+
+### 1. Where is a model's origin?
+
+**Ambiguity.** A `PropPlacement` carries a `Transform`. Geometry out of the
+mesher spans `0..side` on every axis, because that is where the voxel grid is. A
+`.vox` file has no anchor convention at all.
+
+**Chosen: centred on X and Z, sitting on `y = 0`**, taken from the *meshed*
+extent.
+
+The decisive argument is **rotation, not tidiness.** A placement transform
+rotates about the model origin. A corner-anchored crate turned 45° does not turn
+in place — it swings around its corner and ends up somewhere else. "Rotate this"
+and "move this" would be the same field, and the bug would look like a content
+error every time.
+
+Taken from the meshed extent and not the grid, because `to_structure` pads a
+`.vox` up to a cube whose side divides by `MICRO_CHUNK_VOXELS`. The padding is
+empty and produces no faces, so anchoring on the grid would offset every model
+by half its padding — silently, and only the small ones. Mutation-tested with a
+2-voxel model in an 8-voxel cube: anchoring on the grid puts it 0.75 m away.
+
+Resolution order note: this is criterion 3, *deterministic attributable
+failure*, over criterion 5. The zero-policy answer was "store it as meshed and
+let the author compensate", which is cheaper here and wrong everywhere a model
+is ever rotated.
+
+### 2. Which palette?
+
+**Ambiguity.** A `.vox` carries its own 256-entry `RGBA` table. Lobster already
+has `DEFAULT_PALETTE`, which is what structures are drawn with. Two palettes,
+one `material` field.
+
+**Chosen: resolve to RGB at build time, per kind.** A voxel model uses its own
+file's table (index *i* is entry *i − 1*); a primitive, and a `.vox` with no
+`RGBA` chunk, uses `DEFAULT_PALETTE`.
+
+This looks like two rules and is one: **a model in the library holds colour,
+never an index**, so no runtime code ever has to ask *which* palette a model
+meant. The question only exists at build time, which is where it is answered and
+then destroyed. ASSET_SCOPE §1's whole case for `.vox` was that "a `.vox`
+carries a 256-entry palette, so the *or* is already answered" — ignoring that
+table would have thrown away the thing that argument rested on.
+
+### 3. Lighting
+
+**Chosen: library models are unlit.**
+
+A cell bundle multiplies its baked lightmap into its vertex tints, which is free
+and correct precisely because a cell's light cannot change during a residency
+(§7). A *shared* model has no cell — that is what makes it shareable — so baking
+any cell's light into it would be baking one cell's light into every cell.
+
+This is a bill deferred, not avoided: step 5's instanced draw needs a
+per-instance light term, and that is where it will be paid.
+
+### 4. Which models get meshed?
+
+**Chosen: every declared `Model`, not only the referenced ones.**
+
+Meshing on demand would make the artifact depend on which cells happen to place
+what, so adding a prop to one cell could change another cell's build. The
+linter already reports art nobody names (`model_asset_unused`, still a
+warning), and an unplaced model costs bytes in a derived file that is safe to
+delete.
+
+### 5. How many sides has a cylinder?
+
+**Chosen: `CYLINDER_SEGMENTS = 12`, a constant and not a record field.**
+
+Same argument as freezing the shape set. A knob whose only effect is triangle
+count is a knob content gets wrong, and freezing it makes a cylinder's cost a
+number the budget (§6) can multiply rather than one it has to look up per model.
+
+### Three new lint codes, and where they fire from
+
+| code | fires from | why it is an error |
+|---|---|---|
+| `invalid_primitive_dimensions` | `lint.check_models` | a zero, negative, missing or non-numeric size meshes to nothing |
+| `model_meshing_failed` | `library_writer.build_library` | the `.vox` could not be read; the record id is attached to the reader's own message |
+| `model_meshes_to_nothing` | `library_writer.build_library` | at runtime, indistinguishable from a missing model |
+
+The last two are emitted by the *build*, not by a check, for the reason
+`over_budget` is: they are only knowable once something has been meshed. So the
+library is built **before any cell**, and a world with a broken model bakes
+nothing at all rather than bakes partly — the same rule §15.2 already applies to
+a one-way connection. Mutation-tested by moving the library build after the cell
+loop: a cell bundle appears on disk beside a failed build.
+
+The dimension rule has exactly one definition. `lint` calls
+`model_mesher.primitive_dimension_problem`, the same function the generator
+calls before it meshes, so a rule cannot hold in one and not the other. Mutating
+the lint to invent its own answer fails.
+
+### A guard that could not fail, found by mutation
+
+The reader checks the header's `vertex_count` against the blob's length, and
+separately that the count is whole triangles. Written in that order, the second
+check was **unreachable**: any count that is not a multiple of three also fails
+the length comparison, so the test written for it passed with the check deleted.
+
+The order is now reversed and both are reachable and independently mutable. This
+is the D30 lesson again in a smaller frame — a guard nothing can make fire is a
+comment with a syntax error budget — and it was caught only because every new
+guard in this project gets mutated. Thirteen mutants, thirteen caught.

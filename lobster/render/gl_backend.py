@@ -34,6 +34,7 @@ import math
 import struct
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
+from ..constants import MODEL_VERTEX_STRIDE
 from ..geometry import Vec3
 from .backend import BackendError, BackendInfo, RenderBackend
 
@@ -94,8 +95,10 @@ void main() {
 }
 """
 
-#: bytes per vertex: position, normal, tint - all vec3 floats.
-VERTEX_STRIDE = 9 * 4
+#: bytes per vertex: position, normal, tint - all vec3 floats. Defined in
+#: `constants` because the model library packs to the same layout, and one
+#: format with two definitions eventually has two formats.
+VERTEX_STRIDE = MODEL_VERTEX_STRIDE
 VERTEX_FORMAT = "3f 3f 3f"
 VERTEX_ATTRIBUTES = ("in_position", "in_normal", "in_tint")
 
