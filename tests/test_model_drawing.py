@@ -318,6 +318,69 @@ class TestWhereTheMeshLands(DrawingFixture):
                            "placement is not reaching the model")
 
 
+class TestComposingTwoPlacements(unittest.TestCase):
+    """`Transform.compose` is what puts a model where both transforms say.
+
+    It exists because building two 4x4 matrices and multiplying them was most
+    of the per-placement cost the §6 budget is measured in (D51), and the
+    replacement is only worth having if it gives the same answer. Two mutations
+    - dropping the outer rotation, and composing in the wrong order - survived
+    everything until this test, because every fixture until now placed its
+    cells with a translation and no rotation.
+    """
+
+    def pairs(self, seed=3, count=40):
+        import random
+        rng = random.Random(seed)
+
+        def spin():
+            import math
+            axis = [rng.uniform(-1, 1) for _ in range(3)]
+            norm = math.sqrt(sum(c * c for c in axis)) or 1.0
+            angle = rng.uniform(-math.pi, math.pi)
+            s = math.sin(angle / 2.0) / norm
+            return (axis[0] * s, axis[1] * s, axis[2] * s,
+                    math.cos(angle / 2.0))
+
+        for _ in range(count):
+            yield (Transform(position=(rng.uniform(-9, 9), rng.uniform(-9, 9),
+                                       rng.uniform(-9, 9)), rotation=spin()),
+                   Transform(position=(rng.uniform(-9, 9), rng.uniform(-9, 9),
+                                       rng.uniform(-9, 9)), rotation=spin()),
+                   (rng.uniform(-4, 4), rng.uniform(-4, 4), rng.uniform(-4, 4)))
+
+    def test_it_agrees_with_applying_both_in_order(self):
+        for outer, inner, point in self.pairs():
+            composed = outer.compose(inner).apply(point)
+            twice = outer.apply(inner.apply(point))
+            for a, b in zip(composed, twice):
+                self.assertAlmostEqual(a, b, places=9)
+
+    def test_it_agrees_on_directions_too(self):
+        """A direction takes the rotation and not the translation, and getting
+        that wrong bends every normal a rotated cell draws."""
+        for outer, inner, point in self.pairs(seed=5):
+            composed = outer.compose(inner).rotate(point)
+            twice = outer.rotate(inner.rotate(point))
+            for a, b in zip(composed, twice):
+                self.assertAlmostEqual(a, b, places=9)
+
+    def test_the_order_is_not_symmetric(self):
+        """If it were, composing the wrong way round would be undetectable."""
+        outer, inner, point = next(iter(self.pairs(seed=7, count=1)))
+        self.assertNotEqual(outer.compose(inner).apply(point),
+                            inner.compose(outer).apply(point))
+
+    def test_identity_on_either_side_changes_nothing(self):
+        outer, _inner, point = next(iter(self.pairs(seed=11, count=1)))
+        for a, b in zip(outer.compose(Transform()).apply(point),
+                        outer.apply(point)):
+            self.assertAlmostEqual(a, b, places=9)
+        for a, b in zip(Transform().compose(outer).apply(point),
+                        outer.apply(point)):
+            self.assertAlmostEqual(a, b, places=9)
+
+
 # ---------------------------------------------------------------------------
 # Lighting, which the library deliberately does not carry
 # ---------------------------------------------------------------------------

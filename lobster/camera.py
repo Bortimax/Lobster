@@ -63,6 +63,18 @@ class Camera:
                 "{0}..{1}".format(self.near, self.far))
         if self.aspect <= 0.0:
             raise CameraError("aspect must be positive")
+        # Two pure functions of these immutable fields, computed once here.
+        # Both were being recomputed inside `to_view` and `sees_sphere`, which
+        # a cull calls once per drawable per cell per frame - so a 400-prop
+        # cell orthonormalised the same basis three thousand six hundred times
+        # a frame and called `math.tan` twice as often. Found by profiling the
+        # per-placement cost the ASSET_SCOPE §6 budget is derived from (D51).
+        forward = normalize(self.forward)
+        right = normalize(cross(self.up, forward))
+        object.__setattr__(self, "_basis",
+                           (right, normalize(cross(forward, right)), forward))
+        ty = math.tan(math.radians(self.fov_y_deg) * 0.5)
+        object.__setattr__(self, "_tan_half_fov", (ty * self.aspect, ty))
 
     # -- construction --------------------------------------------------------
     @classmethod
@@ -92,11 +104,8 @@ class Camera:
         return normalize(cross(self.up, self.forward))
 
     def basis(self) -> Tuple[Vec3, Vec3, Vec3]:
-        """(right, up, forward), orthonormalised."""
-        forward = normalize(self.forward)
-        right = normalize(cross(self.up, forward))
-        up = normalize(cross(forward, right))
-        return right, up, forward
+        """(right, up, forward), orthonormalised. Computed once, at birth."""
+        return self._basis
 
     # -- transforms ----------------------------------------------------------
     def to_view(self, point: Vec3) -> Vec3:
@@ -111,8 +120,7 @@ class Camera:
         return (dot(rel, right), dot(rel, up), dot(rel, forward))
 
     def tan_half_fov(self) -> Tuple[float, float]:
-        ty = math.tan(math.radians(self.fov_y_deg) * 0.5)
-        return ty * self.aspect, ty
+        return self._tan_half_fov
 
     def project(self, point: Vec3, width: int, height: int
                 ) -> Optional[Tuple[float, float, float]]:

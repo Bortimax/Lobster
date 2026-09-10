@@ -74,6 +74,17 @@ class ModelMesh:
     bounds: AABB = dc_field(
         default_factory=lambda: AABB((0.0, 0.0, 0.0), (0.0, 0.0, 0.0)))
 
+    def __post_init__(self) -> None:
+        # Computed once, here, because it is a pure function of immutable
+        # bounds and it is asked once per placement per frame. It used to be
+        # eight square roots per barrel per frame, which showed up as a fifth
+        # of the measured per-placement cost the budget is derived from (D51).
+        object.__setattr__(self, "_radius", max(
+            (x * x + y * y + z * z) ** 0.5
+            for x in (self.bounds.minimum[0], self.bounds.maximum[0])
+            for y in (self.bounds.minimum[1], self.bounds.maximum[1])
+            for z in (self.bounds.minimum[2], self.bounds.maximum[2])))
+
     def vertex_count(self) -> int:
         return len(self.vertices) // MODEL_VERTEX_STRIDE
 
@@ -94,11 +105,7 @@ class ModelMesh:
         rotation turns it - so this radius is the same whichever way the thing
         is facing, which a bounds-centre radius would not be.
         """
-        return max(
-            (x * x + y * y + z * z) ** 0.5
-            for x in (self.bounds.minimum[0], self.bounds.maximum[0])
-            for y in (self.bounds.minimum[1], self.bounds.maximum[1])
-            for z in (self.bounds.minimum[2], self.bounds.maximum[2]))
+        return self._radius
 
 
 @dataclass(frozen=True)

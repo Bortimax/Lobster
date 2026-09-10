@@ -1,15 +1,16 @@
 # Asset scope — making `model_ref` mean something
 
-**Status: §7 steps 1-5 built; only 6 outstanding.** The kind registry and its
-lint are in (step 1); `models.lobster_lib` holds every `Model` meshed once, both
-kinds, in the vertex format the GL backend already draws (step 2, D47); model
-buffers are reference-counted across resident cells — props *and* items — with
-`drift()` extended to catch a leak (steps 3 and 5, D48/D50); the software
-rasteriser draws props and items as real geometry (step 4, D49); and the GPU
-path draws them **instanced**, one draw per distinct model per frame (step 5,
-D50). What remains is **the budget** (§6), which is now measurable for the first
-time because meshing and residency are real — which is exactly the order §6
-insisted on.
+**Status: built.** All six steps of §7 are done. The kind registry and its lint
+(step 1); `models.lobster_lib`, both kinds meshed once into the vertex format
+the GL backend already draws (step 2, D47); reference-counted model residency
+across resident cells, props *and* items, with `drift()` extended to catch a
+leak (steps 3 and 5, D48/D50); real geometry on the software rasteriser (step 4,
+D49); instanced drawing on the GPU, one draw per distinct model per frame (step
+5, D50); and a **derived** budget — a declared slice over a measured unit, taken
+last, exactly as §6 insisted (step 6, D51).
+
+`model_ref` means something now. What it still does not mean is a skinned
+character or a second authoring format — §5 and §8 are unchanged.
 
 > **A renderer sized for the actual target.** Baked per-cell lighting, small
 > texture atlases or **vertex-colored voxels**, cell-boundary visibility,

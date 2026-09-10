@@ -87,6 +87,16 @@ def quat_rotate(q: Quat, v: Vec3) -> Vec3:
             v[2] + w * tz + (x * ty - y * tx))
 
 
+def quat_mul(a: Quat, b: Quat) -> Quat:
+    """`a` then `b` applied to a vector as `a * b`: rotate by `b`, then by `a`."""
+    ax, ay, az, aw = a
+    bx, by, bz, bw = b
+    return (aw * bx + ax * bw + ay * bz - az * by,
+            aw * by - ax * bz + ay * bw + az * bx,
+            aw * bz + ax * by - ay * bx + az * bw,
+            aw * bw - ax * bx - ay * by - az * bz)
+
+
 def quat_conjugate(q: Quat) -> Quat:
     return (-q[0], -q[1], -q[2], q[3])
 
@@ -122,6 +132,24 @@ class Transform:
     def rotate(self, direction: Vec3) -> Vec3:
         """Local direction -> world direction. Rotation only, no translation."""
         return quat_rotate(self.rotation, direction)
+
+    def compose(self, inner: "Transform") -> "Transform":
+        """`self` applied *after* `inner`, as one transform.
+
+        `outer.compose(inner).apply(p)` equals `outer.apply(inner.apply(p))`,
+        and a test asserts exactly that over random pairs.
+
+        Both are rigid - rotation and translation, no scale, which is what every
+        placement in this project is - so composing them is a quaternion product
+        and one rotated vector. Building two 4x4 matrices and multiplying them
+        gives the same answer for sixty-four multiply-adds instead of about
+        twenty, and that difference is the whole per-placement cost of a frame
+        (DECISIONS.md D51).
+        """
+        return Transform(
+            position=add(self.position, quat_rotate(self.rotation,
+                                                    inner.position)),
+            rotation=quat_mul(self.rotation, inner.rotation))
 
     def inverse_rotate(self, direction: Vec3) -> Vec3:
         """World direction -> local direction.

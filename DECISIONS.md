@@ -3090,3 +3090,113 @@ entries (D47, D49, here), which is either a habit worth naming or a sign that
 mutation testing is doing its job. Probably both.
 
 Eighteen mutants, eighteen caught.
+
+---
+
+## D51 — The budget, taken last, and the three things it made me fix first
+
+ASSET_SCOPE §6 put this step at the end and said why:
+
+> **No placeholder ceiling. Not even a temporary one.** ... A number invented
+> before there is anything to measure survives: it acquires tests, it gets
+> quoted in a document, and by the time real numbers exist it is load-bearing
+> and nobody remembers it was a guess.
+
+So it was taken last, and the first measurement said the feature was unusable.
+That is the whole value of the ordering.
+
+### The measurement, and what it cost to make it honest
+
+The unit ASSET_SCOPE named was *"meshed bytes per placement"*. That unit stopped
+existing at step 2: a shared library means mesh bytes are per **model**, and
+what a placement costs is a *frame*, not memory. So there are two budgets, and
+the scope's own sentence is the casualty of its own step 2. Worth saying plainly
+rather than quietly measuring something else.
+
+The per-placement frame cost, measured on the slope from 25 to 800 placements in
+one cell, taking the worst slope rather than the median (D38's choice, same
+reason):
+
+| | us/placement | what changed |
+|---|---|---|
+| first cut | **29.9** | two 4x4 matrices and a 64-multiply product per placement; a bound radius recomputed from eight square roots every frame |
+| compose | **15.3** | rigid transforms composed as a quaternion product; `ModelMesh` computes its radius once |
+| camera | **12.8** | `Camera.basis()` and `tan_half_fov()` computed at birth instead of inside every cull test |
+
+At 29.9 the derivation lands on **eight props per cell**, which is a correct
+division and a useless ceiling. The project's own answer to that is on the page
+in D38 — *"raising it further means making a pick cheaper again, not editing the
+number"* — so three things got fixed before any number was written down:
+
+1. **`Transform.compose`.** Every placement is rigid, which the shader comment
+   already relied on, so composing two of them is a quaternion product and one
+   rotated vector rather than two matrix builds and a 64-multiply product.
+2. **`ModelMesh.bound_radius`** was eight square roots, recomputed per placement
+   per frame, for a pure function of immutable bounds. Computed once now.
+3. **`Camera.basis()` and `Camera.tan_half_fov()`** were recomputed *inside*
+   every `sees_sphere`. A 400-prop cell orthonormalised the same basis 3,600
+   times a frame and called `math.tan` twice as often. Both are pure functions
+   of immutable fields; both are computed at construction now.
+
+The third was not a model bug at all. It was in the culler every backend has
+used since the beginning, and it took profiling a budget to notice - which is an
+argument for deriving budgets rather than choosing them that I had not expected
+to be making.
+
+### The numbers
+
+**Memory.** The library is the first resident thing that is not per cell, so it
+cannot be charged to one - a barrel two cells both place would be paid for
+twice. It gets a share of the transition peak on the same terms as a cell, and
+D20's divisor gains one: `RESIDENT_MEMORY_SHARES = MAX_RESIDENT_CELLS + 1`.
+`DEFAULT_MAX_CELL_BYTES` drops from 21.3 MiB to 19.2, which is the honest price
+of a tenth claimant and the same argument D20 made in the first place - a
+default that cannot compose is a lie.
+
+Checked against the **whole** library at build time rather than the resident
+subset at runtime: conservative, exact, and one number instead of a second
+ledger. If the whole thing fits, every subset does.
+
+**Frame.** `MODEL_DRAW_BUDGET_US = 4000` is a declared slice, bigger than
+hit-testing's 2000 and picking's 1000 because it is what a frame is *for*, and
+small enough that the three together are 7 ms of a 16.7 ms frame - under half,
+with the majority left to the game above. Divided by the measured 12.8 that is
+**312 visible placements a frame**, and divided again by the ring, **34 props a
+cell**.
+
+### Two ceilings that look like a contradiction and are not
+
+`MAX_ITEMS_PER_CELL` is 173 and `MAX_PROP_PLACEMENTS_PER_CELL` is 34. Both are
+derived; neither is wrong.
+
+A pick tests every item in **every** resident cell with no culling at all, so
+173 is a fixed worst case. Drawing culls, so its worst case is not "every cell
+full" but "this many things on screen" - which is why the drawing ceiling is a
+frame counter and the picking one is a per-cell count. A cell that fills its
+item allowance *and* puts every one of them on screen trips `model_frame_us`,
+loudly, naming the metric. That is the two ceilings composing, not colliding,
+and there is a test that says so in one line.
+
+### Octopus's own hook
+
+§6 asked that `cost_estimate` be *"honoured rather than re-derived"*. Honouring
+it here means reporting the truth against it: Lobster measures the mesh exactly
+and cannot write the record back, so a declared estimate the geometry has
+outgrown becomes `model_cost_estimate_low` - a **warning**, because an out of
+date estimate is dead weight in a report rather than a broken build. Zero means
+"not declared" (it is Octopus's default for the field) and is never a finding.
+
+### And a mutation harness that was judging nothing
+
+Four of this entry's mutants were reported SURVIVED without ever running:
+`python -m unittest tests` runs **zero** tests and exits 0. The dangerous
+direction is worse - a mistyped target errors, exits non-zero, and is reported
+*caught*, which is a false pass.
+
+The harness now runs every target once unmutated and refuses to believe a
+verdict from one that does not both pass and report a non-zero test count. Two
+of the four mutants it had been ignoring were real gaps: nothing tested
+`Transform.compose` against applying both transforms in order, and nothing built
+a world with too many props.
+
+Twenty mutants, twenty caught - and this time the count means something.

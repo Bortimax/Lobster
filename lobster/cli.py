@@ -34,7 +34,12 @@ from .budgets import (Budget, BudgetViolation, MemoryLedger,
 from .bundle import BundleError, read_bundle, read_header
 from .cell import CellError, CellManager
 from .constants import (BUNDLE_SUFFIX, EXTERIOR_CELL_SIZE_M,
-                        MAX_TRANSITION_PEAK_BYTES, MICRO_CHUNK_VOXELS,
+                        MAX_MODEL_LIBRARY_BYTES,
+                        MAX_PROP_PLACEMENTS_PER_CELL,
+                        MAX_TRANSITION_PEAK_BYTES,
+                        MAX_VISIBLE_PLACEMENTS_PER_FRAME,
+                        MICRO_CHUNK_VOXELS, MODEL_DRAW_BUDGET_US,
+                        PER_PLACEMENT_US,
                         SPATIAL_GRID_CELL_M, VOXEL_SIZE_M,
                         ZONE_SHAPE_PRIMITIVES)
 from .events import CONTRACT_EVENTS, EventBus, PAYLOAD_TYPES
@@ -233,6 +238,16 @@ def cmd_budgets(args: argparse.Namespace) -> int:
     _emit({"cells": rows,
            "over_transition_peak": composed,
            "peak_transition_limit": MAX_TRANSITION_PEAK_BYTES,
+           # The model budget (ASSET_SCOPE 6, D51). Printed beside the per-cell
+           # numbers because it is the one ceiling that is *not* per cell, and
+           # a reader who cannot see it here would not know it exists.
+           "model_budget": {
+               "library_bytes_limit": MAX_MODEL_LIBRARY_BYTES,
+               "draw_budget_us": MODEL_DRAW_BUDGET_US,
+               "per_placement_us": PER_PLACEMENT_US,
+               "max_visible_placements_per_frame":
+                   MAX_VISIBLE_PLACEMENTS_PER_FRAME,
+               "max_prop_placements_per_cell": MAX_PROP_PLACEMENTS_PER_CELL},
            "shell_constants": {
                "exterior_cell_size_m": EXTERIOR_CELL_SIZE_M,
                "voxel_size_m": VOXEL_SIZE_M,

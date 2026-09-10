@@ -607,10 +607,13 @@ def _instance_bytes(item: Any, cell: Any) -> bytes:
     ambient at their position"*.
     """
     from .raster import _light_at
-    world = _matmul(_model_matrix(item.cell_placement),
-                    _model_matrix(item.transform))
-    origin = (world[0][3], world[1][3], world[2][3])
-    return _pack_matrix(world) + struct.pack("f", _light_at(cell, origin))
+    # Composed as transforms and turned into a matrix once, rather than built
+    # as two matrices and multiplied. Both are rigid, so the product is a
+    # quaternion multiply and one rotated vector - and this runs once per
+    # visible placement per frame, which is what the §6 budget is measured in.
+    world = item.cell_placement.compose(item.transform)
+    return (_pack_matrix(_model_matrix(world))
+            + struct.pack("f", _light_at(cell, world.position)))
 
 
 def _impostor_vertices(item: Any, settings: Any) -> bytes:

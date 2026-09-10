@@ -643,12 +643,45 @@ Declared in `lobster/constants.py`, overridable **downward** per cell via
 | `DEFAULT_MAX_MICRO_CHUNKS_PER_CELL` | 8,000 |
 | `DEFAULT_MAX_ACTIVE_SKELETONS_PER_CELL` | 32 |
 | `MAX_TRANSITION_PEAK_BYTES` | 192 MiB |
-| `DEFAULT_MAX_CELL_BYTES` | **21.3 MiB — derived**, `MAX_TRANSITION_PEAK_BYTES // MAX_RESIDENT_CELLS` |
+| `RESIDENT_MEMORY_SHARES` | 10 — the nine cells, plus the shared model library |
+| `DEFAULT_MAX_CELL_BYTES` | **19.2 MiB — derived**, `MAX_TRANSITION_PEAK_BYTES // RESIDENT_MEMORY_SHARES` |
+| `MAX_MODEL_LIBRARY_BYTES` | **19.2 MiB — derived**, one share, on the same terms as a cell |
+| `MODEL_DRAW_BUDGET_US` | 4,000 — declared slice for assembling one frame's model instances |
+| `PER_PLACEMENT_US` | **12.8 — measured** on the slope, 25 to 800 placements |
+| `MAX_VISIBLE_PLACEMENTS_PER_FRAME` | **312 — derived**, slice ÷ measured unit |
+| `MAX_PROP_PLACEMENTS_PER_CELL` | **34 — derived**, frame ceiling ÷ `MAX_RESIDENT_CELLS` |
 | `PROJECTILE_BROAD_RADIUS_M` | 2.5 — a *floor*; the real margin is derived per rig |
 
 A cell declaring a *higher* ceiling than the shell default is itself a
 violation. `python -m lobster.cli budgets --cells DIR` prints declared versus
 actual per cell.
+
+### The model budget, and why picking allows more items than drawing shows
+
+Three ceilings, all derived (ASSET_SCOPE §6, D51):
+
+* **`MAX_VISIBLE_PLACEMENTS_PER_FRAME`** is the real one. Culling is what bounds
+  drawing, so the honest quantity is *visible* placements per frame rather than
+  authored ones per cell. `build_draw_list` counts them and raises
+  `BudgetViolation(metric="model_frame_us")` naming the microseconds.
+  `max_visible_placements=0` disables it, the `HitTester` convention.
+* **`MAX_PROP_PLACEMENTS_PER_CELL`** is the build-time proxy: the frame ceiling
+  divided by the ring, checked per cell so a Location may declare lower
+  (`lobster_budget.max_prop_placements`). Props with no `model_ref` are not
+  counted — an impostor is the cheaper path and is not charged either.
+* **`MAX_MODEL_LIBRARY_BYTES`** bounds the meshed library, checked against the
+  whole of it at build time. Conservative on purpose: if the whole thing fits,
+  every resident subset does.
+
+**`MAX_ITEMS_PER_CELL` (173) is larger than `MAX_PROP_PLACEMENTS_PER_CELL` (34),
+and that is not a contradiction.** They answer different questions. A pick tests
+every item in every resident cell with no culling at all, so 173 is a fixed
+worst case (D38). Drawing culls, so its worst case is bounded by the frame
+counter instead — and a cell that fills its item allowance *and* puts every one
+of them on screen trips `model_frame_us`, loudly, naming the metric.
+
+Raising any of them means making a placement cheaper, not editing the number.
+`PER_PLACEMENT_US` has already come down from 29.9 to 12.8 that way.
 
 ### Walking holds both cells; jumping does not
 
@@ -1224,6 +1257,8 @@ a runtime symptom weeks later (§15.2).
 | `prop_model_ref_unresolved` | yes | a prop naming a `Model` no record declares — Octopus's `dangling_reference` covers `Item.model_ref`; a prop lives in the manifest and had no owner |
 | `model_meshing_failed` | yes | a model the mesher could not turn into geometry; carries the reader's own message and the record id |
 | `model_meshes_to_nothing` | yes | a model that meshed to zero triangles — at runtime that is indistinguishable from a missing one |
+| `model_library_over_budget` | yes | the meshed library exceeds its share of the transition peak; the message names the largest models |
+| `model_cost_estimate_low` | **no** | a `Model` whose declared `cost_estimate` is under what it actually meshes to — Octopus budgets against the declared number, so it is the one that is wrong |
 | `model_asset_unused` | **no** | a `.vox` in `vox_dir` nothing references — dead weight, not a broken build |
 | `sound_bypass_channel` | yes | a manifest trying to bake record-owned data (sound lists, zone shapes, spawn transforms) into the bundle (§4.5) |
 | `unknown_zone_shape` | yes | a fourth zone primitive |

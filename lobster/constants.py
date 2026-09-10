@@ -78,6 +78,12 @@ DEFAULT_MAX_ACTIVE_SKELETONS_PER_CELL = 32
 #: Declared first, because the per-cell default is derived from it.
 MAX_TRANSITION_PEAK_BYTES = 192 * 1024 * 1024
 
+#: Resident things that share the transition peak: the cells, plus the shared
+#: model library. The library is the first resident thing that is **not** per
+#: cell (ASSET_SCOPE 2), so it cannot be charged to one - a barrel two cells
+#: both place would be paid for twice - and it gets a share of its own.
+RESIDENT_MEMORY_SHARES = MAX_RESIDENT_CELLS + 1
+
 #: Accounted bytes one cell may hold resident (terrain mesh + structures +
 #: navmesh + lightmap + metadata).
 #:
@@ -88,7 +94,19 @@ MAX_TRANSITION_PEAK_BYTES = 192 * 1024 * 1024
 #: was silently obliged to declare lower than the default - an obligation
 #: nothing stated. A default that cannot compose is a lie, so it is now the
 #: largest value that does. See DECISIONS.md D20.
-DEFAULT_MAX_CELL_BYTES = MAX_TRANSITION_PEAK_BYTES // MAX_RESIDENT_CELLS
+#:
+#: The divisor gained one when the model library became resident: the same
+#: argument D20 made, applied to a new claimant on the same peak (D51).
+DEFAULT_MAX_CELL_BYTES = MAX_TRANSITION_PEAK_BYTES // RESIDENT_MEMORY_SHARES
+
+#: Meshed bytes the whole model library may hold.
+#:
+#: One share of the transition peak, on the same terms as a cell. Checked
+#: against the **whole** library at build time rather than against the resident
+#: subset at runtime, which is conservative on purpose: any subset fits if the
+#: whole thing does, and one exact build-time number beats a runtime pool that
+#: would need its own ledger to say anything different (D51).
+MAX_MODEL_LIBRARY_BYTES = MAX_TRANSITION_PEAK_BYTES // RESIDENT_MEMORY_SHARES
 
 #: **Floor** for the broad-phase margin, not the margin itself.
 #:
@@ -228,6 +246,63 @@ PER_PICKED_ITEM_US = 0.64
 #: means making a pick cheaper again, not editing the number.
 MAX_ITEMS_PER_CELL = int(SELECTION_PICK_BUDGET_US
                          / (PER_PICKED_ITEM_US * MAX_RESIDENT_CELLS))
+
+# ---------------------------------------------------------------------------
+# Model placement budget (ASSET_SCOPE 6, DECISIONS.md D51)
+# ---------------------------------------------------------------------------
+
+#: What assembling one frame's model instances may spend, across every resident
+#: cell.
+#:
+#: A declared slice, like `HIT_TEST_FRAME_BUDGET_US` and
+#: `SELECTION_PICK_BUDGET_US`, and it composes with them: 2000 + 1000 + 4000 is
+#: 7 ms of a 16.7 ms frame at 60 FPS, so Lobster's three per-frame CPU jobs
+#: together take under half of it and the majority stays with the game above.
+#:
+#: Bigger than the other two because it is what a frame is *for*: hit-testing
+#: answers a question about combat and picking answers one about a crosshair,
+#: while this is the work of putting the world on screen.
+MODEL_DRAW_BUDGET_US = 4_000.0
+
+#: Marginal cost of one visible placement per frame: cull it, compose its world
+#: transform, sample the light where it stands, pack seventeen floats.
+#:
+#: Measured on the slope, 25 to 800 placements in one cell, taking the *worst*
+#: slope rather than the median - the same choice D38 made and for the same
+#: reason. It has come down twice, both times by removing work:
+#:
+#: | | us/placement | what changed |
+#: |---|---|---|
+#: | first cut | 29.9 | two 4x4 matrices and a 64-multiply product per placement, and a bound radius recomputed from eight square roots every frame |
+#: | compose | 15.3 | rigid transforms composed as a quaternion product; `ModelMesh` computes its radius once |
+#: | camera | **12.8** | `Camera.basis()` and `tan_half_fov()` computed at birth instead of inside every cull test |
+#:
+#: Raising the ceiling below means making a placement cheaper again - the
+#: accelerator seam (D26) is where a fourth line of that table would come from -
+#: not editing this number.
+PER_PLACEMENT_US = 12.8
+
+#: Visible model placements one frame may assemble, across every resident cell.
+#:
+#: The runtime ceiling, and the real one: culling is what bounds this, so the
+#: honest quantity is *visible* placements per frame rather than authored ones
+#: per cell.
+MAX_VISIBLE_PLACEMENTS_PER_FRAME = int(MODEL_DRAW_BUDGET_US / PER_PLACEMENT_US)
+
+#: Prop placements one cell may author.
+#:
+#: Derived from the frame ceiling the way D20 derives a cell's memory from the
+#: transition peak: the worst case is every resident cell at its ceiling with
+#: everything on screen at once.
+#:
+#: **`MAX_ITEMS_PER_CELL` is deliberately larger than this**, and the two do not
+#: contradict each other because they answer different questions. A pick tests
+#: every item in every resident cell with no culling at all, so 173 is a fixed
+#: worst case. Drawing culls, so its worst case is bounded by the frame counter
+#: instead - and a cell that fills its item allowance *and* puts every one of
+#: them on screen trips `model_frame_us`, loudly, naming the metric.
+MAX_PROP_PLACEMENTS_PER_CELL = int(MAX_VISIBLE_PLACEMENTS_PER_FRAME
+                                   / MAX_RESIDENT_CELLS)
 
 # ---------------------------------------------------------------------------
 # Zone shape primitives - FROZEN (§4)

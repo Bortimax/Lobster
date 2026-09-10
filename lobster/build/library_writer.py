@@ -58,6 +58,22 @@ def build_library(view: Any, manifest: Manifest) -> Tuple[ModelLibrary,
                 "model_meshing_failed", str(e), record_id=model_id))
             continue
 
+        # `Model` is `accountable=True` in Octopus and carries `cost_estimate`
+        # (ASSET_SCOPE 6: "Octopus's own budget hook and should be honoured
+        # rather than re-derived"). Honouring it here means *reporting the
+        # truth against it*: Lobster measures the mesh exactly and cannot write
+        # the record back, so a declared estimate the geometry has outgrown is
+        # a content fact worth surfacing. A warning, not an error - an out of
+        # date estimate is dead weight in a report, not a broken build.
+        estimate = record.get("cost_estimate") or 0
+        if estimate and mesh.nbytes() > estimate:
+            findings.append(finding(
+                "model_cost_estimate_low",
+                "declares cost_estimate {0} and meshes to {1} bytes. Octopus "
+                "budgets against the declared number, so it is the one that "
+                "is wrong".format(estimate, mesh.nbytes()),
+                record_id=model_id))
+
         if mesh.is_empty():
             findings.append(finding(
                 "model_meshes_to_nothing",

@@ -38,7 +38,8 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from ..budgets import Budget, BudgetViolation
 from ..bundle import CellBundle, PropPlacement
-from ..constants import BUNDLE_SUFFIX, EXTERIOR_CELL_SIZE_M, LIBRARY_FILENAME
+from ..constants import (BUNDLE_SUFFIX, EXTERIOR_CELL_SIZE_M,
+                         LIBRARY_FILENAME, MAX_MODEL_LIBRARY_BYTES)
 from ..geometry import Transform, Vec3
 from ..model_library import ModelLibrary
 from ..navmesh import LoadBearingTable, Navmesh
@@ -209,6 +210,8 @@ def build_cell(view: Any, manifest: Manifest, cell: CellEntry, *,
     budget_findings: List[Dict[str, Any]] = []
     for metric, value in (("max_structure_voxels", bundle.structure_voxel_count()),
                           ("max_micro_chunks", bundle.micro_chunk_count()),
+                          ("max_prop_placements",
+                           sum(1 for p in bundle.props if p.model_ref)),
                           ("max_bytes", sum(bundle.nbytes().values()))):
         try:
             budget.check(metric, value, record_id=cell.location_id)
@@ -238,6 +241,33 @@ def build_cell(view: Any, manifest: Manifest, cell: CellEntry, *,
         write_bundle(bundle, path)
         entry_report["path"] = path
     return entry_report
+
+
+def check_library_budget(library: Any) -> List[Dict[str, Any]]:
+    """The library is one share of the transition peak (D51).
+
+    Checked against the **whole** library rather than against whatever subset a
+    ring happens to reference, which is conservative on purpose: if the whole
+    thing fits, every subset does, and one exact build-time number beats a
+    runtime pool that would need its own ledger to say anything different.
+
+    The finding names the biggest models, because "19 MiB is too much" is not
+    actionable and "these four are 14 MiB of it" is.
+    """
+    total = library.nbytes()
+    if total <= MAX_MODEL_LIBRARY_BYTES:
+        return []
+    worst = sorted(library.models.values(), key=lambda m: -m.nbytes())[:4]
+    return [{"code": "model_library_over_budget", "record_id": None,
+             "cell_id": None,
+             "detail": "the model library meshes to {0} bytes against a "
+                       "ceiling of {1} - one share of the transition peak, on "
+                       "the same terms as a resident cell. The largest are "
+                       "{2}".format(
+                           total, MAX_MODEL_LIBRARY_BYTES,
+                           ", ".join("{0} ({1} bytes)".format(m.model_ref,
+                                                              m.nbytes())
+                                     for m in worst))}]
 
 
 def _manifest_hash(cell: CellEntry) -> str:
@@ -270,6 +300,7 @@ def build_world(manifest: Manifest, *, out_dir: str,
     library, library_findings = build_library(view, manifest)
     report.findings.extend(library_findings)
     report.library = library.report()
+    report.findings.extend(check_library_budget(library))
     if report.errors():
         return report
 

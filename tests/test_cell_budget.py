@@ -176,17 +176,23 @@ class TestCellTransitionBudget(unittest.TestCase):
         """The check Shrimp asked for: declared ceilings summed over the union
         a transition actually holds."""
         from lobster.budgets import transition_peak_findings
-        mib = 1024 * 1024
+        # Expressed against the default rather than in megabytes: a cell may
+        # declare *lower* and never higher, so a literal that happened to be
+        # under the default became a `BudgetViolation` the moment the default
+        # moved - which it did when the model library took a share of the
+        # transition peak (D51). Two cells at the ceiling against a peak that
+        # only fits one and a bit is the scenario, whatever the ceiling is.
+        greedy = DEFAULT_MAX_CELL_BYTES
         package = {"format": "lce-package", "package_id": "mod.greedy",
                    "version": "1.0.0", "schema_compat": {"min": 1, "max": 1},
                    "operations": [
                        {"op": "PATCH", "id": cell, "field": "lobster_budget",
-                        "value": {"max_bytes": 21 * mib}}
+                        "value": {"max_bytes": greedy}}
                        for cell in (VILLAGE, FIELD)]}
         session = build_session(extra_packages=[package])
         view = OctopusBridge(session).frame()
 
-        findings = transition_peak_findings(view, peak_limit=30 * mib)
+        findings = transition_peak_findings(view, peak_limit=int(greedy * 1.5))
         by_cell = {f["record_id"]: f for f in findings}
         self.assertIn(VILLAGE, by_cell)
         finding = by_cell[VILLAGE]

@@ -28,7 +28,10 @@ from __future__ import annotations
 from dataclasses import dataclass, field as dc_field
 from typing import (Any, Dict, Iterable, List, Optional, Sequence, Tuple)
 
+from .budgets import BudgetViolation
 from .camera import Camera
+from .constants import (MAX_VISIBLE_PLACEMENTS_PER_FRAME,
+                        MODEL_DRAW_BUDGET_US, PER_PLACEMENT_US)
 from .geometry import AABB, Transform, Vec3, distance
 from .tiers import DORMANT
 
@@ -82,6 +85,17 @@ class DrawItem:
                 "model_ref": self.model_ref}
 
 
+def modelled_placement_cost_us(placements: int) -> float:
+    """What this frame's model assembly cost, from a counter alone.
+
+    Deterministic and machine-independent, exactly like
+    `constants.modelled_cost_us`: the budget is a statement about a measured
+    per-unit cost times a count, not about a wall clock that varies with what
+    else the machine is doing.
+    """
+    return placements * PER_PLACEMENT_US
+
+
 @dataclass
 class VisibilityStats:
     """What culling actually saved. Measurable, like every other budget."""
@@ -90,15 +104,24 @@ class VisibilityStats:
     cells_drawn: int = 0
     items_considered: int = 0
     items_drawn: int = 0
+    #: visible props and items with a model - the unit the §6 budget is in.
+    #: Props and items together, because they cost the same and go through the
+    #: same path; splitting them would budget an implementation detail.
+    placements_drawn: int = 0
 
     def culled(self) -> int:
         return self.items_considered - self.items_drawn
+
+    def placement_cost_us(self) -> float:
+        return modelled_placement_cost_us(self.placements_drawn)
 
     def to_dict(self) -> Dict[str, Any]:
         return {"cells_considered": self.cells_considered,
                 "cells_drawn": self.cells_drawn,
                 "items_considered": self.items_considered,
-                "items_drawn": self.items_drawn, "culled": self.culled()}
+                "items_drawn": self.items_drawn, "culled": self.culled(),
+                "placements_drawn": self.placements_drawn,
+                "placement_cost_us": self.placement_cost_us()}
 
 
 @dataclass(frozen=True)
@@ -163,6 +186,7 @@ def build_draw_list(camera: Camera,
                     placements: Optional[Dict[str, Transform]] = None,
                     include_dormant_entities: bool = False,
                     library: Any = None,
+                    max_visible_placements: int = MAX_VISIBLE_PLACEMENTS_PER_FRAME,
                     view: Any = None) -> DrawList:
     """Cull a set of resident cells against the camera.
 
@@ -180,6 +204,28 @@ def build_draw_list(camera: Camera,
     placements = placements or {}
     stats = VisibilityStats()
     items: List[DrawItem] = []
+
+    def charge_placement(cell_id: str) -> None:
+        """One more thing with a mesh on screen. Raises when the frame is full.
+
+        Counted here and not in a backend because *visible* is decided here,
+        and because both backends pay it - the software path walks the mesh,
+        the GPU path composes an instance. `0` disables the ceiling, the same
+        convention `HitTester` uses.
+        """
+        stats.placements_drawn += 1
+        if (max_visible_placements
+                and stats.placements_drawn > max_visible_placements):
+            raise BudgetViolation(
+                cell_id=cell_id, record_id=None, metric="model_frame_us",
+                value=round(stats.placement_cost_us(), 1),
+                limit=MODEL_DRAW_BUDGET_US,
+                detail="{0} visible placements at {1} us each; the ceiling is "
+                       "{2} across every resident cell. Culling is what bounds "
+                       "this, so the fix is fewer things on screen at once - "
+                       "or a cheaper placement (ASSET_SCOPE 6)".format(
+                           stats.placements_drawn, PER_PLACEMENT_US,
+                           max_visible_placements))
 
     for cell in cells:
         stats.cells_considered += 1
@@ -227,6 +273,8 @@ def build_draw_list(camera: Camera,
                 cell_placement=placement, center=center, radius=radius,
                 distance=camera.distance_to(center),
                 model_ref=model_ref, transform=prop.transform))
+            if model_ref:
+                charge_placement(cell.cell_id)
             drew_any = True
 
         # -- placed items (Scope 8) --------------------------------------------
@@ -255,6 +303,8 @@ def build_draw_list(camera: Camera,
                     distance=camera.distance_to(center),
                     model_ref=model_ref,
                     transform=Transform.from_dict(transform)))
+                if model_ref:
+                    charge_placement(cell.cell_id)
                 drew_any = True
 
         # -- entities ----------------------------------------------------------

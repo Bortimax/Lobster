@@ -77,6 +77,7 @@ ERROR_CODES = frozenset({
     # meshes to nothing is indistinguishable at runtime from a missing one.
     "model_meshing_failed",
     "model_meshes_to_nothing",
+    "model_library_over_budget",
 })
 
 #: Manifest keys that would bake record-owned data into the bundle.
