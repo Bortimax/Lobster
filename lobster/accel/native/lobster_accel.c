@@ -683,10 +683,24 @@ static PyObject *place_batch(PyObject *self, PyObject *payload)
         (const char *)packed, kept * INSTANCE_FLOATS * (Py_ssize_t)sizeof(float));
     if (!instances) goto done;
 
-    result = Py_BuildValue("{s:N,s:N,s:N,s:N}",
-                           "visible", visible, "centers", centers,
-                           "distances", distances, "instances", instances);
-    if (result) { visible = centers = distances = instances = NULL; }
+    /* Built by hand rather than with `Py_BuildValue("{s:N,...}")`.
+     *
+     * "N" steals a reference, and when `Py_BuildValue` fails partway it
+     * releases the values it has already taken - so the cleanup below would
+     * then be a second release of the same objects. It needs `PyDict_SetItem`
+     * to fail, which means an allocation failure, which means the one time it
+     * happens is the worst possible time. `PyDict_SetItemString` takes its own
+     * reference and leaves ownership here, so there is one owner throughout
+     * and the `done:` block is unconditionally correct. */
+    result = PyDict_New();
+    if (!result) goto done;
+    if (PyDict_SetItemString(result, "visible", visible) != 0
+        || PyDict_SetItemString(result, "centers", centers) != 0
+        || PyDict_SetItemString(result, "distances", distances) != 0
+        || PyDict_SetItemString(result, "instances", instances) != 0) {
+        Py_CLEAR(result);
+        goto done;
+    }
 
 done:
     PyMem_Free(packed);

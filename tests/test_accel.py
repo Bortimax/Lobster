@@ -304,6 +304,78 @@ class TestTheNativeKernelDoesNotLeak(unittest.TestCase):
         self.assertLessEqual(sys.getrefcount(struck), before[0])
         self.assertLessEqual(sys.getrefcount(nearest), before[1])
 
+    def place_payload(self, lightmap):
+        return {"camera": {"position": [0.0, 2.0, -10.0],
+                           "forward": [0.0, 0.0, 1.0], "up": [0.0, 1.0, 0.0],
+                           "fov_y_deg": 60.0, "aspect": 1.7, "near": 0.1,
+                           "far": 500.0},
+                "cell": {"position": [0.0, 0.0, 0.0],
+                         "rotation": [0.0, 0.0, 0.0, 1.0]},
+                "radius": 1.0,
+                "placements": [0.0, 0.0, 5.0, 0.0, 0.0, 0.0, 1.0] * 20,
+                "lightmap": lightmap}
+
+    def test_place_batch_returns_the_references_it_takes(self):
+        """It holds a pointer *into* the lightmap for the length of the call,
+        so it has to keep the object alive and then let it go again."""
+        from lobster.conformance import PLACE_BATCH
+        data = bytes(bytearray(64))
+        lightmap = {"data": data, "side": 8, "voxel_size": 1.0}
+        payload = self.place_payload(lightmap)
+        kernel = self.kernels()[PLACE_BATCH]
+        self.assertTrue(kernel(payload)["visible"], "fixture must draw")
+
+        watched = (data, lightmap, payload["placements"], payload["camera"])
+        names = ("lightmap bytes", "lightmap", "placements", "camera")
+        before = [sys.getrefcount(o) for o in watched]
+        for _ in range(2000):
+            kernel(payload)
+        gc.collect()
+        # Counted through the *same* comprehension as the baseline, and only
+        # then compared. Taking the second reading inside `for o in zip(...)`
+        # reported one extra reference on every object - including two the
+        # kernel never touches - because a `zip` keeps its last result tuple
+        # alive to reuse it. A uniform, wrong +1 that looked exactly like a
+        # leak, in the test written to find leaks.
+        after = [sys.getrefcount(o) for o in watched]
+        for name, was, now in zip(names, before, after):
+            self.assertLessEqual(now, was,
+                                 "{0}: a reference per call, and only the "
+                                 "memory grows".format(name))
+
+    def test_place_batch_does_not_leak_the_other_lightmap_route(self):
+        """A sequence takes `PySequence_Fast`, which returns an *owned*
+        reference where the bytes route returns a borrowed pointer. Two routes,
+        two ownership rules, and only one of them is exercised at runtime."""
+        from lobster.conformance import PLACE_BATCH
+        rows = list(range(64))
+        lightmap = {"data": rows, "side": 8, "voxel_size": 1.0}
+        payload = self.place_payload(lightmap)
+        kernel = self.kernels()[PLACE_BATCH]
+        kernel(payload)
+        before = sys.getrefcount(rows)
+        for _ in range(2000):
+            kernel(payload)
+        gc.collect()
+        self.assertLessEqual(sys.getrefcount(rows), before)
+
+    def test_place_batch_leaks_nothing_on_a_malformed_batch(self):
+        """The error path runs after the lightmap is held and after some
+        survivors are already in the lists."""
+        from lobster.conformance import PLACE_BATCH
+        data = bytes(bytearray(64))
+        lightmap = {"data": data, "side": 8, "voxel_size": 1.0}
+        payload = self.place_payload(lightmap)
+        payload["placements"] = ([0.0, 0.0, 5.0, 0.0, 0.0, 0.0, 1.0]
+                                 + [0.0, 0.0, 5.0, 0.0, 0.0, 0.0, "no"])
+        kernel = self.kernels()[PLACE_BATCH]
+        before = sys.getrefcount(data)
+        for _ in range(2000):
+            with self.assertRaises(Exception):
+                kernel(payload)
+        gc.collect()
+        self.assertLessEqual(sys.getrefcount(data), before)
+
     def test_an_error_path_leaks_nothing_either(self):
         """A malformed row aborts mid-loop, after some ids are already stashed.
         That path has to release them too."""

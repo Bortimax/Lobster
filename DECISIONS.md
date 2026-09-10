@@ -3422,9 +3422,37 @@ that nobody spends a week on the kernel again.
   culling and the packed instances depend on the payload and no test varied
   them. A dropped cell placement, a wrong field of view and a dropped lightmap
   all drew a correct picture.
+* **A double-free path in the result**, found by re-reading rather than by any
+  test. `Py_BuildValue("{s:N,...}")` steals its values, and when it fails
+  partway it releases the ones it has already taken - so the cleanup block
+  would have released them a second time. It needs an allocation failure to
+  happen at all, which means the one time it fires is the worst possible time.
+  Built by hand with `PyDict_SetItemString` now, which takes its own reference
+  and leaves one owner throughout.
 * **The C itself**, mutated, recompiled and run: composing the wrong way round,
   a row-major matrix, a dropped cell translation, truncation instead of floor
   in the light index, a forgotten aspect ratio, a near plane tested without the
   radius. Six for six, hundreds of divergences each. That is the first time the
   differential suite has been shown to catch a *broken build* rather than a
   broken dict, and it is what D28 was written for.
+
+### And two faults in the tests, one of which failed CI
+
+**A leak test that reported a leak that was not there.** The reference-count
+check took its baseline through a list comprehension and its second reading
+inside `for obj, was in zip(watched, before)` - and a `zip` keeps its last
+result tuple alive to reuse it, so every object read one higher. Uniform, wrong,
+and on objects the kernel never touches, which is what gave it away. Both
+readings go through the same comprehension now.
+
+**A test that failed the pure-python CI job**, which is the job that exists to
+prove the shell needs no accelerator at all. `test_more_than_one_implementation_was_actually_compared`
+asserted that there is something to compare the reference against - true
+everywhere except the one configuration L7 promises. It is a class-level skip
+now, with the reason written out: "there is nothing to compare" is honest on a
+machine with no compiler and a real fault anywhere else.
+
+Both were caught by CI and by reading, not by the local suite, because the local
+machine has a compiler and numpy. Reproducing that job locally - hiding the
+`.pyd` and blocking `numpy` on the meta path - is two lines and should have been
+the check before pushing.
