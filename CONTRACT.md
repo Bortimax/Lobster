@@ -38,7 +38,7 @@ are held to the same answers by differential tests, with a declared float
 tolerance and a named authority where they differ. See DECISIONS.md D26.
 
 **The arithmetic accelerator exists in two forms; the GPU backend does not.**
-`lobster/accel/` holds a **C extension** and NumPy kernels for the seam's three
+`lobster/accel/` holds a **C extension** and NumPy kernels for the seam's four
 operations, all proven against the reference by thousands of differential cases:
 
 | kernel | numpy | native (C) |
@@ -47,21 +47,38 @@ operations, all proven against the reference by thousands of differential cases:
 | `nearest_region`, 6 bones | *0.46×* | **64×** |
 | `place_batch`, 800 in one call | 8.2× | **50×** |
 | `place_batch`, a real frame — 36 small calls | *0.26×* | **27×** |
+| `pose_capsules`, one 6-bone humanoid | *0.13×* | **30×** |
+| `pose_capsules`, a real volley — 62 rigs | *0.20×* | **57×** |
 
-NumPy **loses** the refinement — six bones cannot pay for six array
-constructions — and loses placement for the same reason at a different scale:
-the kernel is called once per resident cell per model, so a real frame is
-dozens of batches of ten, where NumPy comes out **four times worse than not
-accelerating at all**. So selection is **per kernel**
-(`accel.KERNEL_PREFERENCE`), C first, NumPy only where it wins, the reference
-always the floor. `select()` names what it actually composed rather than
-overclaiming.
+**NumPy has won one of the four**, and the pattern is the point. It takes
+`segment_query`, which is a thousand entities handed over in a single call. It
+loses the other three, all of which are invoked *per thing* — per rig, per cell,
+per model — where an array is built and torn down every time. On a real volley
+`pose_capsules` under NumPy is **five times worse than not accelerating at
+all**. The rule, before anyone writes a fifth: **NumPy belongs on a kernel
+called once with everything, and nowhere else** — and it must be measured over
+a real frame or volley, because both times the single-call benchmark said the
+opposite of the truth.
 
-`place_batch` is the one the runtime leans on hardest: it culls a cell's
-placements and packs their instance data in the same call, and the draw list
-carries the packed bytes straight to the GPU backend. It took the measured
-per-placement cost from 12.8 µs to 4.2 and the on-screen ceiling from 312 to
-952 (§6, D53).
+So selection is **per kernel** (`accel.KERNEL_PREFERENCE`), C first, NumPy only
+where it wins, the reference always the floor. `select()` names what it actually
+composed rather than overclaiming, and is memoised on the preference table —
+`forget_selection()` drops it.
+
+`place_batch` culls a cell's placements and packs their instance data in the
+same call, and the draw list carries the packed bytes straight to the GPU
+backend. It took the measured per-placement cost from 12.8 µs to 4.2 and the
+on-screen ceiling from 312 to 952 (§6, D53).
+
+`pose_capsules` places a posed rig's bones in world space. It took
+`Skeleton.hitboxes` from 29.9 µs to 3.5 on the volley's path and a 40-arrow
+volley over 200 entities from 3.05 ms to 1.71 (D54).
+
+**Every kernel sits below the `limb_state` read**, and `pose_capsules` was
+designed for it: deciding *which* bones offer a hitbox is a read of limb state
+and therefore policy, so the caller filters and passes the surviving bone
+*indices*. A native kernel never sees a limb id or a state string. The L8
+boundary is structural rather than promised.
 
 **The C source is committed; the binary is not.** Build it with
 `python lobster/accel/native/setup.py build_ext --inplace` (a C compiler and

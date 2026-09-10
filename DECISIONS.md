@@ -3456,3 +3456,148 @@ Both were caught by CI and by reading, not by the local suite, because the local
 machine has a compiler and numpy. Reproducing that job locally - hiding the
 `.pyd` and blocking `numpy` on the meta path - is two lines and should have been
 the check before pushing.
+
+---
+
+## D54 — The fourth kernel, and a mutation harness that was testing stale bytecode
+
+`Skeleton.hitboxes` was **61% of a volley** - D45 estimated ~50% and it had
+grown as the other halves got faster. `pose_capsules` is that closed.
+
+### The seam, and the constraint that placed it
+
+The kernel takes a root, a flat rest pose, a flat current pose and **the bone
+indices that survived the caller's limb filter**, and returns the world-space
+capsules for exactly those, packed.
+
+That last argument is the whole design. `conformance`'s docstring already
+promised that every seam kernel sits *below* the `limb_state` read, and this is
+the first kernel where obeying that took thought: deciding **which** bones offer
+a hitbox is a read of limb state and therefore policy (L8), while placing the
+bones that survived is arithmetic. So `_surviving_bones` does the reading, in
+Python, and hands over integers. A native kernel never sees a limb id or a state
+string - and a test asserts that by spying on the payload and checking no limb
+id appears anywhere in it.
+
+`None` rather than a full index list when nothing is severed: that is the
+overwhelmingly common case, and building a list per rig per volley to say "all
+of them" is exactly the marshalling this kernel exists to remove.
+
+### Two caches, and `pose_version` finally has a consumer
+
+The rest pose is fixed per `RegionSet` and is packed once, in `__post_init__`,
+beside `extent` - same argument, same place.
+
+The current pose changes only when somebody writes one, and `Skeleton` has had
+`pose_version` since it was written, documented as being there "so a consumer
+can tell a stale read". This is the first consumer. `pose_rows()` rebuilds only
+when the version has moved, which means a standing NPC pays nothing across
+frames and a volley pays once per rig rather than once per arrow.
+
+A stale pose cache would be a hit registered on a body that has moved, so four
+tests pin the invalidation directly rather than trusting the version bump.
+
+### numpy loses a third time, and that is now a rule
+
+| | python | numpy | native |
+|---|---|---|---|
+| one 6-bone humanoid | 4.55 us/bone | 33.9 (0.13x) | **0.15 (30x)** |
+| 200 bones in one call | 4.52 | 1.80 (2.5x) | **0.05 (90x)** |
+| **a volley's 62 rigs** | 2.77 ms | **14.1 ms** | **0.05 ms (57x)** |
+
+NumPy has now won exactly one of four kernels - `segment_query`, the only one
+handed everything in a single call - and lost all three that are invoked per
+thing. That is not three coincidences, and `KERNEL_PREFERENCE` now says so in
+words: **numpy belongs on a kernel called once with everything, and nowhere
+else**, measured over a real frame or volley rather than a single big call.
+Both times the single-call number said the opposite of the truth.
+
+### The numbers
+
+`Skeleton.hitboxes` 29.9 us -> **3.47 us** on the volley's path, and a 40-arrow
+volley over 200 entities **3.05 ms -> 1.71 ms**. `quat_rotate` went from 4,230
+calls at the top of the profile to 270 near the bottom.
+
+Where the 3.47 goes: 0.98 in the kernel, the rest in Python marshalling. Two
+smaller decisions came out of measuring that:
+
+* **`hitbox_rows`**, a second wrapper that skips `Capsule` entirely. The volley
+  called `hitboxes()` and immediately took the capsules apart again into lists
+  for `nearest_region` - six objects built per rig per volley purely to be
+  discarded. `hitboxes()` still exists and still returns capsules; selection and
+  IK use it.
+* **`select()` is memoised.** It measured 3.35 us - more than the whole kernel
+  for a humanoid - so a lookup per rig would have handed the win straight back.
+  The hot path passes the kernel down from the one selection the volley already
+  makes; the memoisation is for everyone else. Keyed on `KERNEL_PREFERENCE`'s
+  contents, because every cross-implementation test in the suite works by
+  swapping that table.
+
+### A divergence found by writing the second implementation
+
+The reference indexed the bone list with plain Python indexing, so a **negative**
+index silently wrapped and served the last bone - a hitbox belonging to a
+different limb than the caller asked for. numpy would have done the same; the C
+raised. No generated case contains a negative index, so the differential suite
+would never have found it.
+
+All three refuse it now. Writing a second implementation of a thing is a way of
+reading the first one that reading it is not.
+
+### The part worth reading: the harness was testing stale bytecode
+
+Running the wiring mutants left the suite failing in a way that looked exactly
+like a real regression - 28 failures, a capsule endpoint at `5.1e-28` - in a
+working tree `git status` called clean, with the source visibly correct.
+
+CPython validates a `.pyc` against the source's **(mtime, size)**. The mutation
+that swaps `"7d"` for `"7f"` changes neither. Restoring the file inside the same
+mtime tick therefore left the *mutant bytecode* valid and importable, and the
+next interpreter loaded it.
+
+That is the third defect in this harness, and the worst, because unlike the
+other two it corrupts results in **both** directions:
+
+1. it can mask a mutant, reporting SURVIVED for code that is tested;
+2. it can leak a mutant into the *next* mutant's run, reporting caught for code
+   that is not.
+
+Every write now deletes the module's cached bytecode and stamps the source a
+second into the future. The C harness had the same disease one layer down -
+setuptools skips the compiler when the object file looks newer than the source,
+so a restored `.c` of the same length was never recompiled and the **mutant
+binary** stayed on disk. It now stamps the source, checks the rebuild succeeded,
+and re-runs the differential suite against the restored kernel before it will
+say it finished.
+
+**Every mutation suite in this project was then re-run.** Three verdicts
+changed, and each one was worth having:
+
+* `place_batch`'s "the light index truncates instead of flooring" had been
+  reported caught with 692 divergences. It is an **equivalent mutant**: the
+  clamp to `[0, side-1]` maps every negative index to 0 whichever way the
+  division rounds, so the two cannot be told apart. The 692 was contamination.
+  The C comment claimed the mutation would break lighting west of the origin;
+  it now says the truth, which is that the clamp hides it and `floor` is there
+  to mirror the reference expression by expression rather than to fix a bug.
+* `pose_capsules`'s bounds check showed 0 divergences, correctly: no *generated*
+  payload carries a malformed bone index, because validation is covered by
+  ordinary tests. The C harness was judging mutants on the differential suite
+  alone; it runs the unit tests too now.
+* **`select()`'s cache had no test at all.** The mutation that made it ignore
+  `KERNEL_PREFERENCE` had been reported caught, by stale bytecode. It is a real
+  hole and a bad one: every cross-implementation comparison in this suite works
+  by swapping that table, so a cache that ignored it would have turned all of
+  them into comparisons of one implementation with itself, all still green.
+
+### And the same test mistake, twice
+
+The new cache test asserted that swapping the preference returns a *different
+function* - true everywhere except the pure-python job, where the reference is
+the only implementation and the swap legitimately returns the same one. That is
+the second test in two kernels to assume more than one implementation exists.
+It asserts on the cache rather than the kernel now.
+
+Twenty-four mutants for this kernel - 17 on the wiring, 7 on the C, all caught -
+plus six harness-liveness tests. 774 tests green, in both CI configurations,
+checked before pushing this time.

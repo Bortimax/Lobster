@@ -25,10 +25,12 @@ that is Shrimp, and the answer is no.
 from __future__ import annotations
 
 import math
+import struct
 from dataclasses import dataclass, field as dc_field
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 from .geometry import Capsule, Transform, Vec3
+from .octopus_bridge import limb_has_hitbox
 
 # ---------------------------------------------------------------------------
 # Hit regions - Lobster-owned vocabulary (Scope 5)
@@ -46,6 +48,13 @@ RIGHT_LEG = "right_leg"
 #: with a hitbox now resolves to one of these six (DECISIONS.md D16).
 HUMANOID_REGIONS: Tuple[str, ...] = (HEAD, TORSO, LEFT_ARM, RIGHT_ARM,
                                      LEFT_LEG, RIGHT_LEG)
+
+
+#: How the seam kernel hands a capsule back: `a`, `b`, radius, as float64.
+#: Mirrors `conformance.CAPSULE_FLOATS`/`CAPSULE_PACK`; a test pins them
+#: equal, because a wire format spelled in two files is two wire formats.
+_CAPSULE_FORMAT = "7d"
+_CAPSULE_WIDTH = struct.calcsize(_CAPSULE_FORMAT)
 
 
 class SkeletonError(Exception):
@@ -152,6 +161,12 @@ class RegionSet:
     bones: Tuple[Bone, ...]
     extent: Optional[RestExtent] = dc_field(default=None, init=False,
                                             compare=False, repr=False)
+    #: the bones as flat kernel input - `a`, `b`, radius per bone, in
+    #: `bones` order. Built here for the reason `extent` is: a rest pose never
+    #: changes, and rebuilding it per call would be per-bone Python work in
+    #: front of a kernel that exists to remove per-bone Python work (D54).
+    rest_rows: Tuple[float, ...] = dc_field(default=(), init=False,
+                                            compare=False, repr=False)
 
     def __post_init__(self) -> None:
         declared = set(self.regions)
@@ -163,6 +178,12 @@ class RegionSet:
                         self.name, bone.bone_id, bone.region,
                         list(self.regions)))
         object.__setattr__(self, "extent", _rest_extent(self.bones))
+        rows: List[float] = []
+        for bone in self.bones:
+            rows.extend((float(bone.a[0]), float(bone.a[1]), float(bone.a[2]),
+                         float(bone.b[0]), float(bone.b[1]), float(bone.b[2]),
+                         float(bone.radius)))
+        object.__setattr__(self, "rest_rows", tuple(rows))
 
     def bone(self, bone_id: str) -> Bone:
         for b in self.bones:
@@ -236,6 +257,11 @@ class Skeleton:
             b.bone_id: Transform() for b in self.region_set.bones}
         #: bumped on every pose write, so a consumer can tell a stale read.
         self.pose_version = 0
+        #: the pose as flat kernel input, and the version it was built from.
+        #: `pose_version` existed for exactly this - "so a consumer can tell a
+        #: stale read" - and this is the first consumer to use it (D54).
+        self._pose_rows: Tuple[float, ...] = ()
+        self._pose_rows_version = -1
 
     # -- the interface Shrimp binds against ----------------------------------
     def set_pose(self, pose: Mapping[str, Transform], *,
@@ -279,29 +305,118 @@ class Skeleton:
 
     # -- hitboxes ------------------------------------------------------------
     def capsule_for(self, bone_id: str) -> Capsule:
-        bone = self.region_set.bone(bone_id)
-        local = self._pose[bone_id]
-        a = self.root.apply(local.apply(bone.a))
-        b = self.root.apply(local.apply(bone.b))
-        return Capsule(a, b, bone.radius)
+        """One bone's world-space capsule.
 
-    def hitboxes(self, *, limb_state: Optional[Mapping[str, str]] = None
-                 ) -> List[Tuple[str, Capsule]]:
+        Composes root and bone once rather than applying two transforms to each
+        endpoint - three rotations instead of four, and the same definition the
+        seam kernel and its reference use, so there is one transform here and
+        not two that can drift.
+        """
+        bone = self.region_set.bone(bone_id)
+        placed = self.root.compose(self._pose[bone_id])
+        return Capsule(placed.apply(bone.a), placed.apply(bone.b), bone.radius)
+
+    def pose_rows(self) -> Tuple[float, ...]:
+        """The pose as flat kernel input, rebuilt only when it has moved."""
+        if self._pose_rows_version != self.pose_version:
+            rows: List[float] = []
+            for bone in self.region_set.bones:
+                local = self._pose[bone.bone_id]
+                position, rotation = local.position, local.rotation
+                rows.extend((float(position[0]), float(position[1]),
+                             float(position[2]), float(rotation[0]),
+                             float(rotation[1]), float(rotation[2]),
+                             float(rotation[3])))
+            self._pose_rows = tuple(rows)
+            self._pose_rows_version = self.pose_version
+        return self._pose_rows
+
+    def _surviving_bones(self,
+                         limb_state: Optional[Mapping[str, str]]
+                         ) -> Optional[List[int]]:
+        """Which bone indices still offer a hitbox, or None for all of them.
+
+        **This is where limb state is read, and it is the only place.** The
+        kernel below is handed indices and never a limb id, so the L8 boundary
+        stays in Python whichever implementation runs (D54). A limb the caller
+        reports as severed contributes no capsule; every other state does,
+        because whether a disabled arm can still be hit is a gameplay question
+        and Scope 5 gives gameplay questions to Octopus's stats module and to
+        Shrimp.
+
+        `None` rather than `list(range(n))` when nothing is severed: that is
+        the overwhelmingly common case, and it saves building a list per rig
+        per volley to say "all of them".
+        """
+        if not limb_state:
+            return None
+        keep: List[int] = []
+        severed = False
+        for index, bone in enumerate(self.region_set.bones):
+            if bone.limb_id and not limb_has_hitbox(limb_state.get(bone.limb_id)):
+                severed = True
+                continue
+            keep.append(index)
+        return keep if severed else None
+
+    def _world_capsules(self, limb_state: Optional[Mapping[str, str]],
+                        place: Optional[Any]) -> Tuple[List[str], Any]:
+        """`(regions, packed capsules)` for the bones that survived.
+
+        `place` is the seam kernel. A caller on the hot path passes the one it
+        already selected - `select()` costs more than the kernel does for a
+        six-bone rig, so looking it up per rig would hand the win straight
+        back. A caller that does not care selects here.
+        """
+        bones = self._surviving_bones(limb_state)
+        all_bones = self.region_set.bones
+        if bones is None:
+            regions = [bone.region for bone in all_bones]
+        else:
+            regions = [all_bones[i].region for i in bones]
+        if place is None:
+            from .accel import select as _select
+            from .conformance import POSE_CAPSULES as _POSE
+            place = _select()[1][_POSE]
+        answer = place({"root": {"position": self.root.position,
+                                 "rotation": self.root.rotation},
+                        "pose": self.pose_rows(),
+                        "rest": self.region_set.rest_rows,
+                        "bones": bones})
+        return regions, answer["capsules"]
+
+    def hitbox_rows(self, *, limb_state: Optional[Mapping[str, str]] = None,
+                    place: Optional[Any] = None
+                    ) -> List[List[Any]]:
+        """`[region, [ax, ay, az], [bx, by, bz], radius]` per live bone.
+
+        The shape `nearest_region` takes, built straight from the kernel's
+        bytes. `resolve_volley` used to call `hitboxes()` and immediately take
+        the `Capsule`s apart again into exactly this - so the capsules were
+        built to be discarded, once per rig per volley.
+        """
+        regions, packed = self._world_capsules(limb_state, place)
+        out: List[List[Any]] = []
+        for index, region in enumerate(regions):
+            v = struct.unpack_from(_CAPSULE_FORMAT, packed,
+                                   index * _CAPSULE_WIDTH)
+            out.append([region, [v[0], v[1], v[2]], [v[3], v[4], v[5]], v[6]])
+        return out
+
+    def hitboxes(self, *, limb_state: Optional[Mapping[str, str]] = None,
+                 place: Optional[Any] = None) -> List[Tuple[str, Capsule]]:
         """(region, capsule) per bone that currently offers a hitbox.
 
         `limb_state` is passed IN. This module never reads it from Octopus -
-        see the module docstring and L8. A limb the caller reports as severed
-        contributes no capsule; every other state does, because whether a
-        disabled arm can still be hit is a gameplay question and Scope 5 gives
-        gameplay questions to Octopus's stats module and to Shrimp.
+        see the module docstring and L8.
         """
-        from .octopus_bridge import limb_has_hitbox
-        states = dict(limb_state or {})
+        regions, packed = self._world_capsules(limb_state, place)
         out: List[Tuple[str, Capsule]] = []
-        for bone in self.region_set.bones:
-            if bone.limb_id and not limb_has_hitbox(states.get(bone.limb_id)):
-                continue
-            out.append((bone.region, self.capsule_for(bone.bone_id)))
+        for index, region in enumerate(regions):
+            v = struct.unpack_from(_CAPSULE_FORMAT, packed,
+                                   index * _CAPSULE_WIDTH)
+            out.append((region, Capsule((v[0], v[1], v[2]),
+                                        (v[3], v[4], v[5]), v[6])))
         return out
 
     def whole_body_capsule(self) -> Capsule:

@@ -10,17 +10,22 @@ module on purpose: it needs no toolchain, so it cannot become a third
 named-but-unwritten thing, and a native implementer gets a target to hit rather
 than a description to interpret.
 
-**The seam is three pure kernels.** Everything else stays Python.
+**The seam is four pure kernels.** Everything else stays Python.
 
 | kernel | question |
 |---|---|
 | `segment_query` | which entities lie within `radius` of this segment |
+| `pose_capsules` | where this rig's bones are, in world space |
 | `nearest_region` | which bone a ray struck, over an already-filtered capsule list |
 | `place_batch` | which of these placements are on screen, and their instance data |
 
-The first two sit **below the `limb_state` read**: the caller filters severed
-limbs and hands over only the capsules that survived, so a native kernel never
-touches limb state and the L8 boundary stays in Python permanently.
+**Every one of them sits below the `limb_state` read**, and `pose_capsules` is
+the one that had to be designed for it. Deciding *which* bones offer a hitbox is
+a read of limb state and therefore policy; placing the bones that survived is
+arithmetic. So the caller filters and passes `bones` - the indices that
+survived - and the kernel transforms exactly those. A native kernel never sees a
+limb id, never sees a state string, and the L8 boundary stays in Python
+permanently (D54).
 
 `place_batch` is the third (D53), and its granularity is D26's argument applied
 again: one call per resident cell per model per frame. The intermediate between
@@ -102,7 +107,8 @@ AUTHORITY = "python"
 SEGMENT_QUERY = "segment_query"
 NEAREST_REGION = "nearest_region"
 PLACE_BATCH = "place_batch"
-SEAM_KERNELS = (SEGMENT_QUERY, NEAREST_REGION, PLACE_BATCH)
+POSE_CAPSULES = "pose_capsules"
+SEAM_KERNELS = (SEGMENT_QUERY, NEAREST_REGION, PLACE_BATCH, POSE_CAPSULES)
 
 #: floats per placement in a `place_batch` payload: position, then rotation.
 PLACEMENT_FLOATS = 7
@@ -110,6 +116,16 @@ PLACEMENT_FLOATS = 7
 #: floats per instance in its result: a column-major 4x4, then the baked light
 #: where that instance stands. The same seventeen `gl_backend` uploads.
 INSTANCE_FLOATS = 17
+
+#: floats per capsule, in and out of `pose_capsules`: `a`, `b`, radius. The
+#: rest pose goes in in this shape and the world-space capsule comes out in it.
+CAPSULE_FLOATS = 7
+
+#: `pose_capsules` answers in **float64**, unlike `place_batch`. Its consumer is
+#: `nearest_region`, which does its arithmetic in doubles; narrowing to f32 on
+#: the way between two CPU kernels would throw away precision to save nothing.
+#: `place_batch` narrows because its consumer is a GPU vertex buffer.
+CAPSULE_PACK = "d"
 
 
 class ConformanceError(Exception):
@@ -274,10 +290,64 @@ def reference_place_batch(payload: Mapping[str, Any]) -> Dict[str, Any]:
             "instances": bytes(packed)}
 
 
+def reference_pose_capsules(payload: Mapping[str, Any]) -> Dict[str, Any]:
+    """Where a posed rig's bones are, in world space.
+
+    Composes root and bone transform **once** and applies the result to both
+    endpoints, rather than applying two transforms to each endpoint in turn -
+    three rotations instead of four, for an answer that is the same to within
+    far less than the declared tolerance. `Transform.compose` is asserted
+    against applying both in order over random pairs.
+
+    `bones` is the caller's filter and this kernel never questions it. Which
+    bones offer a hitbox is a read of `limb_state`, which is policy and stays
+    in Python (L8); where the surviving bones *are* is arithmetic.
+    """
+    root_block = payload["root"]
+    root = Transform(position=tuple(root_block["position"]),
+                     rotation=tuple(root_block["rotation"]))
+    pose = payload["pose"]
+    rest = payload["rest"]
+    total = len(rest) // CAPSULE_FLOATS
+    selected = payload.get("bones")
+    if selected is None:
+        indices: Sequence[int] = range(total)
+    else:
+        indices = [int(i) for i in selected]
+
+    out = bytearray()
+    for index in indices:
+        # Checked rather than trusted, and **negative indices are refused**
+        # rather than wrapped. Python indexing would have quietly served the
+        # last bone for -1, which is a hitbox belonging to a different limb
+        # than the caller asked for - the silent kind of wrong. The native
+        # kernel raises here, so the reference has to as well or they disagree
+        # on a case no generated payload happens to contain.
+        if not 0 <= index < total:
+            raise IndexError(
+                "bone index {0} is outside this rig's {1} bones".format(
+                    index, total))
+        p = index * PLACEMENT_FLOATS
+        local = Transform(
+            position=(float(pose[p]), float(pose[p + 1]), float(pose[p + 2])),
+            rotation=(float(pose[p + 3]), float(pose[p + 4]),
+                      float(pose[p + 5]), float(pose[p + 6])))
+        r = index * CAPSULE_FLOATS
+        placed = root.compose(local)
+        a = placed.apply((float(rest[r]), float(rest[r + 1]),
+                          float(rest[r + 2])))
+        b = placed.apply((float(rest[r + 3]), float(rest[r + 4]),
+                          float(rest[r + 5])))
+        out.extend(struct.pack("7" + CAPSULE_PACK, a[0], a[1], a[2],
+                               b[0], b[1], b[2], float(rest[r + 6])))
+    return {"capsules": bytes(out)}
+
+
 REFERENCE: Dict[str, Callable[[Mapping[str, Any]], Dict[str, Any]]] = {
     SEGMENT_QUERY: reference_segment_query,
     NEAREST_REGION: reference_nearest_region,
     PLACE_BATCH: reference_place_batch,
+    POSE_CAPSULES: reference_pose_capsules,
 }
 
 
@@ -406,6 +476,8 @@ def generate_cases(seed: int = 20260909, count: int = 80) -> List[Case]:
                      "max_distance": 40.0}))
     cases.extend(generate_place_batch_cases(seed + 1,
                                             count=max(8, count // 2)))
+    cases.extend(generate_pose_capsules_cases(seed + 2,
+                                              count=max(8, count // 2)))
     return cases
 
 
@@ -531,6 +603,104 @@ def generate_place_batch_cases(seed: int = 20260910,
              "rotation": _spin(rng)},
             rng.uniform(0.2, 4.0), flat,
             _lightmap(rng, side=8) if len(cases) % 2 else None)
+    return cases[:count]
+
+
+def generate_pose_capsules_cases(seed: int = 20260911,
+                                 count: int = 30) -> List[Case]:
+    """Cases across the shapes that actually break a pose transform.
+
+    The rig this ships with has six bones and no rotation on any of them, which
+    would make a dropped bone rotation invisible - so every generated case
+    turns something. Severed limbs are a *subset* of the bone list rather than
+    a flag, because that is how the caller expresses them and a kernel that
+    quietly transformed all of them would still pass a length check on the
+    common case where nothing is severed.
+    """
+    rng = random.Random(seed)
+    cases: List[Case] = []
+
+    def add(name, root, pose, rest, bones):
+        cases.append(Case(
+            case_id="pose-%s" % name, kernel=POSE_CAPSULES,
+            payload={"root": root, "pose": pose, "rest": rest,
+                     "bones": bones}))
+
+    def rig(n, *, spin=True, span=0.4):
+        pose: List[float] = []
+        rest: List[float] = []
+        for i in range(n):
+            pose.extend([rng.uniform(-0.5, 0.5), rng.uniform(0.0, 1.8),
+                         rng.uniform(-0.5, 0.5)])
+            pose.extend(_spin(rng) if spin else [0.0, 0.0, 0.0, 1.0])
+            ax, ay, az = (rng.uniform(-span, span) for _ in range(3))
+            rest.extend([ax, ay, az,
+                         ax + rng.uniform(-span, span),
+                         ay + rng.uniform(0.0, span),
+                         az + rng.uniform(-span, span),
+                         rng.uniform(0.02, 0.25)])
+        return pose, rest
+
+    def at(position=(0.0, 0.0, 0.0), rotation=(0.0, 0.0, 0.0, 1.0)):
+        return {"position": list(position), "rotation": list(rotation)}
+
+    add("empty", at(), [], [], None)
+    pose, rest = rig(1)
+    add("one-bone", at(), pose, rest, None)
+    add("one-bone-selected", at(), pose, rest, [0])
+    add("one-bone-severed", at(), pose, rest, [])
+
+    # the shipped humanoid, at rest and posed
+    humanoid = humanoid_region_set()
+    flat_rest: List[float] = []
+    for bone in humanoid.bones:
+        flat_rest.extend(list(bone.a) + list(bone.b) + [bone.radius])
+    rest_pose = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0] * len(humanoid.bones)
+    add("humanoid-rest", at((3.0, 0.0, 4.0)), rest_pose, flat_rest, None)
+    spun_pose: List[float] = []
+    for _ in humanoid.bones:
+        spun_pose.extend([rng.uniform(-0.2, 0.2)] * 3)
+        spun_pose.extend(_spin(rng))
+    add("humanoid-posed", at((3.0, 0.0, 4.0), _spin(rng)), spun_pose,
+        flat_rest, None)
+    # one arm off, which is the case the `bones` filter exists for
+    add("humanoid-one-limb-gone", at((3.0, 0.0, 4.0)), spun_pose, flat_rest,
+        [0, 1, 3, 4, 5])
+    add("humanoid-all-gone", at((3.0, 0.0, 4.0)), spun_pose, flat_rest, [])
+    add("humanoid-one-left", at((3.0, 0.0, 4.0)), spun_pose, flat_rest, [2])
+
+    # a root that turns, which is where composing in the wrong order shows
+    for i in range(4):
+        pose, rest = rig(6)
+        add("turned-root-%d" % i,
+            at((rng.uniform(-60, 60), rng.uniform(-3, 3),
+                rng.uniform(-60, 60)), _spin(rng)), pose, rest, None)
+
+    # degenerate and awkward rigs
+    add("zero-length-bone", at((1.0, 2.0, 3.0), _spin(rng)),
+        [0.0, 0.0, 0.0] + _spin(rng),
+        [0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.1], None)
+    add("zero-radius", at(), [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0],
+        [0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0], None)
+    add("far-from-the-origin", at((6000.0, -400.0, 9000.0), _spin(rng)),
+        *rig(4), None)
+
+    # big rigs, and subsets of them
+    for i, n in enumerate((12, 40)):
+        pose, rest = rig(n)
+        add("big-%d" % i, at((rng.uniform(-20, 20), 0.0, rng.uniform(-20, 20)),
+                             _spin(rng)), pose, rest, None)
+        add("big-subset-%d" % i, at((1.0, 0.0, 2.0), _spin(rng)), pose, rest,
+            sorted(rng.sample(range(n), n // 3)))
+
+    while len(cases) < count:
+        n = rng.randrange(1, 9)
+        pose, rest = rig(n)
+        keep = None if rng.random() < 0.5 else sorted(
+            rng.sample(range(n), rng.randrange(0, n + 1)))
+        add("fuzz-%d" % len(cases),
+            at((rng.uniform(-40, 40), rng.uniform(-4, 4),
+                rng.uniform(-40, 40)), _spin(rng)), pose, rest, keep)
     return cases[:count]
 
 
@@ -749,9 +919,50 @@ def _compare_place_batch(case: Case, ref: Mapping[str, Any],
     return out
 
 
+def _capsules_of(result: Mapping[str, Any]) -> List[Tuple[float, ...]]:
+    raw = result.get("capsules") or b""
+    if isinstance(raw, str):                 # an undecoded vector file
+        raw = bytes.fromhex(raw)
+    width = struct.calcsize(CAPSULE_PACK) * CAPSULE_FLOATS
+    return [struct.unpack_from("7" + CAPSULE_PACK, raw, i * width)
+            for i in range(len(raw) // width)]
+
+
+def _compare_pose_capsules(case: Case, ref: Mapping[str, Any],
+                           cand: Mapping[str, Any]) -> List[Divergence]:
+    """**No ambiguity rules, deliberately.**
+
+    The other three kernels each answer a *predicate* - is this inside the
+    radius, did the ray strike, is this on screen - so a value sitting on the
+    boundary is admissible either way. This one has no predicate: the caller
+    decided which bones survive and the kernel places them. The count is
+    therefore exact, and every number is a distance in metres compared against
+    the one tolerance that means metres.
+    """
+    out: List[Divergence] = []
+    ref_caps = _capsules_of(ref)
+    cand_caps = _capsules_of(cand)
+    if len(ref_caps) != len(cand_caps):
+        out.append(Divergence(
+            case.case_id, case.kernel, "capsules.count", len(ref_caps),
+            len(cand_caps),
+            "the caller chose the bones; the count is not a judgement call"))
+        return out
+    labels = ("a.x", "a.y", "a.z", "b.x", "b.y", "b.z", "radius")
+    for index, (a, b) in enumerate(zip(ref_caps, cand_caps)):
+        for slot in range(CAPSULE_FLOATS):
+            if not _close(a[slot], b[slot]):
+                out.append(Divergence(
+                    case.case_id, case.kernel,
+                    "capsules[%d].%s" % (index, labels[slot]),
+                    a[slot], b[slot], "bone %d" % index))
+    return out
+
+
 _COMPARATORS = {SEGMENT_QUERY: _compare_segment_query,
                 NEAREST_REGION: _compare_nearest_region,
-                PLACE_BATCH: _compare_place_batch}
+                PLACE_BATCH: _compare_place_batch,
+                POSE_CAPSULES: _compare_pose_capsules}
 
 
 def compare(cases: Sequence[Case], reference: Sequence[Mapping[str, Any]],

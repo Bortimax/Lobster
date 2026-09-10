@@ -1,4 +1,4 @@
-/* Native implementations of the three seam kernels (D26's seam, D42, D53).
+/* Native implementations of the four seam kernels (D26's seam, D42, D53, D54).
  *
  * Plain C against the CPython API, on purpose:
  *
@@ -33,6 +33,7 @@ static const double EPS = 1e-12;
  * shape constant that will differ. */
 #define PLACEMENT_FLOATS 7
 #define INSTANCE_FLOATS 17
+#define CAPSULE_FLOATS 7
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -530,11 +531,16 @@ out:
     return ok;
 }
 
-/* ResidentCell.ambient_at, over the bytes. Python's `//` floors towards
- * negative infinity and C's cast truncates towards zero, so a negative
- * coordinate needs `floor` or every point west of the origin lands one cell
- * too far east - and only on one side, which is the kind of asymmetry that
- * looks like a lighting artefact rather than a bug. */
+/* ResidentCell.ambient_at, over the bytes.
+ *
+ * `floor` and not a cast, because Python's `//` floors towards negative
+ * infinity and a C cast truncates towards zero. **The clamp below currently
+ * hides the difference** - every negative index lands at 0 either way - so
+ * mutating this to a cast is an *equivalent* mutant and survives the
+ * differential suite by construction, not for want of a test. It is still
+ * `floor`: this file mirrors the reference expression by expression, and the
+ * one that only agrees because a later line rescues it is the one that stops
+ * agreeing when the later line changes. */
 static double sample_light(const Lightmap *lm, Vec3 point, int *failed)
 {
     if (lm->length == 0 || lm->side <= 0) return 1.0;
@@ -717,6 +723,187 @@ done:
 }
 
 /* ---------------------------------------------------------------------- */
+/* pose_capsules                                                          */
+/* ---------------------------------------------------------------------- */
+/*
+ * Where a posed rig's bones are, in world space. The fourth seam kernel (D54),
+ * and the one that was ~61% of a volley before it existed.
+ *
+ * Mirrors, branch for branch:
+ *
+ *   Transform.compose      root and bone composed once, as a quaternion
+ *                          product and one rotated offset
+ *   Transform.apply        the composed placement applied to both endpoints
+ *
+ * Composing once and applying twice is three rotations where applying two
+ * transforms to each endpoint in turn is four - the same answer, well inside
+ * the declared tolerance, and `Transform.compose` is asserted against applying
+ * both in order over random pairs.
+ *
+ * **This kernel never sees limb state, and that is structural.** Deciding which
+ * bones offer a hitbox is a read of `limb_state`, which is policy and stays in
+ * Python (L8). The caller passes `bones` - the indices that survived its own
+ * filter - and this places exactly those, in that order. There is no limb id
+ * here, no state string, and nothing to interpret.
+ *
+ * Answers in float64, unlike `place_batch`: the consumer is `nearest_region`,
+ * which works in doubles. Narrowing between two CPU kernels would throw away
+ * precision to save nothing.
+ *
+ * `lobster.conformance.AUTHORITY` is "python", so where this and the reference
+ * disagree beyond the declared tolerance, THIS is wrong.
+ */
+
+static int read_transform_block(PyObject *block, Vec3 *position, Quat *rotation)
+{
+    PyObject *rot;
+    if (!read_vec3_key(block, "position", position)) return 0;
+    rot = PyMapping_GetItemString(block, "rotation");
+    if (!rot) return 0;
+    int ok = read_quat(rot, rotation);
+    Py_DECREF(rot);
+    return ok;
+}
+
+static PyObject *pose_capsules(PyObject *self, PyObject *payload)
+{
+    PyObject *root_o = NULL, *pose_o = NULL, *rest_o = NULL, *bones_o = NULL;
+    PyObject *pose_fast = NULL, *rest_fast = NULL, *bones_fast = NULL;
+    PyObject *result = NULL, *blob = NULL;
+    double *packed = NULL;
+    Vec3 root_pos;
+    Quat root_rot;
+
+    root_o = PyMapping_GetItemString(payload, "root");
+    if (!root_o || !read_transform_block(root_o, &root_pos, &root_rot))
+        goto done;
+
+    pose_o = PyMapping_GetItemString(payload, "pose");
+    if (!pose_o) goto done;
+    rest_o = PyMapping_GetItemString(payload, "rest");
+    if (!rest_o) goto done;
+    pose_fast = PySequence_Fast(pose_o, "pose must be a sequence");
+    if (!pose_fast) goto done;
+    rest_fast = PySequence_Fast(rest_o, "rest must be a sequence");
+    if (!rest_fast) goto done;
+
+    Py_ssize_t pose_n = PySequence_Fast_GET_SIZE(pose_fast);
+    Py_ssize_t rest_n = PySequence_Fast_GET_SIZE(rest_fast);
+    if (pose_n % PLACEMENT_FLOATS != 0 || rest_n % CAPSULE_FLOATS != 0) {
+        PyErr_Format(PyExc_ValueError,
+                     "pose has %zd floats and rest has %zd; they must be whole "
+                     "numbers of %d- and %d-float bones",
+                     pose_n, rest_n, PLACEMENT_FLOATS, CAPSULE_FLOATS);
+        goto done;
+    }
+    Py_ssize_t total = rest_n / CAPSULE_FLOATS;
+    if (pose_n / PLACEMENT_FLOATS != total) {
+        PyErr_Format(PyExc_ValueError,
+                     "pose describes %zd bones and rest describes %zd",
+                     pose_n / PLACEMENT_FLOATS, total);
+        goto done;
+    }
+    PyObject **pose_items = PySequence_Fast_ITEMS(pose_fast);
+    PyObject **rest_items = PySequence_Fast_ITEMS(rest_fast);
+
+    /* `bones` absent or None means every bone. A list means exactly those, in
+     * the order given - the caller matches the answers back to regions by
+     * position, so this is not free to reorder. */
+    bones_o = PyMapping_GetItemString(payload, "bones");
+    if (!bones_o) PyErr_Clear();
+    Py_ssize_t count = total;
+    PyObject **bone_items = NULL;
+    if (bones_o && bones_o != Py_None) {
+        bones_fast = PySequence_Fast(bones_o, "bones must be a sequence");
+        if (!bones_fast) goto done;
+        count = PySequence_Fast_GET_SIZE(bones_fast);
+        bone_items = PySequence_Fast_ITEMS(bones_fast);
+    }
+
+    packed = (double *)PyMem_Malloc((count ? count : 1) * CAPSULE_FLOATS
+                                    * sizeof(double));
+    if (!packed) { PyErr_NoMemory(); goto done; }
+
+    for (Py_ssize_t k = 0; k < count; ++k) {
+        Py_ssize_t i = k;
+        if (bone_items) {
+            i = PyNumber_AsSsize_t(bone_items[k], PyExc_IndexError);
+            if (i == -1 && PyErr_Occurred()) goto done;
+            /* Loud, not clamped and not skipped: a bone index this rig does
+             * not have means the caller's filter and its rig disagree, and
+             * silently dropping it would be a hitbox that quietly stops
+             * existing. */
+            if (i < 0 || i >= total) {
+                PyErr_Format(PyExc_IndexError,
+                             "bone index %zd is outside this rig's %zd bones",
+                             i, total);
+                goto done;
+            }
+        }
+
+        double v[PLACEMENT_FLOATS];
+        for (int c = 0; c < PLACEMENT_FLOATS; ++c) {
+            v[c] = PyFloat_AsDouble(pose_items[i * PLACEMENT_FLOATS + c]);
+            if (v[c] == -1.0 && PyErr_Occurred()) goto done;
+        }
+        double r[CAPSULE_FLOATS];
+        for (int c = 0; c < CAPSULE_FLOATS; ++c) {
+            r[c] = PyFloat_AsDouble(rest_items[i * CAPSULE_FLOATS + c]);
+            if (r[c] == -1.0 && PyErr_Occurred()) goto done;
+        }
+
+        /* Transform.compose(root, local), once. */
+        Vec3 local_pos = { v[0], v[1], v[2] };
+        Quat local_rot = { v[3], v[4], v[5], v[6] };
+        Vec3 spun = quat_rotate(root_rot, local_pos);
+        Vec3 origin = { root_pos.x + spun.x, root_pos.y + spun.y,
+                        root_pos.z + spun.z };
+        Quat rot = quat_mul(root_rot, local_rot);
+
+        Vec3 rest_a = { r[0], r[1], r[2] };
+        Vec3 rest_b = { r[3], r[4], r[5] };
+        Vec3 a = quat_rotate(rot, rest_a);
+        Vec3 b = quat_rotate(rot, rest_b);
+
+        double *out = packed + k * CAPSULE_FLOATS;
+        out[0] = origin.x + a.x;
+        out[1] = origin.y + a.y;
+        out[2] = origin.z + a.z;
+        out[3] = origin.x + b.x;
+        out[4] = origin.y + b.y;
+        out[5] = origin.z + b.z;
+        out[6] = r[6];
+    }
+
+    blob = PyBytes_FromStringAndSize(
+        (const char *)packed,
+        count * CAPSULE_FLOATS * (Py_ssize_t)sizeof(double));
+    if (!blob) goto done;
+
+    /* By hand, for the reason `place_batch` gives: "N" steals a reference and
+     * releases what it already took when it fails, which would make the
+     * cleanup below a second release. */
+    result = PyDict_New();
+    if (!result) goto done;
+    if (PyDict_SetItemString(result, "capsules", blob) != 0) {
+        Py_CLEAR(result);
+        goto done;
+    }
+
+done:
+    PyMem_Free(packed);
+    Py_XDECREF(blob);
+    Py_XDECREF(bones_fast);
+    Py_XDECREF(bones_o);
+    Py_XDECREF(rest_fast);
+    Py_XDECREF(pose_fast);
+    Py_XDECREF(rest_o);
+    Py_XDECREF(pose_o);
+    Py_XDECREF(root_o);
+    return result;
+}
+
+/* ---------------------------------------------------------------------- */
 
 static PyMethodDef methods[] = {
     {"segment_query", segment_query, METH_O,
@@ -725,6 +912,8 @@ static PyMethodDef methods[] = {
      "Which bone a ray struck, over an already-filtered capsule list."},
     {"place_batch", place_batch, METH_O,
      "Cull one cell's placements and pack the instances that survived."},
+    {"pose_capsules", pose_capsules, METH_O,
+     "Where a posed rig's selected bones are, in world space."},
     {NULL, NULL, 0, NULL}
 };
 

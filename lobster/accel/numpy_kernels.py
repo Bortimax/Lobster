@@ -1,4 +1,4 @@
-"""NumPy implementations of the three seam kernels (D26's seam, D40, D53).
+"""NumPy implementations of the four seam kernels (D26's seam, D40, D53, D54).
 
 Both mirror `lobster.conformance.REFERENCE` exactly in signature and in answer,
 and the differential harness (D28) is what proves the second part rather than
@@ -295,7 +295,58 @@ def _sample_light(lightmap: Any, points: np.ndarray) -> np.ndarray:
     return out
 
 
+def _quat_rotate_rows(q: np.ndarray, v: np.ndarray) -> np.ndarray:
+    """`geometry.quat_rotate` with a *different* quaternion per row."""
+    u, s = q[:, :3], q[:, 3:4]
+    uv = np.sum(u * v, axis=1, keepdims=True)
+    uu = np.sum(u * u, axis=1, keepdims=True)
+    return 2.0 * uv * u + (s * s - uu) * v + 2.0 * s * np.cross(u, v)
+
+
+def pose_capsules(payload: Mapping[str, Any]) -> Dict[str, Any]:
+    """Where a posed rig's selected bones are, in world space.
+
+    Answers in float64 and not f32: the consumer is `nearest_region`, which
+    works in doubles.
+    """
+    from ..conformance import CAPSULE_FLOATS, PLACEMENT_FLOATS
+
+    rest = np.asarray(payload["rest"], dtype=np.float64)
+    pose = np.asarray(payload["pose"], dtype=np.float64)
+    total = rest.size // CAPSULE_FLOATS
+    selected = payload.get("bones")
+
+    if total == 0 or (selected is not None and len(selected) == 0):
+        return {"capsules": b""}
+    rest = rest.reshape(total, CAPSULE_FLOATS)
+    pose = pose.reshape(pose.size // PLACEMENT_FLOATS, PLACEMENT_FLOATS)
+    if selected is None:
+        index = np.arange(total)
+    else:
+        index = np.asarray(selected, dtype=np.int64)
+        # Refused, not wrapped - numpy would have served the last bone for -1,
+        # which is the same silent substitution the reference now rejects.
+        if index.min() < 0 or index.max() >= total:
+            raise IndexError(
+                "bone index outside this rig's {0} bones".format(total))
+
+    root = payload["root"]
+    root_pos = np.asarray(root["position"], dtype=np.float64)
+    root_rot = np.asarray(root["rotation"], dtype=np.float64)
+
+    # Transform.compose(root, local), for every selected bone at once.
+    origin = root_pos + _quat_rotate(root_rot, pose[index, 0:3])
+    rot = _quat_mul(root_rot, pose[index, 3:7])
+
+    out = np.empty((index.size, CAPSULE_FLOATS), dtype=np.float64)
+    out[:, 0:3] = origin + _quat_rotate_rows(rot, rest[index, 0:3])
+    out[:, 3:6] = origin + _quat_rotate_rows(rot, rest[index, 3:6])
+    out[:, 6] = rest[index, 6]
+    return {"capsules": out.tobytes()}
+
+
 def kernels() -> Dict[str, Callable[[Mapping[str, Any]], Dict[str, Any]]]:
-    from ..conformance import NEAREST_REGION, PLACE_BATCH, SEGMENT_QUERY
+    from ..conformance import (NEAREST_REGION, PLACE_BATCH, POSE_CAPSULES,
+                               SEGMENT_QUERY)
     return {SEGMENT_QUERY: segment_query, NEAREST_REGION: nearest_region,
-            PLACE_BATCH: place_batch}
+            PLACE_BATCH: place_batch, POSE_CAPSULES: pose_capsules}

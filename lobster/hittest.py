@@ -524,6 +524,10 @@ class HitTester:
         _name, kernels = _select_accel()
         segment_query = kernels["segment_query"]
         nearest = kernels["nearest_region"]
+        # Selected here and handed down, not looked up per rig: `select()`
+        # costs more than the kernel does for a six-bone humanoid, so a lookup
+        # inside `hitbox_rows` would hand the win back (D54).
+        place = kernels["pose_capsules"]
 
         entries = self._volley_entries()
         radius = self.broad_margin()
@@ -560,13 +564,14 @@ class HitTester:
                 if packed is None:
                     limb_state = view.limb_state(entity_id,
                                                  purpose=HIT_TEST_ONLY)
-                    # Cached in the shape the kernel wants, not just as
-                    # capsules. Re-packing six bones into lists on every
-                    # arrow was the largest remaining per-arrow cost once the
-                    # loops were in C - the marshalling, not the maths.
-                    packed = [[region, list(c.a), list(c.b), c.radius]
-                              for region, c in
-                              skeleton.hitboxes(limb_state=limb_state)]
+                    # Cached in the shape the next kernel wants, and now
+                    # *built* in it: `hitbox_rows` reads the pose kernel's
+                    # bytes straight into these lists. It used to call
+                    # `hitboxes()` and take the `Capsule`s apart again, so six
+                    # capsules were constructed per rig per volley purely to be
+                    # discarded (D54).
+                    packed = skeleton.hitbox_rows(limb_state=limb_state,
+                                                  place=place)
                     boxes_of[entity_id] = packed
 
                 self.stats.bone_refinements += 1

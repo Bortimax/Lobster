@@ -31,6 +31,49 @@ def _present(name: str) -> bool:
 
 class TestTheRegistry(unittest.TestCase):
 
+    def test_the_selection_cache_notices_a_changed_preference(self):
+        """`select()` is memoised, and **every cross-implementation test in
+        this suite works by swapping `KERNEL_PREFERENCE`.**
+
+        So a cache that ignored the table would not merely be stale - it would
+        quietly turn `test_place_batch`, `test_pose_capsules` and
+        `test_volley`'s implementation comparisons into comparisons of one
+        implementation with itself, all still green. That mutation was reported
+        *caught* for a while, by a mutation harness that was leaving stale
+        bytecode behind (D54).
+        """
+        from lobster import accel
+        original = accel.KERNEL_PREFERENCE
+        accel.forget_selection()
+        try:
+            accel.select()
+            self.assertEqual(len(accel._SELECTION), 1)
+            accel.KERNEL_PREFERENCE = dict(
+                original, **{SEGMENT_QUERY: ("python",)})
+            accel.select()
+            # Asserted on the *cache*, not on the kernel that came back: with
+            # no compiler and no numpy there is only the reference, so a
+            # swapped table legitimately returns the same function and an
+            # identity check would fail in the one configuration L7 promises.
+            # That is the second test in this project to have assumed more
+            # than one implementation exists (D53, D54).
+            self.assertEqual(len(accel._SELECTION), 2,
+                             "swapping the preference table reused the cached "
+                             "entry - the memoisation is not keyed on it")
+        finally:
+            accel.KERNEL_PREFERENCE = original
+            accel.forget_selection()
+
+    def test_forgetting_the_selection_repeats_the_walk(self):
+        """The escape hatch, for a process that has just built the extension -
+        the same one `render.forget_gl_probe` gives."""
+        from lobster import accel
+        accel.select()
+        self.assertTrue(accel._SELECTION, "nothing was memoised")
+        accel.forget_selection()
+        self.assertFalse(accel._SELECTION)
+        self.assertTrue(accel.select()[1], "selection broke after forgetting")
+
     def test_python_is_always_available(self):
         found = {i["name"]: i for i in available()}
         self.assertTrue(found["python"]["available"],
@@ -375,6 +418,47 @@ class TestTheNativeKernelDoesNotLeak(unittest.TestCase):
                 kernel(payload)
         gc.collect()
         self.assertLessEqual(sys.getrefcount(data), before)
+
+    def test_pose_capsules_returns_the_references_it_takes(self):
+        from lobster.conformance import POSE_CAPSULES
+        from lobster.skeleton import Skeleton, humanoid_region_set
+        region_set = humanoid_region_set()
+        payload = {"root": {"position": (1.0, 0.0, 2.0),
+                            "rotation": (0.0, 0.0, 0.0, 1.0)},
+                   "pose": Skeleton("e", region_set).pose_rows(),
+                   "rest": region_set.rest_rows,
+                   "bones": [0, 2, 4]}
+        kernel = self.kernels()[POSE_CAPSULES]
+        self.assertTrue(kernel(payload)["capsules"], "fixture must place bones")
+
+        watched = (payload["pose"], payload["rest"], payload["bones"],
+                   payload["root"])
+        names = ("pose", "rest", "bones", "root")
+        before = [sys.getrefcount(o) for o in watched]
+        for _ in range(2000):
+            kernel(payload)
+        gc.collect()
+        after = [sys.getrefcount(o) for o in watched]
+        for name, was, now in zip(names, before, after):
+            self.assertLessEqual(now, was, "{0} leaked".format(name))
+
+    def test_pose_capsules_leaks_nothing_when_it_refuses_a_bone(self):
+        """The error path aborts after both sequences are held."""
+        from lobster.conformance import POSE_CAPSULES
+        from lobster.skeleton import Skeleton, humanoid_region_set
+        region_set = humanoid_region_set()
+        rest = region_set.rest_rows
+        payload = {"root": {"position": (0.0, 0.0, 0.0),
+                            "rotation": (0.0, 0.0, 0.0, 1.0)},
+                   "pose": Skeleton("e", region_set).pose_rows(),
+                   "rest": rest, "bones": [len(region_set.bones)]}
+        kernel = self.kernels()[POSE_CAPSULES]
+        before = sys.getrefcount(rest)
+        for _ in range(2000):
+            with self.assertRaises(IndexError):
+                kernel(payload)
+        gc.collect()
+        self.assertLessEqual(sys.getrefcount(rest), before)
 
     def test_an_error_path_leaks_nothing_either(self):
         """A malformed row aborts mid-loop, after some ids are already stashed.

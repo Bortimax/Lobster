@@ -20,9 +20,11 @@ import random
 import tempfile
 import unittest
 
-from lobster.conformance import (AUTHORITY, DISTANCE_TOLERANCE_M,
+from lobster.conformance import (AUTHORITY, CAPSULE_FLOATS, CAPSULE_PACK,
+                                 DISTANCE_TOLERANCE_M,
                                  INSTANCE_FLOATS, NEAREST_REGION, PLACE_BATCH,
-                                 SEAM_KERNELS, SEGMENT_QUERY, UNIT_TOLERANCE,
+                                 POSE_CAPSULES, SEAM_KERNELS, SEGMENT_QUERY,
+                                 UNIT_TOLERANCE,
                                  Case, ConformanceError, build_vectors,
                                  _region_is_ambiguous, compare,
                                  dump_vectors, generate_cases, load_vectors,
@@ -465,6 +467,188 @@ class TestThePlaceBatchCasesExerciseTheRules(PlaceBatchFixture):
                                    msg="at {0}".format(point))
 
 
+# ---------------------------------------------------------------------------
+# pose_capsules (D54)
+# ---------------------------------------------------------------------------
+
+WIDTH = CAPSULE_FLOATS * struct.calcsize(CAPSULE_PACK)
+
+
+def _caps(result):
+    return [list(struct.unpack_from("7" + CAPSULE_PACK, result["capsules"],
+                                    i * WIDTH))
+            for i in range(len(result["capsules"]) // WIDTH)]
+
+
+def _repack(result, rows):
+    result["capsules"] = b"".join(
+        struct.pack("7" + CAPSULE_PACK, *row) for row in rows)
+
+
+class PoseCapsulesFixture(ConformanceFixture):
+
+    def a_case(self, minimum=1):
+        for i, (case, result) in enumerate(zip(self.cases, self.reference)):
+            if case.kernel == PLACE_BATCH or case.kernel != POSE_CAPSULES:
+                continue
+            if len(result["capsules"]) // WIDTH >= minimum:
+                return i, case, result
+        self.fail("no generated case produces {0} capsule(s)".format(minimum))
+
+    def caught(self, index, candidate):
+        found = compare(self.cases, self.reference, candidate)
+        self.assertTrue(found, "the harness accepted a wrong answer")
+        self.assertEqual({d.case_id for d in found},
+                         {self.cases[index].case_id})
+        return {d.field for d in found}
+
+
+class TestThePoseCapsulesHarnessCanFail(PoseCapsulesFixture):
+    """No ambiguity rules for this kernel, so every one of these must be
+    caught outright - there is no boundary for a disagreement to hide behind."""
+
+    def test_a_dropped_capsule_is_caught(self):
+        i, _case, _ref = self.a_case()
+        candidate = copy.deepcopy(self.reference)
+        rows = _caps(candidate[i])
+        _repack(candidate[i], rows[:-1])
+        self.assertIn("capsules.count", self.caught(i, candidate))
+
+    def test_an_extra_capsule_is_caught(self):
+        i, _case, _ref = self.a_case()
+        candidate = copy.deepcopy(self.reference)
+        rows = _caps(candidate[i])
+        _repack(candidate[i], rows + [rows[0]])
+        self.assertIn("capsules.count", self.caught(i, candidate))
+
+    def test_a_moved_endpoint_is_caught(self):
+        i, _case, _ref = self.a_case()
+        candidate = copy.deepcopy(self.reference)
+        rows = _caps(candidate[i])
+        rows[0][1] += 0.01
+        _repack(candidate[i], rows)
+        self.assertIn("capsules[0].a.y", self.caught(i, candidate))
+
+    def test_a_moved_far_endpoint_is_caught(self):
+        """Both ends, because a kernel that transformed `a` and copied `b`
+        would place every capsule half right."""
+        i, _case, _ref = self.a_case()
+        candidate = copy.deepcopy(self.reference)
+        rows = _caps(candidate[i])
+        rows[0][5] += 0.01
+        _repack(candidate[i], rows)
+        self.assertIn("capsules[0].b.z", self.caught(i, candidate))
+
+    def test_a_changed_radius_is_caught(self):
+        i, _case, _ref = self.a_case()
+        candidate = copy.deepcopy(self.reference)
+        rows = _caps(candidate[i])
+        rows[0][6] += 0.01
+        _repack(candidate[i], rows)
+        self.assertIn("capsules[0].radius", self.caught(i, candidate))
+
+    def test_the_wrong_bone_in_the_right_place_is_caught(self):
+        """Two bones swapped keeps the count and every number, and is still
+        wrong: the caller matches these to regions by position."""
+        i, _case, _ref = self.a_case(minimum=2)
+        candidate = copy.deepcopy(self.reference)
+        rows = _caps(candidate[i])
+        rows[0], rows[1] = rows[1], rows[0]
+        _repack(candidate[i], rows)
+        self.assertTrue(self.caught(i, candidate))
+
+
+class TestThePoseCapsulesHarnessAllowsWhatItSaid(PoseCapsulesFixture):
+
+    def test_an_endpoint_inside_tolerance_is_allowed(self):
+        i, _case, _ref = self.a_case()
+        candidate = copy.deepcopy(self.reference)
+        rows = _caps(candidate[i])
+        rows[0][0] += DISTANCE_TOLERANCE_M * 0.5
+        _repack(candidate[i], rows)
+        self.assertEqual(compare(self.cases, self.reference, candidate), [])
+
+
+class TestThePoseCapsulesCasesExerciseTheRules(PoseCapsulesFixture):
+
+    def rows(self):
+        return [(c, r) for c, r in zip(self.cases, self.reference)
+                if c.kernel == POSE_CAPSULES]
+
+    def test_the_generator_covers_filtering_and_rotation(self):
+        rows = self.rows()
+        self.assertGreaterEqual(
+            sum(1 for c, _r in rows if c.payload["bones"] is not None), 5,
+            "the severed-limb path is barely tested")
+        self.assertTrue(any(c.payload["bones"] == [] for c, _r in rows),
+                        "no case severs everything")
+        self.assertTrue(
+            any(c.payload["root"]["rotation"] != [0.0, 0.0, 0.0, 1.0]
+                for c, _r in rows),
+            "no case turns the root, so composition order is untested")
+        turned = 0
+        for c, _r in rows:
+            pose = c.payload["pose"]
+            for i in range(len(pose) // 7):
+                if pose[i * 7 + 3:i * 7 + 7] != [0.0, 0.0, 0.0, 1.0]:
+                    turned += 1
+        self.assertGreaterEqual(turned, 20,
+                                "bone rotations are barely tested")
+
+    def test_the_generator_produces_capsules_and_empties(self):
+        rows = self.rows()
+        produced = sum(len(r["capsules"]) // WIDTH for _c, r in rows)
+        self.assertGreaterEqual(produced, 60)
+        self.assertTrue(any(not r["capsules"] for _c, r in rows),
+                        "the empty-result path is barely tested")
+
+    def test_the_reference_agrees_with_the_skeleton_it_stands_for(self):
+        """`capsule_for` is what this kernel replaces, and the reference is the
+        authority for both. Two definitions of one transform is how they
+        drift."""
+        from lobster.conformance import reference_pose_capsules
+        from lobster.geometry import Transform
+        from lobster.skeleton import Skeleton, humanoid_region_set
+        import math
+        import random as _random
+
+        rng = _random.Random(17)
+        region_set = humanoid_region_set()
+        for _ in range(25):
+            def spin():
+                axis = [rng.uniform(-1, 1) for _ in range(3)]
+                norm = math.sqrt(sum(c * c for c in axis)) or 1.0
+                angle = rng.uniform(-math.pi, math.pi)
+                k = math.sin(angle / 2.0) / norm
+                return (axis[0] * k, axis[1] * k, axis[2] * k,
+                        math.cos(angle / 2.0))
+
+            root = Transform(position=(rng.uniform(-30, 30), 0.0,
+                                       rng.uniform(-30, 30)),
+                             rotation=spin())
+            skeleton = Skeleton("e", region_set, root=root)
+            skeleton.set_pose({b.bone_id: Transform(
+                position=(rng.uniform(-0.3, 0.3),) * 3, rotation=spin())
+                for b in region_set.bones})
+
+            pose, rest = [], []
+            for bone in region_set.bones:
+                local = skeleton.pose()[bone.bone_id]
+                pose.extend(list(local.position) + list(local.rotation))
+                rest.extend(list(bone.a) + list(bone.b) + [bone.radius])
+            got = _caps(reference_pose_capsules(
+                {"root": {"position": list(root.position),
+                          "rotation": list(root.rotation)},
+                 "pose": pose, "rest": rest, "bones": None}))
+            for row, (_region, capsule) in zip(got,
+                                               skeleton.hitboxes()):
+                for a, b in zip(row[0:3], capsule.a):
+                    self.assertAlmostEqual(a, b, places=9)
+                for a, b in zip(row[3:6], capsule.b):
+                    self.assertAlmostEqual(a, b, places=9)
+                self.assertAlmostEqual(row[6], capsule.radius, places=12)
+
+
 class TestGoldenVectors(unittest.TestCase):
 
     def test_the_committed_vectors_match_the_live_reference(self):
@@ -508,9 +692,10 @@ class TestGoldenVectors(unittest.TestCase):
 class TestTheSeamStaysWhereItWasPut(unittest.TestCase):
     """D26 fixed where the seam goes. This is the guard on that."""
 
-    def test_the_seam_is_three_kernels(self):
+    def test_the_seam_is_four_kernels(self):
         self.assertEqual(sorted(SEAM_KERNELS),
-                         ["nearest_region", "place_batch", "segment_query"])
+                         ["nearest_region", "place_batch", "pose_capsules",
+                          "segment_query"])
 
     def test_neither_kernel_reads_limb_state(self):
         """The seam sits *below* the limb-state read on purpose, so a native

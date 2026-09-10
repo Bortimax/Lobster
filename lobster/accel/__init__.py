@@ -62,10 +62,12 @@ def _native_kernels():
         from .native import lobster_accel
     except Exception:
         return None
-    from ..conformance import NEAREST_REGION, PLACE_BATCH, SEGMENT_QUERY
+    from ..conformance import (NEAREST_REGION, PLACE_BATCH, POSE_CAPSULES,
+                               SEGMENT_QUERY)
     return {SEGMENT_QUERY: lobster_accel.segment_query,
             NEAREST_REGION: lobster_accel.nearest_region,
-            PLACE_BATCH: lobster_accel.place_batch}
+            PLACE_BATCH: lobster_accel.place_batch,
+            POSE_CAPSULES: lobster_accel.pose_capsules}
 
 
 register("python", _python_kernels)
@@ -85,6 +87,8 @@ PREFERENCE: Tuple[str, ...] = ("native", "numpy", "python")
 #: | `nearest_region`, 6 bones | **0.46x** | **64x** |
 #: | `place_batch`, 800 in one call | 8.2x | **50x** |
 #: | `place_batch`, **a real frame** - 36 small calls | **0.26x** | **27x** |
+#: | `pose_capsules`, one 6-bone humanoid | **0.13x** | **30x** |
+#: | `pose_capsules`, **a real volley** - 62 rigs | **0.20x** | **57x** |
 #:
 #: NumPy *loses* the refinement, because a rig has six bones and building six
 #: arrays costs more than looping over six capsules - D26's seam-granularity
@@ -100,15 +104,28 @@ PREFERENCE: Tuple[str, ...] = ("native", "numpy", "python")
 #: the granularity that makes numpy slow, and measuring the aggregate rather
 #: than the single call is what showed it (D53).
 #:
-#: So numpy stays as the middle rung for the broad phase, where it is a real
-#: win on a machine with no compiler, and is **excluded from the refinement and
-#: from placement** rather than left in to be slower than the reference. It
-#: still *implements* both, so the differential suite holds it to the same
+#: **Three of four, and the pattern is now the point.** NumPy has won exactly
+#: one kernel - `segment_query`, which is a thousand entities handed over in a
+#: single call - and lost the three that are invoked *per thing*: per rig, per
+#: cell, per model. That is not three coincidences. The seam's granularity is
+#: what makes C fast, because C pays nothing to be called; the same granularity
+#: is what makes numpy slow, because an array is built and torn down every time.
+#:
+#: The rule that falls out, and it is worth stating before the fifth kernel:
+#: **numpy belongs on a kernel that is called once with everything, and nowhere
+#: else.** Anyone adding one should measure the aggregate over a real frame or
+#: volley, not a single big call - both times the single-call number said the
+#: opposite of the truth.
+#:
+#: So numpy stays as the middle rung for the broad phase and is **excluded
+#: everywhere else** rather than left in to be slower than the reference. It
+#: still *implements* all four, so the differential suite holds it to the same
 #: answers and a caller may ask for it by name.
 KERNEL_PREFERENCE: Dict[str, Tuple[str, ...]] = {
     "segment_query": ("native", "numpy", "python"),
     "nearest_region": ("native", "python"),
     "place_batch": ("native", "python"),
+    "pose_capsules": ("native", "python"),
 }
 
 
@@ -137,6 +154,28 @@ def available() -> List[Dict[str, Any]]:
     return out
 
 
+#: `select()`'s answer, keyed by the preference table it was computed from.
+#:
+#: Selection walks the registry and calls every loader, which measured at
+#: 3.35 us - more than a whole native `pose_capsules` call for a humanoid. That
+#: is fine once a volley and absurd once a rig, and `Skeleton.hitboxes` is
+#: called per rig (D54).
+#:
+#: **Keyed on `KERNEL_PREFERENCE`'s contents**, so a test that swaps the table
+#: to force an implementation misses the cache and gets what it asked for -
+#: which is how `test_volley` and `test_place_batch` compare implementations.
+#: `forget_selection()` drops it, the same escape `render.forget_gl_probe`
+#: gives for the same reason: a process that gains an implementation mid-run
+#: is rare, real, and should not need a restart.
+_SELECTION: Dict[Any, Tuple[str, Dict[str, Callable]]] = {}
+
+
+def forget_selection() -> None:
+    """Drop the memoised selection. For a process that has just built the
+    extension, and for a test that wants the walk repeated."""
+    _SELECTION.clear()
+
+
 def select(prefer: Optional[str] = None) -> Tuple[str, Dict[str, Callable]]:
     """`(name, kernels)` for the fastest kernel available for each operation.
 
@@ -149,6 +188,12 @@ def select(prefer: Optional[str] = None) -> Tuple[str, Dict[str, Callable]]:
     reason: a caller who asked for the fast path and silently got the slow one
     would blame the wrong layer for the frame rate.
     """
+    if prefer is None:
+        key = tuple(sorted((k, tuple(v)) for k, v in KERNEL_PREFERENCE.items()))
+        hit = _SELECTION.get(key)
+        if hit is not None:
+            return hit
+
     if prefer is not None:
         loader = _IMPLEMENTATIONS.get(prefer)
         if loader is None:
@@ -186,4 +231,5 @@ def select(prefer: Optional[str] = None) -> Tuple[str, Dict[str, Callable]]:
     # a lie when half of it is the reference.
     name = "+".join(sorted(set(picked.values()))) if len(
         set(picked.values())) > 1 else next(iter(picked.values()))
+    _SELECTION[key] = (name, chosen)
     return name, chosen
