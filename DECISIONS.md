@@ -3169,6 +3169,14 @@ cell**.
 
 ### Two ceilings that look like a contradiction and are not
 
+> **Wrong, and superseded by D52.** This section defended a per-cell ceiling
+> that counted props while items fed the same frame counter, and it defended a
+> ring divisor applied to interiors that have no ring. The paragraph below is
+> kept because the *argument* it makes about picking is still true and is the
+> reason `MAX_ITEMS_PER_CELL` survived unchanged - but "that is the two ceilings
+> composing, not colliding" was not true, and two questions from the project
+> owner took about a minute to show it.
+
 `MAX_ITEMS_PER_CELL` is 173 and `MAX_PROP_PLACEMENTS_PER_CELL` is 34. Both are
 derived; neither is wrong.
 
@@ -3203,3 +3211,91 @@ of the four mutants it had been ignoring were real gaps: nothing tested
 a world with too many props.
 
 Twenty mutants, twenty caught - and this time the count means something.
+
+---
+
+## D52 — Two worst cases applied to populations that did not have them
+
+D51 shipped a per-cell drawing ceiling of 34 and a paragraph explaining why that
+did not contradict `MAX_ITEMS_PER_CELL`. The project owner asked two questions,
+a minute apart, and each one found a defect the paragraph was covering for.
+
+> Isn't one items and one NPCs?
+
+Neither. `MAX_ITEMS_PER_CELL` is placed `Item` records (D38, derived from
+picking); `MAX_PROP_PLACEMENTS_PER_CELL` was bundle props (D51, derived from
+drawing); NPCs are `DEFAULT_MAX_ACTIVE_SKELETONS_PER_CELL`, which is 32 and a
+coincidence. But the question was the right one to ask, because the two numbers
+I *was* comparing are two different populations - and **both of them draw**.
+
+### Defect 1: a ceiling on one contributor, derived as though it bounded both
+
+`charge_placement` fires for props and for items. The per-cell ceiling counted
+props and divided the frame budget by the ring anyway. So:
+
+* a cell at 34 props **and** 173 items is 207 drawable things;
+* two such cells is 414 against a frame ceiling of 312;
+* and every per-cell check passes.
+
+That is precisely the failure D20 named - *a default that cannot compose is a
+lie* - which I quoted in the commit message while shipping it. The paragraph
+defending the two numbers as "different questions" was true about *picking* and
+irrelevant to the thing that was broken.
+
+**Fixed:** one ceiling, `max_drawable_placements`, over props **and** items with
+a `model_ref`. Counted at build time (the build can see both - props are in the
+manifest, items are records with a resolvable location) and at `place_item`,
+which already refuses a cell at its `max_items` and now refuses one at its
+drawing ceiling for the same reason and in the same place: before the write, so
+a refusal leaves nothing behind.
+
+`MAX_ITEMS_PER_CELL` is untouched and keeps its meaning. It bounds *items*,
+mesh or no mesh, because a pick tests all of them. A cell may still hold 173;
+what it may not do is give them all models.
+
+### Defect 2: an interior charged for a ring it can never have
+
+> That doesn't seem very high. If someone has a 'player home', then 34 items is
+> quite small.
+
+Correct, and the reason is not the slice or the unit. It is that 34 is
+`frame ÷ MAX_RESIDENT_CELLS`, and `residency_ring` says in its own docstring:
+
+> An exterior cell brings its exterior neighbours; **an interior brings
+> nothing** (DECISIONS.md D8).
+
+A player home is an interior. It is resident *alone*. Dividing the frame budget
+by nine charges it for eight exterior neighbours that will never be loaded
+beside it, and a house with 34 things in it is not a house.
+
+**Fixed:** the ceiling is derived from the cell's actual residency worst case -
+`MAX_DRAWABLE_PLACEMENTS_PER_CELL` (34) for an exterior, and
+`MAX_DRAWABLE_PLACEMENTS_PER_INTERIOR` (312, the whole frame) for an interior.
+This is the only per-cell default in the shell that is not global, and it is not
+global because residency is not. `Budget.declared` reads the `exterior` tag off
+the Location record, which is the same test `cell.is_exterior` uses - one
+definition, not two.
+
+A transition into an interior does hold both sets briefly, but `set_player_cell`
+loads and unloads inside one call, so no frame is drawn with both resident. The
+overlap is a *memory* peak, which `MAX_TRANSITION_PEAK_BYTES` already bounds.
+
+### What is actually left, if 312 is still not enough
+
+312 is the pure-Python ceiling at 12.8 us a placement, and that unit is the only
+thing standing between it and a larger number. Three quarters of it is culling
+and transform work that is uniform across placements - the shape the accelerator
+seam (D26) exists for, and the fourth line of D51's table. Raising the ceiling
+means writing that kernel, not editing the constant.
+
+### The shape of both defects, which is the same shape
+
+Each took a worst case that was true of one population and applied it to another:
+props' frame cost applied as though items had none, and the exterior ring
+applied to cells that have no ring. Both survived because every test asserted
+the *arithmetic* of the derivation - which was correct - rather than the
+*property* the derivation was supposed to guarantee.
+
+There is now a test for the property itself: nine exterior cells at their
+ceiling, everything on screen, still inside the frame budget. It fails under
+either defect. Thirteen mutants, thirteen caught.

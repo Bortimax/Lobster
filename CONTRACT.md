@@ -649,39 +649,59 @@ Declared in `lobster/constants.py`, overridable **downward** per cell via
 | `MODEL_DRAW_BUDGET_US` | 4,000 — declared slice for assembling one frame's model instances |
 | `PER_PLACEMENT_US` | **12.8 — measured** on the slope, 25 to 800 placements |
 | `MAX_VISIBLE_PLACEMENTS_PER_FRAME` | **312 — derived**, slice ÷ measured unit |
-| `MAX_PROP_PLACEMENTS_PER_CELL` | **34 — derived**, frame ceiling ÷ `MAX_RESIDENT_CELLS` |
+| `MAX_DRAWABLE_PLACEMENTS_PER_CELL` | **34 — derived**, frame ceiling ÷ `MAX_RESIDENT_CELLS`, for an **exterior** cell |
+| `MAX_DRAWABLE_PLACEMENTS_PER_INTERIOR` | **312 — derived**, the whole frame: an interior brings no ring (D8) |
 | `PROJECTILE_BROAD_RADIUS_M` | 2.5 — a *floor*; the real margin is derived per rig |
 
 A cell declaring a *higher* ceiling than the shell default is itself a
 violation. `python -m lobster.cli budgets --cells DIR` prints declared versus
 actual per cell.
 
-### The model budget, and why picking allows more items than drawing shows
+### The model budget
 
-Three ceilings, all derived (ASSET_SCOPE §6, D51):
+Three ceilings, all derived (ASSET_SCOPE §6, D51, corrected by D52):
 
 * **`MAX_VISIBLE_PLACEMENTS_PER_FRAME`** is the real one. Culling is what bounds
   drawing, so the honest quantity is *visible* placements per frame rather than
   authored ones per cell. `build_draw_list` counts them and raises
   `BudgetViolation(metric="model_frame_us")` naming the microseconds.
   `max_visible_placements=0` disables it, the `HitTester` convention.
-* **`MAX_PROP_PLACEMENTS_PER_CELL`** is the build-time proxy: the frame ceiling
-  divided by the ring, checked per cell so a Location may declare lower
-  (`lobster_budget.max_prop_placements`). Props with no `model_ref` are not
-  counted — an impostor is the cheaper path and is not charged either.
+* **`max_drawable_placements`** is the per-cell build-time proxy, and it counts
+  **props and placed items together** — both feed the same frame counter, so a
+  ceiling on one of them derived as though it bounded both guarantees nothing.
+  A Location may declare lower. Anything with no `model_ref` is not counted:
+  an impostor is the cheaper path and the frame budget does not charge for it
+  either.
 * **`MAX_MODEL_LIBRARY_BYTES`** bounds the meshed library, checked against the
   whole of it at build time. Conservative on purpose: if the whole thing fits,
   every resident subset does.
 
-**`MAX_ITEMS_PER_CELL` (173) is larger than `MAX_PROP_PLACEMENTS_PER_CELL` (34),
-and that is not a contradiction.** They answer different questions. A pick tests
-every item in every resident cell with no culling at all, so 173 is a fixed
-worst case (D38). Drawing culls, so its worst case is bounded by the frame
-counter instead — and a cell that fills its item allowance *and* puts every one
-of them on screen trips `model_frame_us`, loudly, naming the metric.
+**The per-cell ceiling depends on the kind of cell**, because residency does:
 
-Raising any of them means making a placement cheaper, not editing the number.
-`PER_PLACEMENT_US` has already come down from 29.9 to 12.8 that way.
+| cell | resident with it | ceiling |
+|---|---|---|
+| exterior (tagged `exterior`) | itself plus its ring, up to 9 | **34** |
+| interior — a house, a dungeon | itself, and nothing else (D8) | **312** |
+
+That is the only per-cell default in the shell that is not global, and it is not
+global because `residency_ring` is explicit: *"an exterior cell brings its
+exterior neighbours; an interior brings nothing"*. Dividing the frame budget by
+the ring for a player's house charges it for eight neighbours it can never have.
+
+**`MAX_ITEMS_PER_CELL` (173) is a different ceiling on a different cost.** A pick
+tests every item in a resident cell whether or not it has a mesh, so 173 bounds
+*items*; `max_drawable_placements` bounds *meshes*, of which items are one
+source and props the other. A cell may hold more items than it can draw — the
+extra ones simply have no `model_ref` and appear as impostors. Neither number
+contains the other, and `place_item` checks both before it writes.
+
+NPCs are in neither: an entity has no `model_ref` at all, because skinning is an
+ASSET_SCOPE §5 non-goal. `DEFAULT_MAX_ACTIVE_SKELETONS_PER_CELL` is their own
+ceiling.
+
+Raising any of these means making a placement cheaper, not editing the number.
+`PER_PLACEMENT_US` has already come down from 29.9 to 12.8 that way, and the
+accelerator seam (D26) is where the next reduction would come from.
 
 ### Walking holds both cells; jumping does not
 

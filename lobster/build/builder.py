@@ -42,7 +42,7 @@ from ..constants import (BUNDLE_SUFFIX, EXTERIOR_CELL_SIZE_M,
                          LIBRARY_FILENAME, MAX_MODEL_LIBRARY_BYTES)
 from ..geometry import Transform, Vec3
 from ..navmesh import LoadBearingTable, Navmesh
-from ..octopus_bridge import content_view
+from ..octopus_bridge import content_view, resolve_item_location
 from ..structures import StructureError, StructureVoxelData
 from ..terrain import Terrain
 from .bundle_writer import write_bundle
@@ -209,8 +209,8 @@ def build_cell(view: Any, manifest: Manifest, cell: CellEntry, *,
     budget_findings: List[Dict[str, Any]] = []
     for metric, value in (("max_structure_voxels", bundle.structure_voxel_count()),
                           ("max_micro_chunks", bundle.micro_chunk_count()),
-                          ("max_prop_placements",
-                           sum(1 for p in bundle.props if p.model_ref)),
+                          ("max_drawable_placements",
+                           drawable_placements(view, bundle)),
                           ("max_bytes", sum(bundle.nbytes().values()))):
         try:
             budget.check(metric, value, record_id=cell.location_id)
@@ -267,6 +267,24 @@ def check_library_budget(library: Any) -> List[Dict[str, Any]]:
                            ", ".join("{0} ({1} bytes)".format(m.model_ref,
                                                               m.nbytes())
                                      for m in worst))}]
+
+
+def drawable_placements(view: Any, bundle: CellBundle) -> int:
+    """Things in this cell that will draw as a mesh: props **and** items.
+
+    Both, because both feed the same per-frame counter. Counting props alone
+    and dividing the frame budget by the ring anyway was the defect D52
+    records: a ceiling on one contributor, derived as though it bounded both.
+
+    Something with no `model_ref` is not counted, here or at runtime. It draws
+    as an impostor, which is the cheaper path the frame budget does not charge
+    for either.
+    """
+    props = sum(1 for p in bundle.props if p.model_ref)
+    items = sum(1 for record in view.records_of_type("Item")
+                if record.get("model_ref") and record.get("world_transform")
+                and resolve_item_location(record) == bundle.cell_id)
+    return props + items
 
 
 def _manifest_hash(cell: CellEntry) -> str:

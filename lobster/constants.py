@@ -50,6 +50,11 @@ SPATIAL_GRID_DIM = int(EXTERIOR_CELL_SIZE_M / SPATIAL_GRID_CELL_M) + 1
 # Residency (§4, §3 "Don't stream - load cells")
 # ---------------------------------------------------------------------------
 
+#: The Location tag that means "this cell sits on the exterior grid".
+#: Declared here rather than in `cell` because the budget layer needs it too,
+#: and `budgets` importing from `cell` would be a cycle.
+EXTERIOR_TAG = "exterior"
+
 #: "One cell (plus immediate exterior neighbors) resident at a time" (§1).
 RESIDENT_RING = 1
 
@@ -289,20 +294,47 @@ PER_PLACEMENT_US = 12.8
 #: per cell.
 MAX_VISIBLE_PLACEMENTS_PER_FRAME = int(MODEL_DRAW_BUDGET_US / PER_PLACEMENT_US)
 
-#: Prop placements one cell may author.
+#: Things with a mesh one **exterior** cell may hold: props and placed items
+#: together.
 #:
 #: Derived from the frame ceiling the way D20 derives a cell's memory from the
-#: transition peak: the worst case is every resident cell at its ceiling with
-#: everything on screen at once.
+#: transition peak: an exterior cell brings its ring, so the worst case is nine
+#: of them at their ceiling with everything on screen at once.
 #:
-#: **`MAX_ITEMS_PER_CELL` is deliberately larger than this**, and the two do not
-#: contradict each other because they answer different questions. A pick tests
-#: every item in every resident cell with no culling at all, so 173 is a fixed
-#: worst case. Drawing culls, so its worst case is bounded by the frame counter
-#: instead - and a cell that fills its item allowance *and* puts every one of
-#: them on screen trips `model_frame_us`, loudly, naming the metric.
-MAX_PROP_PLACEMENTS_PER_CELL = int(MAX_VISIBLE_PLACEMENTS_PER_FRAME
-                                   / MAX_RESIDENT_CELLS)
+#: **Both populations, because both feed the same frame counter.** The first
+#: version counted props alone and divided by the ring anyway, which made it a
+#: ceiling on one contributor derived as though it bounded both: a cell at 34
+#: props *and* 173 items is 207 drawable things, and two such cells pass every
+#: per-cell check and blow the frame ceiling. That is the failure D20 named - a
+#: default that cannot compose is a lie (D52).
+#:
+#: `MAX_ITEMS_PER_CELL` (173) is untouched and does not contradict this. It is
+#: the *picking* ceiling, and a pick tests every item whether or not it has a
+#: mesh. A cell may still hold 173 items; what it may not do is give them all
+#: models. An item with no `model_ref` draws as an impostor and is charged to
+#: neither this ceiling nor the frame counter.
+#:
+#: NPCs are not in here either, and not by oversight: an entity has no
+#: `model_ref` at all (skinning is an ASSET_SCOPE 5 non-goal), so it takes the
+#: impostor path. `DEFAULT_MAX_ACTIVE_SKELETONS_PER_CELL` is its own ceiling.
+MAX_DRAWABLE_PLACEMENTS_PER_CELL = int(MAX_VISIBLE_PLACEMENTS_PER_FRAME
+                                       / MAX_RESIDENT_CELLS)
+
+#: Things with a mesh one **interior** cell may hold - the whole frame.
+#:
+#: An interior brings nothing with it: `residency_ring` is explicit that "an
+#: exterior cell brings its exterior neighbours; an interior brings nothing"
+#: (D8). So dividing the frame budget by the ring for an interior charges a
+#: player's house for eight neighbours it can never have, and a house with 34
+#: things in it is not a house.
+#:
+#: This is the same mistake as the one above, one layer out: a worst case that
+#: belongs to one population applied to a population that does not have it
+#: (D52). A transition into an interior does hold both sets briefly, but
+#: `set_player_cell` loads and unloads inside one call, so no frame is drawn
+#: with both resident - the overlap is a *memory* peak, which is what
+#: `MAX_TRANSITION_PEAK_BYTES` already bounds.
+MAX_DRAWABLE_PLACEMENTS_PER_INTERIOR = MAX_VISIBLE_PLACEMENTS_PER_FRAME
 
 # ---------------------------------------------------------------------------
 # Zone shape primitives - FROZEN (§4)

@@ -30,7 +30,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field as dc_field
 from typing import Any, Dict, Iterable, List, Optional, Set
 
-from .constants import (MAX_ITEMS_PER_CELL, MAX_PROP_PLACEMENTS_PER_CELL,
+from .constants import (EXTERIOR_TAG, MAX_DRAWABLE_PLACEMENTS_PER_CELL,
+    MAX_DRAWABLE_PLACEMENTS_PER_INTERIOR, MAX_ITEMS_PER_CELL,
                         
     DEFAULT_MAX_ACTIVE_SKELETONS_PER_CELL, DEFAULT_MAX_CELL_BYTES,
     DEFAULT_MAX_MICRO_CHUNKS_PER_CELL, DEFAULT_MAX_STRUCTURE_VOXELS_PER_CELL,
@@ -79,13 +80,31 @@ class BudgetViolation(Exception):
                 "limit": self.limit, "detail": self.detail}
 
 
+def drawable_ceiling(location_record: Optional[Dict[str, Any]]) -> int:
+    """How many meshed things this cell may hold, from what is resident with it.
+
+    An exterior cell brings its ring, so it gets one ninth of the frame; an
+    interior brings nothing (D8), so it gets the frame. A Location with no tags
+    is an interior - that is what `cell.is_exterior` already means by it.
+
+    This is the only per-cell default that is not global, and it is not global
+    because residency is not: charging a player's house for eight exterior
+    neighbours it can never have was how this ceiling first came out at 34
+    (D52).
+    """
+    tags = (location_record or {}).get("tags") or ()
+    return (MAX_DRAWABLE_PLACEMENTS_PER_CELL if EXTERIOR_TAG in tags
+            else MAX_DRAWABLE_PLACEMENTS_PER_INTERIOR)
+
+
 _BUDGET_FIELDS = (
     ("max_structure_voxels", DEFAULT_MAX_STRUCTURE_VOXELS_PER_CELL),
     ("max_micro_chunks", DEFAULT_MAX_MICRO_CHUNKS_PER_CELL),
     ("max_active_skeletons", DEFAULT_MAX_ACTIVE_SKELETONS_PER_CELL),
     ("max_bytes", DEFAULT_MAX_CELL_BYTES),
     ("max_items", MAX_ITEMS_PER_CELL),
-    ("max_prop_placements", MAX_PROP_PLACEMENTS_PER_CELL),
+    # the default is per *cell kind*; see `drawable_ceiling`
+    ("max_drawable_placements", MAX_DRAWABLE_PLACEMENTS_PER_INTERIOR),
 )
 
 
@@ -99,7 +118,7 @@ class Budget:
     max_active_skeletons: int = DEFAULT_MAX_ACTIVE_SKELETONS_PER_CELL
     max_bytes: int = DEFAULT_MAX_CELL_BYTES
     max_items: int = MAX_ITEMS_PER_CELL
-    max_prop_placements: int = MAX_PROP_PLACEMENTS_PER_CELL
+    max_drawable_placements: int = MAX_DRAWABLE_PLACEMENTS_PER_INTERIOR
 
     @classmethod
     def declared(cls, cell_id: str,
@@ -111,14 +130,22 @@ class Budget:
         the alternative is a per-cell escape hatch that makes the global
         promise meaningless.
         """
-        raw = (location_record or {}).get("lobster_budget") or {}
+        record = location_record or {}
+        raw = record.get("lobster_budget") or {}
         if not isinstance(raw, dict):
             raise BudgetViolation(
                 cell_id=cell_id, record_id=cell_id, metric="lobster_budget",
                 value=type(raw).__name__, limit="object",
                 detail="lobster_budget must be an object of declared ceilings")
-        kwargs: Dict[str, int] = {}
-        for name, default in _BUDGET_FIELDS:
+        # One default is not global: an exterior cell shares the frame with
+        # its ring and an interior does not, so the ceiling that follows from
+        # the frame budget is different for each (D52).
+        defaults = dict(_BUDGET_FIELDS)
+        defaults["max_drawable_placements"] = drawable_ceiling(record)
+        kwargs: Dict[str, int] = {
+            "max_drawable_placements": defaults["max_drawable_placements"]}
+        for name, _static_default in _BUDGET_FIELDS:
+            default = defaults[name]
             if name not in raw:
                 continue
             value = raw[name]

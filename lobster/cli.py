@@ -35,7 +35,8 @@ from .bundle import BundleError, read_bundle, read_header
 from .cell import CellError, CellManager
 from .constants import (BUNDLE_SUFFIX, EXTERIOR_CELL_SIZE_M,
                         MAX_MODEL_LIBRARY_BYTES,
-                        MAX_PROP_PLACEMENTS_PER_CELL,
+                        MAX_DRAWABLE_PLACEMENTS_PER_CELL,
+                        MAX_DRAWABLE_PLACEMENTS_PER_INTERIOR,
                         MAX_TRANSITION_PEAK_BYTES,
                         MAX_VISIBLE_PLACEMENTS_PER_FRAME,
                         MICRO_CHUNK_VOXELS, MODEL_DRAW_BUDGET_US,
@@ -247,7 +248,10 @@ def cmd_budgets(args: argparse.Namespace) -> int:
                "per_placement_us": PER_PLACEMENT_US,
                "max_visible_placements_per_frame":
                    MAX_VISIBLE_PLACEMENTS_PER_FRAME,
-               "max_prop_placements_per_cell": MAX_PROP_PLACEMENTS_PER_CELL},
+               "max_drawable_placements_per_exterior_cell":
+                   MAX_DRAWABLE_PLACEMENTS_PER_CELL,
+               "max_drawable_placements_per_interior":
+                   MAX_DRAWABLE_PLACEMENTS_PER_INTERIOR},
            "shell_constants": {
                "exterior_cell_size_m": EXTERIOR_CELL_SIZE_M,
                "voxel_size_m": VOXEL_SIZE_M,

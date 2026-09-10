@@ -32,7 +32,8 @@ from .budgets import (Budget, BudgetViolation, MemoryLedger, POOL_LIGHTMAP,
                       POOL_METADATA, POOL_NAVMESH, POOL_STRUCTURES,
                       POOL_TERRAIN)
 from .bundle import BundleError, CellBundle, read_bundle
-from .constants import (BUNDLE_SUFFIX, EXTERIOR_CELL_SIZE_M, LIBRARY_FILENAME,
+from .constants import (BUNDLE_SUFFIX, EXTERIOR_CELL_SIZE_M, EXTERIOR_TAG,
+                        LIBRARY_FILENAME,
                         RESIDENT_RING, SPATIAL_GRID_CELL_M)
 from .events import EventBus
 from .geometry import Transform, Vec3
@@ -51,7 +52,9 @@ import os  # noqa: E402
 #: Locations tagged this way are exterior cells and preload their ring.
 #: Everything else is treated as an interior, which is the conservative default
 #: (fewer cells resident, never more).
-EXTERIOR_TAG = "exterior"
+# EXTERIOR_TAG moved to `constants` when `budgets` needed it too (importing it
+# from here would have been a cycle). Re-exported because every existing caller
+# reads it from this module.
 
 
 class CellError(Exception):
@@ -177,6 +180,20 @@ class ResidentCell:
             if prop.model_ref:
                 seen.setdefault(prop.model_ref)
         return sorted(seen)
+
+    def drawable_placements(self, view: Any = None) -> int:
+        """Things resident in this cell that draw as a mesh.
+
+        Props from the bundle, plus placed items when a `view` is given - a
+        `ResidentCell` holds no session, so the caller supplies one or gets the
+        props alone. Both halves are counted because both feed one per-frame
+        budget (D52).
+        """
+        count = sum(1 for p in self.bundle.props if p.model_ref)
+        if view is not None:
+            count += sum(1 for record in view.items_in_location(self.cell_id)
+                         if record.get("model_ref"))
+        return count
 
     # -- structures ----------------------------------------------------------
     def structure(self, structure_id: str) -> LiveStructure:
@@ -710,6 +727,19 @@ class CellManager:
                                      "resident cell, so this is what keeps "
                                      "the crosshair inside its slice "
                                      "(DECISIONS.md D36)")
+            # And the drawing ceiling, if this one has a mesh. Two ceilings on
+            # two different costs: a pick tests every item whether or not it
+            # draws, so a cell may hold more items than it can show. Checked
+            # here for the same reason `max_items` is - before the write, so a
+            # refusal leaves nothing behind (D52).
+            record = view.record(item_id) or {}
+            if record.get("model_ref"):
+                cell.budget.check(
+                    "max_drawable_placements",
+                    cell.drawable_placements(view) + 1, record_id=item_id,
+                    detail="props and placed items with a model share one "
+                           "per-frame draw budget; an item with no model_ref "
+                           "draws as an impostor and is not charged")
         writer = placer if placer is not None else ItemPlacer(
             self._session_for_writes(view), self.bus)
         return writer.place(item_id, cell_id, transform)
