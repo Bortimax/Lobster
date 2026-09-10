@@ -103,32 +103,75 @@ class SelectionReport:
 _SOFTWARE_GL_MARKERS = ("llvmpipe", "softpipe", "swrast", "software rasterizer")
 
 
-def gl_renderer_string() -> Optional[str]:
-    """What `GL_RENDERER` says here, or None if there is no GL at all.
+#: Context attempts, in order. A headless box is the case this list exists for.
+#:
+#: The platform default first, because on a workstation it is one call and it
+#: is the one that finds the real GPU. **Then EGL explicitly**, which is how you
+#: get a context with no display server at all - over SSH, in a container
+#: without an X socket, in CI. `moderngl.create_context(standalone=True,
+#: backend="egl")` needs no window and no `DISPLAY`, so "no display" is not the
+#: same as "no GL" and must not be reported as if it were.
+_CONTEXT_ATTEMPTS: Tuple[Tuple[str, Dict[str, Any]], ...] = (
+    ("platform default", {"standalone": True}),
+    ("egl (headless)", {"standalone": True, "backend": "egl"}),
+)
 
-    **Only the import half of this has ever executed on the build machine** -
-    there is no graphics library installed, so `import moderngl` raises and the
-    function returns None. The context half is written from ModernGL's
-    documented standalone-context API and is marked no-cover rather than
-    pretended about, which is the same honesty D22 applied to the backend
-    itself: the machinery that chooses between tiers is fully exercised (see
-    `probe_with`), the four lines that talk to a driver are not.
+
+def gl_probe() -> Tuple[Optional[str], str]:
+    """`(GL_RENDERER, detail)` - what GL is here, or None and why not.
+
+    Three outcomes, kept distinct because they need different answers from
+    whoever reads the log:
+
+    * **No graphics library.** `moderngl` does not import. Install it.
+    * **Library, no context.** Every backend failed, and the detail names each
+      one and its error. On Linux that usually means no GPU *and* no Mesa, and
+      the remedy is a package, not a code change.
+    * **A context.** The renderer string decides which tier (D29).
+
+    An earlier version tried a single unnamed backend and collapsed every
+    failure into "no OpenGL here". On a headless machine that reported no GL at
+    all when EGL would have given a perfectly good llvmpipe context - dropping
+    two tiers and blaming the wrong layer, which is the exact failure D29 was
+    written to prevent.
+
+    **Only the import branch has ever executed on the build machine**, which has
+    no graphics library. The attempt loop is marked no-cover rather than
+    pretended about; what *is* exercised is everything downstream of this, which
+    takes the result as an argument (`probe_with`).
     """
     try:
         import moderngl                      # type: ignore
-    except Exception:
-        return None
-    try:                                     # pragma: no cover - needs a GL stack
-        ctx = moderngl.create_standalone_context()
+    except Exception as exc:
+        return None, ("no graphics library: `import moderngl` failed "
+                      "({0})".format(exc.__class__.__name__))
+
+    failures = []
+    for label, kwargs in _CONTEXT_ATTEMPTS:  # pragma: no cover - needs a GL stack
         try:
-            return str(ctx.info.get("GL_RENDERER", "")) or "unknown"
+            ctx = moderngl.create_context(**kwargs)
+        except Exception as exc:
+            failures.append("{0}: {1}".format(label, exc))
+            continue
+        try:
+            renderer = str(ctx.info.get("GL_RENDERER", "")) or "unknown"
         finally:
-            ctx.release()
-    except Exception:                        # pragma: no cover - needs a GL stack
-        # A GL stack that imports but cannot make a context (no display, no
-        # driver, a headless box without EGL) is the same answer as no GL at
-        # all: drop a tier. It is not an error - the chain exists for this.
-        return None
+            try:
+                ctx.release()
+            except Exception:
+                pass
+        return renderer, "context via {0}".format(label)
+
+    return None, (                           # pragma: no cover - needs moderngl
+        "moderngl imports but no backend gave a context - {0}. A headless "
+        "machine still gets GL through EGL with Mesa installed, so this is a "
+        "missing driver or library rather than a missing display".format(
+            "; ".join(failures)))
+
+
+def gl_renderer_string() -> Optional[str]:
+    """Just the renderer string. `gl_probe` carries the reason as well."""
+    return gl_probe()[0]
 
 
 def _is_software_gl(renderer: str) -> bool:
@@ -202,7 +245,8 @@ _UNIMPLEMENTED = (
     "(DECISIONS.md D22), but it has not been written against real hardware yet")
 
 
-def probe_with(renderer: Optional[str]) -> List[BackendInfo]:
+def probe_with(renderer: Optional[str],
+               reason: Optional[str] = None) -> List[BackendInfo]:
     """Every tier's availability, given what GL reports.
 
     Split out from `probe()` so the tier logic is testable without a GL stack.
@@ -214,8 +258,9 @@ def probe_with(renderer: Optional[str]) -> List[BackendInfo]:
     gl_impl = _gl_backend()
 
     if renderer is None:
-        gl_detail = ("no OpenGL here - `moderngl` does not import, or no "
-                     "context could be created (no driver, no display)")
+        gl_detail = reason or (
+            "no OpenGL here - `moderngl` does not import, or no backend gave "
+            "a context")
         hardware_ok = software_ok = False
     elif _is_software_gl(renderer):
         gl_detail = "GL present but software-rasterised: {0}".format(renderer)
@@ -245,7 +290,7 @@ def probe_with(renderer: Optional[str]) -> List[BackendInfo]:
 
 def probe() -> List[BackendInfo]:
     """Every backend and whether it can run here. What the CLI reports."""
-    return probe_with(gl_renderer_string())
+    return probe_with(*gl_probe())
 
 
 def selection_report(prefer: Optional[str] = None,

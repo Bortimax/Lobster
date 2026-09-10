@@ -2145,3 +2145,77 @@ restored; the clamp is documented as deliberate, for the same reason
 That is the second time in this project a refactor of working code was safe only
 because something outside the test suite noticed. Worth remembering when the
 native kernels (D26) arrive.
+
+---
+
+## D39 — "No display" is not "no OpenGL" (corrects D29's probe)
+
+**Caught by the project owner**, on code I had written and tested a few commits
+earlier: over SSH, in a container without GPU passthrough, or in a headless CI
+environment, my probe would fail to make a context and report *no GL at all*.
+
+### The defect
+
+`gl_renderer_string()` made **one** context attempt with no backend named, and
+collapsed every failure - import error, missing driver, missing display, missing
+library - into a single string:
+
+> "no OpenGL here - `moderngl` does not import, or no context could be created
+> (no driver, no display)"
+
+Two things wrong with that, and the second is worse than the first.
+
+**1. It gave up too early.** `moderngl.create_context(standalone=True,
+backend="egl")` needs no window and no `DISPLAY`. A headless Linux box with Mesa
+has perfectly good OpenGL through EGL - usually llvmpipe, which is **exactly the
+middle tier D29 was written to introduce**. The probe would miss it and fall two
+tiers to the pure-Python rasteriser, on the machines most likely to be running
+CI.
+
+**2. It misattributed the cause.** "No driver, no display" is a guess covering
+four different situations with four different remedies. D29's own justification
+was that *silent fallback is how somebody spends an afternoon profiling the
+wrong layer* - and this told them to go looking at their display server when the
+actual answer was `pip install moderngl`.
+
+### The fix
+
+`gl_probe()` returns `(renderer, detail)` and tries backends in order:
+
+| attempt | why in this order |
+|---|---|
+| platform default | a workstation finds its GPU in one call |
+| `backend="egl"` | no window, no display - SSH, containers, CI |
+
+Three outcomes, kept distinct because they need different answers:
+
+* **No graphics library** - `import moderngl` failed. Install a package.
+* **Library, no context** - every backend failed, and the detail names each one
+  and its error. Install a driver or Mesa; it is not a display problem.
+* **A context** - the renderer string decides the tier, and EGL is *not* a
+  synonym for software: a datacentre GPU over SSH reads as hardware.
+
+### Verifying the API instead of inventing it
+
+The first draft of the fix used `create_standalone_context(backend=...)`, which
+is not the documented form. Checked before shipping, because this project has
+already invented one API that did not exist - `PATCH_MANY` in D34 - and the
+lesson from that entry was the point. The correct call is
+`moderngl.create_context(standalone=True, backend="egl")`, per ModernGL's own
+context and headless documentation.
+
+### What is executable here, and what is not
+
+The build machine has no graphics library, so **only the import branch has ever
+run**; the attempt loop stays `no cover` rather than pretended about, exactly as
+D22 required of the backend itself.
+
+What *is* exercised is everything downstream, because the probe result is passed
+as an argument: `probe_with(renderer, reason)` covers the headless-llvmpipe case,
+the headless-hardware case, and both failure causes with their distinct
+messages. Six tests, none of which need a GPU.
+
+**That seam is why this was cheap to fix.** D29 split the driver query from the
+tier logic specifically so the branches this machine cannot take are still
+testable - and the defect turned out to be in the four lines that seam left
+uncovered, which is the honest place for a defect to be.

@@ -24,7 +24,9 @@ from lobster.geometry import Transform
 from lobster.octopus_bridge import OctopusBridge
 from lobster.render import (BackendError, RenderSettings, SoftwareBackend,
                             probe, render_resident, select_backend)
-from lobster.render.backend import probe_with, selection_report
+from lobster.render.backend import (_CONTEXT_ATTEMPTS, gl_probe,
+                                    gl_renderer_string, probe_with,
+                                    selection_report)
 from lobster.visibility import build_draw_list
 from tests.fixtures import (FIELD, KEEP, VILLAGE, build_session, package_dict,
                             standard_workspace)
@@ -296,3 +298,74 @@ class TestTheThreeTierChain(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestHeadlessIsNotTheSameAsNoGL(unittest.TestCase):
+    """D39: "no display" and "no OpenGL" are different facts.
+
+    `moderngl.create_context(standalone=True, backend="egl")` needs no window
+    and no `DISPLAY`, so a box reached over SSH, a container with no X socket,
+    and a CI runner can all have perfectly good GL - usually Mesa's llvmpipe,
+    which is exactly the middle tier D29 exists for.
+
+    The first version of the probe made one unnamed context attempt and
+    collapsed every failure into "no OpenGL here", which would have dropped
+    those machines two tiers and blamed the wrong layer.
+    """
+
+    def test_the_egl_attempt_exists_and_comes_after_the_platform_default(self):
+        labels = [label for label, _kwargs in _CONTEXT_ATTEMPTS]
+        self.assertEqual(len(labels), 2)
+        self.assertIn("default", labels[0],
+                      "a workstation should find its GPU in one call")
+        self.assertIn("egl", labels[1],
+                      "headless needs an explicit EGL attempt, or a machine "
+                      "with no display reports no GL")
+        egl = dict(_CONTEXT_ATTEMPTS[1][1])
+        self.assertEqual(egl.get("backend"), "egl")
+        self.assertTrue(egl.get("standalone"))
+
+    def test_a_missing_library_and_a_missing_context_read_differently(self):
+        """Two causes, two remedies: install a package, or install a driver."""
+        no_lib = probe_with(None, "no graphics library: `import moderngl` "
+                                  "failed (ModuleNotFoundError)")
+        no_ctx = probe_with(None, "moderngl imports but no backend gave a "
+                                  "context - platform default: nope; egl "
+                                  "(headless): nope. A headless machine still "
+                                  "gets GL through EGL with Mesa installed")
+        self.assertIn("import moderngl", no_lib[0].detail)
+        self.assertIn("EGL", no_ctx[0].detail)
+        self.assertNotEqual(no_lib[0].detail, no_ctx[0].detail)
+
+    def test_a_headless_egl_llvmpipe_box_lands_on_the_middle_tier(self):
+        """The case the old probe got wrong: no display, but real GL."""
+        infos = {i.name: i for i in
+                 probe_with("llvmpipe (LLVM 15.0.7, 256 bits)")}
+        self.assertFalse(infos["moderngl"].available)
+        self.assertIn("software-rasterised", infos["moderngl"].detail)
+        self.assertIn("llvmpipe", infos["moderngl-llvmpipe"].detail)
+        report = selection_report(infos=list(infos.values()))
+        self.assertEqual(report.chosen, "software",
+                         "the GL backend is still unwritten (D22), so it falls "
+                         "through - but the tier it *would* take is reported")
+        self.assertNotIn("no OpenGL", report.skipped[1][1],
+                         "this machine has OpenGL; saying otherwise sends "
+                         "somebody to install a driver they already have")
+
+    def test_a_headless_box_with_a_real_gpu_still_reads_as_hardware(self):
+        """EGL is not a synonym for software. A datacentre GPU over SSH is the
+        top tier, and reporting it as llvmpipe would understate the machine."""
+        infos = {i.name: i for i in probe_with("NVIDIA A100-SXM4-40GB")}
+        self.assertIn("hardware GL", infos["moderngl"].detail)
+        self.assertIn("A100", infos["moderngl"].detail)
+
+    def test_the_probe_always_returns_a_reason(self):
+        """Whatever this machine is, the second half of the pair is populated -
+        an empty reason is how the old version lost the cause."""
+        renderer, reason = gl_probe()
+        self.assertTrue(reason)
+        if renderer is None:
+            self.assertRegex(reason, "graphics library|context|OpenGL")
+
+    def test_gl_renderer_string_still_answers_the_narrow_question(self):
+        self.assertEqual(gl_renderer_string(), gl_probe()[0])

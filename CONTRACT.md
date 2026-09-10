@@ -698,7 +698,17 @@ log.info("render backend: %s", backend.selection.summary())
 `backend.selection` is a `SelectionReport` (`chosen`, `skipped` as
 `(name, reason)` pairs, `summary()`). `selection_report()` returns it without
 constructing anything; `probe()` returns per-tier `BackendInfo`; **every tier
-that cannot run says why, always.** `python -m lobster.cli contract` prints both
+that cannot run says why, always.**
+
+**"No display" is not "no OpenGL".** A machine reached over SSH, a container
+with no X socket and a CI runner can all have real GL: `create_context(
+standalone=True, backend="egl")` needs no window and no `DISPLAY`. So the probe
+tries the platform default *and then EGL*, and reports three distinct outcomes —
+no graphics library (install a package), library but no context from any backend
+(install a driver; the detail names each attempt and its error), or a renderer
+string that picks the tier. Collapsing those would send somebody to fix the
+wrong layer, which is what this reporting exists to prevent. See DECISIONS.md
+D39. `python -m lobster.cli contract` prints both
 under `render_backends` and `render_backend_selected`.
 
 `select_backend("moderngl")` **raises** if that tier cannot run, rather than
