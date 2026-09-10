@@ -43,27 +43,103 @@ five-sixths built, in an idiom the project already uses.
 
 ---
 
-## 1. The format: `.vox`, vertex colours, and no textures at all
+## 1. Two model kinds, declared rather than assumed
 
-**Decided by the Scope, not by me.** §4.5 names MagicaVoxel `.vox` as *the*
-authoring format, and §1 offers "small texture atlases **or** vertex-colored
-voxels" — the `or` is a choice, and `.vox` makes it for us: a `.vox` file
-carries a 256-entry palette, so every voxel already has a colour.
+**The project owner said no to "every model is a voxel file", and asked for
+exceptions.** That answer changes the architecture more than it changes the
+formats, and the architecture change is the valuable half.
 
-Consequences worth stating, because each removes a subsystem:
+A scope that says *a model is `.vox`* makes every exception an `if` in the
+loader. A scope that says *a model declares its kind* makes exceptions
+ordinary. This project already does that twice — render backends (D29) and
+accelerator kernels (D40) — and both times the shape is the same: **a declared
+set, a chooser that says which it picked, and every implementation held to the
+same tests.**
+
+So `MODEL_KINDS` is a closed, frozen set, exactly as `ZONE_SHAPE_PRIMITIVES` is
+frozen at three (§4): adding a fourth later is a contract change with a
+DECISIONS entry, not a quiet extension.
+
+| kind | geometry from | when |
+|---|---|---|
+| `voxel` | a MagicaVoxel `.vox` file, via `Model.asset_ref` | the default: anything authored |
+| `primitive` | a shape and dimensions declared in the record itself | a crate is a crate; blockout; placeholders |
+
+### `voxel` — the default, and the Scope's own choice
+
+§4.5 names MagicaVoxel `.vox` as *the* authoring format, and §1 offers "small
+texture atlases **or** vertex-colored voxels" — a `.vox` carries a 256-entry
+palette, so the `or` is already answered. Each of these removes a subsystem:
 
 * **No texture pipeline.** No atlas packer, no UVs, no samplers, no mipmaps, no
-  texture memory budget. The GL shader already takes a per-vertex tint and
-  needs no change.
-* **No importer for anything else.** No glTF, no OBJ, no FBX. A format is a
-  contract with content authors and a second one doubles it.
-* **The same mesher.** A prop is voxels; `StructureMesher` already turns voxels
-  into greedy-meshed quads with palette materials. A second mesher would be the
-  thing L2 forbids for terrain and structures, without even L2's excuse.
+  texture memory budget. The GL shader already takes a per-vertex tint.
+* **The same mesher.** `StructureMesher` already turns voxels into greedy-meshed
+  quads with palette materials. A second mesher would be the thing L2 forbids
+  for terrain and structures, without even L2's excuse.
 
-**Open question for the project owner.** This makes every prop and item a voxel
-model. If the intent was ever "characters and swords are conventional meshes,
-terrain is voxels", that is a different project and this scope is wrong.
+### `primitive` — geometry with no asset at all
+
+A box, a cylinder or a quad, declared inline with dimensions and a palette
+index. No file, no importer, no round trip through an art tool.
+
+```json
+{"id": "model-crate", "type": "Model",
+ "primitive": {"shape": "box", "size": [0.8, 0.8, 0.8], "material": 6}}
+```
+
+This earns its place for three reasons and not because it is easy:
+
+1. **It removes the need for most exceptions rather than being one.** A crate,
+   a plank, a doorway marker, a debug volume — things that are genuinely a box
+   do not become more correct by being drawn in MagicaVoxel first.
+2. **It has no build-time dependency.** A primitive resolves with no `vox_dir`,
+   no file, and no art pipeline, so content and mods can ship a placeable
+   object with nothing but a record. That is the case D33 wanted for
+   pre-placed items and could not have.
+3. **It meshes to the same vertex format.** A box is twelve triangles with
+   normals and a palette tint — the buffer the GL backend already draws and the
+   quads the software rasteriser already fills. Nothing downstream learns a
+   second representation.
+
+The shape set is frozen at three, for the reason §4 freezes zone shapes: three
+primitives cover the cases, and a fourth is a decision rather than a
+convenience.
+
+### `Model` declares exactly one of them
+
+Lobster adds `Model.primitive` through `schema_extensions.new_fields`, the same
+mechanism that added `Item.world_transform` (D33), `Location.exterior_grid` and
+`Zone.shape`. `asset_ref` is Octopus's and already exists.
+
+> **Invariant — a `Model` has `asset_ref` **or** `primitive`, never both and
+> never neither.**
+
+Deliberately the same shape as D33's co-null rule, and for the same reason: two
+sources of geometry for one model is a question about which wins, and no
+sources is a model that silently does not appear. Both are build errors.
+
+### What is *not* a kind, and will not become one
+
+Sprites and conventional meshes were both considered and are **not** in the set.
+
+* **Sprites.** `Item.sprite_ref` and Octopus's `Sprite` record exist, and a
+  textured billboard would slot into the impostor path almost directly. It
+  needs a texture path — PNG *decode*, which this project does not have — and
+  §1's "vertex-colored voxels" branch was taken instead. Reconsiderable; not
+  free.
+* **Conventional meshes** (glTF/OBJ). A second format contract with content
+  authors, a material model, and the door skinned characters come through. See
+  §5: that is a new scope.
+
+**Neither is a primitive's slippery slope.** A primitive is a *fewer*-assets
+kind, not a richer one — it adds no format, no importer and no file. If someone
+proposes `"shape": "mesh"` with a path in it, that is the mesh importer wearing
+a primitive's clothes, and this paragraph is the objection.
+
+**Open question for the project owner.** This still makes every *authored* prop
+and item a voxel model, with primitives for the ones that are geometrically
+trivial. If characters or weapons need conventional or skinned meshes, that
+remains true and remains a separate scope.
 
 **And if that answer changes later, it is a new scope — not an addition to this
 one.** Conventional or skinned meshes for entities would bring a second
@@ -153,9 +229,17 @@ Three things can be wrong, and they are not equally wrong:
 
 | code | fires on | severity |
 |---|---|---|
-| `model_ref_unresolved` | a `model_ref` with no manifest entry | **error** |
+| `model_has_no_geometry` | a `Model` with neither `asset_ref` nor `primitive` | **error** |
+| `model_has_two_geometries` | a `Model` with both | **error** |
+| `unknown_primitive_shape` | a shape outside the frozen set | **error** |
+| `model_ref_unresolved` | an `asset_ref` with no manifest entry | **error** |
 | `model_file_missing` | a manifest entry whose `.vox` is not there | **error** |
 | `model_asset_unused` | a `.vox` in `vox_dir` that no entry names | **warning** |
+
+**A primitive model must not trip the file checks.** It has no `asset_ref` by
+construction, so the resolution lint has to read the *kind* before it looks for
+a file — otherwise the cheapest kind fails the strictest check, which is the
+sort of thing that gets a whole feature written off as broken.
 
 The first two are the same shape as `item_transform_without_location` (D33): an
 unresolvable model at runtime is a thing that silently does not appear, and this
@@ -233,12 +317,16 @@ invisible dishonest one.
 
 ## 7. Build order
 
-1. **The manifest and the lint.** `models:` entries, `model_ref` → file
-   resolution, and errors for both directions of a missing link. No runtime
-   behaviour, testable immediately.
-2. **The library artifact.** Mesh each distinct model once through the existing
-   `StructureMesher`; write `models.lobster_lib`; a reader with the same
-   provenance discipline as `read_bundle`.
+1. **The kind registry and the lint.** `MODEL_KINDS`, `Model.primitive` in the
+   package, the one-of invariant, `models:` manifest entries, and every code in
+   §3. No runtime behaviour and no meshing — testable immediately, and it is
+   what makes the second kind ordinary instead of a special case.
+2. **The library artifact, both kinds.** Mesh each distinct model once —
+   voxels through the existing `StructureMesher`, primitives through a
+   dozen-line generator — into the same vertex format; write
+   `models.lobster_lib`; a reader with the same provenance discipline as
+   `read_bundle`. **Primitives first**, because they need no file and so prove
+   the library end to end before the importer is involved.
 3. **Residency.** Reference-counted load/release through `GpuResidency`, with
    `drift()` extended to cover models.
 4. **Drawing, software first — and this step is not skippable.** The software
@@ -266,7 +354,11 @@ invisible dishonest one.
 * **No skinning** (§5), no animation, no blend trees — L8, and staged.
 * **No LOD** (§5).
 * **No textures, no atlases, no UVs** (§1).
-* **No second authoring format.**
+* **No second authoring format.** `primitive` is not one: it declares geometry
+  in a record rather than importing it from a file.
+* **No sprites, for now.** Considered (§1); needs a PNG decoder this project
+  does not have, and §1's other branch was taken. A real option later, not a
+  gap.
 * **No runtime asset loading.** Models arrive in a build artifact, like
   everything else geometric. A runtime that reads content files is a runtime
   that can fail to find one on a player's machine.
