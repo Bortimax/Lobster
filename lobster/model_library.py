@@ -86,6 +86,20 @@ class ModelMesh:
     def is_empty(self) -> bool:
         return not self.vertices
 
+    def bound_radius(self) -> float:
+        """A sphere about the model origin that contains the whole model.
+
+        Measured from the *origin* and not from the centre of the bounds,
+        because that origin is where a placement puts the model and where a
+        rotation turns it - so this radius is the same whichever way the thing
+        is facing, which a bounds-centre radius would not be.
+        """
+        return max(
+            (x * x + y * y + z * z) ** 0.5
+            for x in (self.bounds.minimum[0], self.bounds.maximum[0])
+            for y in (self.bounds.minimum[1], self.bounds.maximum[1])
+            for z in (self.bounds.minimum[2], self.bounds.maximum[2]))
+
 
 @dataclass(frozen=True)
 class ModelLibrary:

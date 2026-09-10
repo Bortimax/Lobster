@@ -250,7 +250,7 @@ class ModernGLBackend(RenderBackend):
 
     # -- drawing -------------------------------------------------------------
     def render(self, draw_list: Any, cells_by_id: Dict[str, Any],
-               settings: Any) -> GLFrame:
+               settings: Any, *, library: Any = None) -> GLFrame:
         self._fbo.use()
         # Cleared to the *settings* background, not to black. The software path
         # fills with `settings.background` (the fog colour), and a GPU frame

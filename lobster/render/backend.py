@@ -287,8 +287,16 @@ class RenderBackend:
         return GpuResidency(self, manager).attach(bus)
 
     def render(self, draw_list: Any, cells_by_id: Dict[str, Any],
-               settings: Any) -> Any:       # pragma: no cover - overridden
-        """Draw a culled draw list. Returns a `Framebuffer`."""
+               settings: Any, *,
+               library: Any = None) -> Any:  # pragma: no cover - overridden
+        """Draw a culled draw list. Returns a `Framebuffer`.
+
+        `library` is the shared model library, and it is keyword-with-a-default
+        because the two backends need it for opposite reasons: a CPU rasteriser
+        walks the meshes every frame and cannot draw a model without it, while a
+        GPU backend already holds the buffers residency uploaded and needs only
+        the `model_ref` on each `DrawItem`.
+        """
         raise NotImplementedError
 
 

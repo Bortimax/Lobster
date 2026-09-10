@@ -66,11 +66,20 @@ class DrawItem:
     center: Vec3
     radius: float
     distance: float
+    #: which library model draws this, or "" for something with no mesh - an
+    #: entity, terrain, or a prop whose author gave it none. An empty ref is
+    #: the impostor, and that is a documented state rather than a fault.
+    model_ref: str = ""
+    #: this object's own placement *within its cell*. World placement is
+    #: `cell_placement` composed with it, in that order - the same two-step
+    #: `_draw_structure` already does for a structure origin.
+    transform: Optional[Transform] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return {"kind": self.kind, "cell_id": self.cell_id,
                 "item_id": self.item_id, "center": list(self.center),
-                "radius": self.radius, "distance": self.distance}
+                "radius": self.radius, "distance": self.distance,
+                "model_ref": self.model_ref}
 
 
 @dataclass
@@ -128,11 +137,32 @@ def _placed(box: AABB, placement: Transform) -> AABB:
     return AABB.from_points(placement.apply(c) for c in corners)
 
 
+def _model_radius(library: Any, model_ref: str,
+                  fallback: float) -> Tuple[float, str]:
+    """How big this thing actually is, and whether a model said so.
+
+    The fallback numbers below this call are invented - `1.0` for a prop,
+    `ITEM_DRAW_RADIUS_M` for an item - and were invented precisely because
+    nothing knew a prop's extent. A model does, so when there is one the guess
+    is not used. That matters as a *cull* and not as trivia: a 3 m statue culled
+    against a 1 m guess pops out of view while it is still on screen, and "a
+    cull must err towards drawing" is the rule this file already states.
+    """
+    if not model_ref or library is None:
+        return fallback, model_ref
+    mesh = library.models.get(model_ref)
+    if mesh is None or mesh.is_empty():
+        # Reported by residency as `missing_models`, not invented around here.
+        return fallback, model_ref
+    return max(fallback, mesh.bound_radius()), model_ref
+
+
 def build_draw_list(camera: Camera,
                     cells: Iterable[Any],
                     *,
                     placements: Optional[Dict[str, Transform]] = None,
                     include_dormant_entities: bool = False,
+                    library: Any = None,
                     view: Any = None) -> DrawList:
     """Cull a set of resident cells against the camera.
 
@@ -189,36 +219,42 @@ def build_draw_list(camera: Camera,
         for prop in getattr(getattr(cell, "bundle", None), "props", ()) or ():
             stats.items_considered += 1
             center = placement.apply(prop.transform.position)
-            radius = 1.0                     # props declare no extent yet
+            radius, model_ref = _model_radius(library, prop.model_ref, 1.0)
             if not camera.sees_sphere(center, radius):
                 continue
             items.append(DrawItem(
                 kind=PROP, cell_id=cell.cell_id, item_id=prop.prop_id,
                 cell_placement=placement, center=center, radius=radius,
-                distance=camera.distance_to(center)))
+                distance=camera.distance_to(center),
+                model_ref=model_ref, transform=prop.transform))
             drew_any = True
 
         # -- placed items (Scope 8) --------------------------------------------
         # Same shape as props and deliberately a separate kind: a prop is
         # decoration baked into the bundle, an item is an Octopus record with
-        # an id worth reporting (D36). Neither declares an extent - there is no
-        # asset pipeline, so `model_ref` resolves to nothing - and the radius
-        # here is the same invented number selection uses, kept in one place.
+        # an id worth reporting (D36). `ITEM_DRAW_RADIUS_M` is still the answer
+        # for an item whose `model_ref` names nothing the library holds - which
+        # after ASSET_SCOPE step 2 is a build error rather than the normal case.
         if view is not None:
             for record in view.items_in_location(cell.cell_id):
-                raw = (record.get("world_transform") or {}).get("position")
+                transform = record.get("world_transform") or {}
+                raw = transform.get("position")
                 if not raw:
                     continue
                 stats.items_considered += 1
                 center = placement.apply((float(raw[0]), float(raw[1]),
                                           float(raw[2])))
-                if not camera.sees_sphere(center, ITEM_DRAW_RADIUS_M):
+                radius, model_ref = _model_radius(
+                    library, record.get("model_ref") or "", ITEM_DRAW_RADIUS_M)
+                if not camera.sees_sphere(center, radius):
                     continue
                 items.append(DrawItem(
                     kind=ITEM, cell_id=cell.cell_id, item_id=record["id"],
                     cell_placement=placement, center=center,
-                    radius=ITEM_DRAW_RADIUS_M,
-                    distance=camera.distance_to(center)))
+                    radius=radius,
+                    distance=camera.distance_to(center),
+                    model_ref=model_ref,
+                    transform=Transform.from_dict(transform)))
                 drew_any = True
 
         # -- entities ----------------------------------------------------------

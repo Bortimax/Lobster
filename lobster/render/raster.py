@@ -285,6 +285,45 @@ def _draw_structure(frame: Framebuffer, camera: Camera, cell: Any, live: Any,
     return drawn
 
 
+def _draw_model(frame: Framebuffer, camera: Camera, cell: Any, mesh: Any,
+                placement: Any, transform: Any,
+                settings: RenderSettings) -> int:
+    """Draw one library model at its placement. Triangles, not an impostor.
+
+    Two transforms, in this order: the object's own placement inside its cell,
+    then the cell's placement in the world. Exactly the two steps
+    `_draw_structure` already does for a structure origin, and the reason
+    `DrawItem` carries both rather than only a world centre - a centre cannot
+    turn a crate 45 degrees.
+
+    The tint comes out of the library unlit (D47) and is multiplied by the
+    cell's baked light here, at the triangle's centroid, through the same
+    `_light_at` every other surface uses. A second sampler would be a second
+    thing to keep correct.
+    """
+    import struct as _struct
+    from ..constants import MODEL_VERTEX_STRIDE
+    drawn = 0
+    data = mesh.vertices
+    for base in range(0, len(data), MODEL_VERTEX_STRIDE * 3):
+        corners = []
+        tint = (1.0, 1.0, 1.0)
+        for k in range(3):
+            v = _struct.unpack_from("9f", data, base + k * MODEL_VERTEX_STRIDE)
+            local = transform.apply((v[0], v[1], v[2]))
+            corners.append(placement.apply(local))
+            tint = (v[6], v[7], v[8])
+        normal = placement.rotate(transform.rotate(
+            _struct.unpack_from("9f", data, base)[3:6]))
+        centroid = tuple(sum(p[axis] for p in corners) / 3.0
+                         for axis in range(3))
+        colour = _shade(tuple(int(round(c * 255.0)) for c in tint), normal,
+                        settings, _light_at(cell, centroid))
+        _fill_triangle(frame, camera, corners, colour, settings)
+        drawn += 1
+    return drawn
+
+
 def _draw_capsule_impostor(frame: Framebuffer, camera: Camera, capsule: Any,
                            colour: Colour, settings: RenderSettings) -> int:
     """A bone as a camera-facing quad along its segment.
@@ -324,9 +363,19 @@ def _draw_entity(frame: Framebuffer, camera: Camera, skeleton: Any,
 # ---------------------------------------------------------------------------
 
 def render_draw_list(draw_list: DrawList, cells_by_id: Dict[str, Any], *,
-                     settings: Optional[RenderSettings] = None
-                     ) -> Framebuffer:
-    """Rasterise a draw list. The camera and the culling already happened."""
+                     settings: Optional[RenderSettings] = None,
+                     library: Any = None) -> Framebuffer:
+    """Rasterise a draw list. The camera and the culling already happened.
+
+    `library` is the shared model library. With one, props and items are drawn
+    as their real geometry; without one they are the impostors they have always
+    been. ASSET_SCOPE §7 put the software path *before* the GPU path for a
+    reason: RENDER_SCOPE §2 deleted pixel agreement between the backends, so the
+    GPU path has no oracle, and a mesh drawn inside-out or at the wrong scale
+    would render, differ from this, and be indistinguishable from the
+    differences that decision legitimately permits. Here it is simply a picture
+    that is wrong.
+    """
     settings = settings or RenderSettings()
     frame = Framebuffer(settings.width, settings.height, settings.background)
     camera = draw_list.camera
@@ -347,6 +396,11 @@ def render_draw_list(draw_list: DrawList, cells_by_id: Dict[str, Any], *,
             if skeleton is not None:
                 _draw_entity(frame, camera, skeleton, settings)
         elif item.kind == PROP:
+            mesh = _mesh_for(library, item)
+            if mesh is not None:
+                _draw_model(frame, camera, cell, mesh, item.cell_placement,
+                            item.transform, settings)
+                continue
             from ..geometry import Capsule
             base = item.center
             _draw_capsule_impostor(
@@ -354,10 +408,18 @@ def render_draw_list(draw_list: DrawList, cells_by_id: Dict[str, Any], *,
                 Capsule(base, (base[0], base[1] + 1.0, base[2]), 0.35),
                 PROP_COLOUR, settings)
         elif item.kind == ITEM:
-            # Missing entirely until now. `build_draw_list` culled items in and
-            # this dispatch dropped them, so a placed item was pickable,
-            # labellable and invisible - the exact failure D37 claimed to have
-            # prevented, one layer below where that entry looked.
+            mesh = _mesh_for(library, item)
+            if mesh is not None:
+                _draw_model(frame, camera, cell, mesh, item.cell_placement,
+                            item.transform, settings)
+                continue
+            # The impostor, which is what a thing with no mesh looks like -
+            # not a placeholder to be removed (ASSET_SCOPE §4). Until step 2
+            # every item took this path; `build_draw_list` culled them in and
+            # this dispatch dropped them entirely, so a placed item was
+            # pickable, labellable and invisible - the exact failure D37
+            # claimed to have prevented, one layer below where that entry
+            # looked.
             from ..geometry import Capsule
             base = item.center
             _draw_capsule_impostor(
@@ -369,13 +431,32 @@ def render_draw_list(draw_list: DrawList, cells_by_id: Dict[str, Any], *,
     return frame
 
 
+def _mesh_for(library: Any, item: Any) -> Any:
+    """The model this draw item names, or None to fall back to the impostor.
+
+    None means *impostor*, and there are three honest ways to get one: no
+    library, no `model_ref`, or a ref the library does not hold. The third is a
+    build error (`prop_model_ref_unresolved`) and is counted at residency
+    (`missing_models`), so it is named elsewhere rather than raised here - a
+    renderer that threw mid-frame over one absent barrel would take the whole
+    picture with it.
+    """
+    if library is None or not item.model_ref or item.transform is None:
+        return None
+    mesh = library.models.get(item.model_ref)
+    return None if mesh is None or mesh.is_empty() else mesh
+
+
 def render_cell(camera: Camera, cell: Any, *,
                 settings: Optional[RenderSettings] = None,
+                library: Any = None,
                 backend: Any = None) -> Framebuffer:
     """Cull and draw one resident cell. An interior, or a quick look."""
     settings = settings or RenderSettings()
-    draw_list = build_draw_list(camera.with_aspect(settings.aspect()), [cell])
-    return _dispatch(backend, draw_list, {cell.cell_id: cell}, settings)
+    draw_list = build_draw_list(camera.with_aspect(settings.aspect()), [cell],
+                                library=library)
+    return _dispatch(backend, draw_list, {cell.cell_id: cell}, settings,
+                     library=library)
 
 
 def render_resident(camera: Camera, manager: Any, view: Any, *,
@@ -395,17 +476,22 @@ def render_resident(camera: Camera, manager: Any, view: Any, *,
     """
     settings = settings or RenderSettings()
     cells = [manager.resident[cell_id] for cell_id in sorted(manager.resident)]
+    # The manager owns the bundle directory and therefore the library beside it
+    # (D48). Nothing here opens a file, and the culler needs it too - a prop's
+    # cull radius is its model's, when there is one.
+    library = getattr(manager, "library", None)
     draw_list = build_draw_list(camera.with_aspect(settings.aspect()), cells,
                                 placements=manager.placements(view),
-                                view=view)
+                                library=library, view=view)
     return _dispatch(backend, draw_list,
-                     {cell.cell_id: cell for cell in cells}, settings)
+                     {cell.cell_id: cell for cell in cells}, settings,
+                     library=library)
 
 
 def _dispatch(backend: Any, draw_list: DrawList, cells_by_id: Dict[str, Any],
-              settings: RenderSettings) -> Framebuffer:
+              settings: RenderSettings, *, library: Any = None) -> Framebuffer:
     """Draw through a backend, selecting one when the caller did not."""
     if backend is None:
         from .backend import select_backend
         backend = select_backend()
-    return backend.render(draw_list, cells_by_id, settings)
+    return backend.render(draw_list, cells_by_id, settings, library=library)

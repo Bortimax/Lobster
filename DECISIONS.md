@@ -2875,3 +2875,127 @@ Same shape as the reachability bug D47 records one entry earlier, and the same
 lesson: the tests were asserting that the *world* was consistent, which it was,
 rather than that the *check* could tell when it was not. Sixteen mutants,
 sixteen caught.
+
+---
+
+## D49 — Drawing a model, and the pixel test that could not see a wrong one
+
+ASSET_SCOPE §7 put the software path before the GPU path and said the step was
+not skippable:
+
+> It is the only place a wrong mesh is **visibly wrong** rather than merely
+> *different from the GPU*. RENDER_SCOPE §2 deleted pixel agreement between the
+> backends, which was right and which also means the GPU path has no oracle: a
+> mesh drawn inside-out, at the wrong scale, or with inverted normals would
+> render, differ from the software path, and be indistinguishable from the
+> legitimate differences that decision permits.
+
+Props and items now draw as their library geometry. Four choices, then the part
+worth reading.
+
+### 1. How the library reaches the renderer
+
+**A keyword argument on `render`, defaulted to `None`** - not a constructor
+field, and not a lookup the renderer does itself.
+
+The two backends need it for opposite reasons, which is the argument for a
+parameter rather than state: a CPU rasteriser walks the meshes every frame and
+cannot draw a model without one; a GPU backend already holds the buffers
+residency uploaded (D48) and needs only the `model_ref` on each `DrawItem`. A
+constructor field would make the software backend stateful about something that
+belongs to a *world*, and a backend that read the file itself would put geometry
+back inside presentation - the L8 mistake RENDER_SCOPE §4 already avoided once.
+
+`render_resident` reads it off the manager, which owns the bundle directory.
+Nothing in the render path opens a file.
+
+### 2. `DrawItem` carries a transform, not only a centre
+
+A model is placed by two transforms in order - the object inside its cell, then
+the cell in the world - which is exactly the two steps `_draw_structure` already
+does for a structure origin.
+
+The draw list previously carried only a world `center`, which was enough for an
+impostor because an impostor is a camera-facing quad and has no orientation. A
+centre cannot turn a crate 45°, and D47 chose the model anchor specifically so
+that rotation would mean *turn in place*. Carrying the transform is what makes
+that decision reach the screen.
+
+### 3. The cull radius now comes from the model
+
+`max(invented_guess, mesh.bound_radius())`.
+
+The guesses below it - `1.0` for a prop, `ITEM_DRAW_RADIUS_M` for an item - were
+invented precisely because nothing knew a prop's extent. A model does. This is a
+cull and not trivia: a 3 m statue culled against a 1 m guess pops out of view
+while it is still on screen.
+
+**Never smaller than the guess**, because `visibility.py` already states the
+rule - *a cull must err towards drawing* - and a tight bound on a shape whose
+projected extent this file does not model is the wrong direction to be wrong in.
+`bound_radius()` measures from the model **origin** and not from the centre of
+its bounds, so the number does not change when the thing is turned.
+
+### 4. Lighting, and the impostor that is staying
+
+The library tint is unlit by construction (D47), so the cell's baked light is
+multiplied in at draw time, at the triangle centroid, through the same
+`_light_at` every other surface samples. A second sampler would be a second
+thing to keep correct.
+
+The impostor stays. It is what a thing with no mesh looks like (§4), and there
+are three honest ways to get one: no library, an empty `model_ref`, or a ref the
+library does not hold. The third is a build error and a counted residency fault,
+so it is named in both places rather than raised mid-frame - a renderer that
+threw over one absent barrel would take the whole picture with it.
+
+### The part worth reading: a pixel test that could not see a wrong picture
+
+Three mutants survived the first pass, and two of them survived for the same
+reason - **the test measured the world rather than the check.**
+
+**"Which pixels did this prop draw?"** was answered by *"the ones that are
+neither sky nor ground"*, with the ground taken to be the commonest non-sky
+colour. That is a reasonable heuristic and it is wrong in exactly one case: when
+the terrain moves with the cell. Dropping the cell placement from the model
+drawer left the crate stationary while the ground slid under it, the heuristic
+followed the ground, and the assertion about *where the crate went* passed.
+
+It is now a difference against the same scene rendered with **no props at all**,
+which is the literal definition of the question. Each shot is compared against
+its own baseline, so terrain moving with the cell cannot stand in for the crate
+moving with it.
+
+**"Do the three shapes draw different pictures?"** could not see a tint bug: a
+crate and a barrel both use material 6, so replacing every tint with white left
+them still telling each other apart by geometry. Two boxes of the same size and
+different materials now assert the colours differ, that neither is white, and
+that the hues follow the palette.
+
+The third survivor was a bad mutant rather than a gap - `return mesh` where
+`mesh` is already `None` changes nothing - but writing the honest version of it
+found a real hole: a library holding a model with **zero triangles** was never
+tested, and that is a bundle and a library built apart rather than a hypothetical.
+
+A fourth survivor turned up after those were fixed, and it is the same lesson a
+third time: `render_resident` hands the library to **two** consumers - the culler
+and the backend - and dropping the first leaves every model still drawn, with
+only the cull radii reverting to guesses. No frame comparison can see that. A
+test now reads the draw list the backend was handed.
+
+Sixteen mutants across two passes; four survived; all four are caught now. And
+the pictures were looked at, which is how the cylinder cap and the turned crate
+were confirmed rather than assumed.
+
+### One more, about the harness rather than the code
+
+The mutation runner restored the source in a `finally`, which covers the script
+failing and not the script being **killed**. One run sat long enough to be
+stopped from outside, the in-flight mutant stayed in `raster.py`, and the next
+test run failed for a reason that had nothing to do with the code under test.
+
+Two fixes, both worth keeping: the runner now writes the original to a sentinel
+file *before* editing and restores whatever the sentinel names at startup; and
+the frame comparisons no longer go through `assertEqual` on hundred-thousand-byte
+lists, because unittest's differ is superlinear and builds that diff precisely
+when a mutant is caught. That is why the run was slow enough to want killing.

@@ -34,6 +34,7 @@ class SoftwareBackend(RenderBackend):
             detail="standard library only; no device, display or driver needed")
 
     def render(self, draw_list: Any, cells_by_id: Dict[str, Any],
-               settings: Any) -> Any:
+               settings: Any, *, library: Any = None) -> Any:
         from .raster import render_draw_list
-        return render_draw_list(draw_list, cells_by_id, settings=settings)
+        return render_draw_list(draw_list, cells_by_id, settings=settings,
+                                library=library)

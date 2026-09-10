@@ -1,13 +1,13 @@
 # Asset scope — making `model_ref` mean something
 
-**Status: §7 steps 1-3 built; 4-6 outstanding.** The kind registry and its lint
-are in (step 1); `models.lobster_lib` holds every `Model` meshed once, both
-kinds, in the vertex format the GL backend already draws (step 2, D47); and
-model buffers are now reference-counted across resident cells, with `drift()`
-extended to catch a leak (step 3, D48). What is still true: items and props
-reach the draw list as bounded impostors, because **nothing draws from the
-library yet** — that is steps 4 and 5. There is still no budget, deliberately
-(§6).
+**Status: §7 steps 1-4 built; 5 and 6 outstanding.** The kind registry and its
+lint are in (step 1); `models.lobster_lib` holds every `Model` meshed once, both
+kinds, in the vertex format the GL backend already draws (step 2, D47); model
+buffers are reference-counted across resident cells with `drift()` extended to
+catch a leak (step 3, D48); and **the software rasteriser draws props and items
+as real geometry** (step 4, D49). What is still true: the **GPU** path still
+draws both as impostors — that is step 5, instancing. There is still no budget,
+deliberately (§6).
 
 > **A renderer sized for the actual target.** Baked per-cell lighting, small
 > texture atlases or **vertex-colored voxels**, cell-boundary visibility,

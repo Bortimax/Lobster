@@ -890,6 +890,43 @@ whole residency, which is what makes counting it correct. A placed `Item` also
 carries a `model_ref`, but an item can be picked up mid-residency, so its
 lifetime is the item's rather than the cell's. See DECISIONS.md D48.
 
+### Drawing a model — the software path
+
+`DrawItem` carries `model_ref` and `transform`, and the software backend draws
+the geometry rather than an impostor:
+
+```python
+frame = backend.render(draw_list, cells_by_id, settings, library=library)
+```
+
+`library` is keyword-with-a-default because the two backends need it for
+opposite reasons: a CPU rasteriser walks the meshes every frame and cannot draw
+a model without it, while a GPU backend already holds the buffers residency
+uploaded and needs only the `model_ref`. `render_resident` reads it off the
+manager, so nothing in the render path opens a file.
+
+A model is placed by **two** transforms, in this order — the object's own
+placement inside its cell, then the cell's placement in the world. That is why
+`DrawItem` carries a `transform` and not only a world `center`: a centre cannot
+turn a crate 45°.
+
+Library tints are unlit (§7 above), so the cell's baked light is multiplied in
+at draw time, at the triangle centroid, through the same `_light_at` every other
+surface uses.
+
+**The cull radius comes from the model when there is one**, as
+`max(invented_guess, mesh.bound_radius())` — never smaller, because a cull must
+err towards drawing. `bound_radius()` measures from the model origin rather than
+from the centre of its bounds, so it is the same whichever way the thing is
+facing.
+
+**The impostor is not going away.** It is what a thing with no mesh looks like
+(ASSET_SCOPE §4), and there are three honest ways to get one: no library, an
+empty `model_ref`, or a ref the library does not hold. The third is a build error
+(`prop_model_ref_unresolved`) and a counted residency fault (`missing_models`) —
+named there rather than raised mid-frame, because a renderer that threw over one
+absent barrel would take the whole picture with it.
+
 ---
 
 ## 8. Object selection
@@ -1067,10 +1104,11 @@ directions: **a cull must err towards drawing**, because culling something
 invisible costs one wasted draw while culling something visible is a missing
 sword.
 
-Items reach the draw list as bounded entries **with no mesh**, exactly where
-props have always been. `models.lobster_lib` now holds every `Model` meshed once
-(§7, D47), but nothing loads it and nothing draws from it yet, so the impostor is
-still what an item looks like. See DECISIONS.md D37.
+An item with a `model_ref` the library holds now draws as **real geometry** on
+the software path (§7), placed by its `world_transform` and its cell's placement.
+An item without one is a bounded impostor, exactly where props have always been.
+The GPU path still draws every item as an impostor — that is ASSET_SCOPE §7
+step 5. See DECISIONS.md D37, D47 and D49.
 
 ---
 

@@ -339,6 +339,13 @@ class RecordingBackend:
         #: cannot tell you that.
         self.model_uploads: List[str] = []
         self.model_releases: List[str] = []
+        #: every draw list this backend was handed, in order. What reached the
+        #: *culler* is not visible in the pixels - two draw lists that differ
+        #: only in a cull radius can render identically - so a test that cares
+        #: which radius was used looks here.
+        self.draw_lists: List[Any] = []
+        #: and the library it was handed with each of them.
+        self.libraries: List[Any] = []
         self.frames = 0
 
     @classmethod
@@ -365,7 +372,9 @@ class RecordingBackend:
             (cell.cell_id, structure_id, tuple(chunk_indices)))
 
     def render(self, draw_list: Any, cells_by_id: Dict[str, Any],
-               settings: Any) -> Any:
+               settings: Any, *, library: Any = None) -> Any:
+        self.draw_lists.append(draw_list)
+        self.libraries.append(library)
         self.frames += 1
         return None
 
