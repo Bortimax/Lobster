@@ -27,6 +27,12 @@ ROOT = os.path.abspath(os.path.join(HERE, os.pardir, os.pardir, os.pardir))
 os.chdir(ROOT)
 SOURCE = os.path.join("lobster", "accel", "native", "lobster_accel.c")
 
+# **No `-ffast-math`, and no `-O3` beyond the default, on purpose.**
+# `-ffast-math` lets the compiler reassociate floating-point arithmetic and
+# flush denormals, which is exactly the freedom this kernel must not have: it is
+# held to the reference within a declared 1e-4 tolerance (D28), and reassociated
+# sums drift further on long accumulations. An earlier draft of this file passed
+# it. A speed flag that changes answers is not a speed flag.
 setup(
     name="lobster-accel",
     version="0.1.0",
