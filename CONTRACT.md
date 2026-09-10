@@ -108,8 +108,16 @@ hits = tester.resolve_volley(view, shots)   # one list per shot, same order
 
 It answers **exactly** what N `resolve_projectile` calls answer — same regions,
 same order, same Events — and a test asserts that, because a faster path that
-answers differently is not a faster path. Measured at 4.7–6.6× the per-arrow
-path, which is 6 arrows per cell per frame becoming 21–38.
+answers differently is not a faster path. **With the accelerator** it is 4.7–6.6×
+the per-arrow path — 6 arrows per cell per frame becoming 21–38 — and 9.5× on the
+volley D55 measured.
+
+**Without it the volley is ~15% *slower* than the per-arrow path**, and that is
+inherent rather than a defect to fix: the seam hands over packed entity rows, so
+the reference rebuilds a `SpatialIndex` from them once per shot (20% of the
+unaccelerated volley) where `resolve_projectile` queries the live index directly.
+Packing a payload buys speed only when there is a kernel to spend it on. The
+answers are identical either way, which is what the pure-python CI job is for.
 
 The broad phase is no longer the bottleneck: it is 15% of a volley, down from
 64% of a hit-test. `Skeleton.hitboxes` is now ~50%, and it is not behind the
@@ -541,6 +549,26 @@ each carrying `cell_id` (which cell the target was in) and `distance_from_source
 (metres from the shooter). With `first_hit_only=True` you get the single nearest
 hit across every cell — decided after all of them have answered, so a shot
 cannot pass through a near target to reach a far one in a different cell.
+
+`direction` need not be a unit vector; it says *where*, and `max_distance` says
+how far. Scaling it changes nothing.
+
+**A whole volley crosses the boundary the same way**, and this is the call the
+runtime should make — `resolve_projectile` is one arrow's worth of it:
+
+```python
+shots = [(origin, direction, 45.0, force, "player"), ...]
+hits = tester.resolve_volley(view, shots)      # one list per shot, same order
+```
+
+Same answers as N `resolve_projectile` calls, same Events in the same order, and
+a test asserts it. **The batching is per cell, not per shot**: each cell is handed
+the arrows that reach *it*, once, so the three things `HitTester.resolve_volley`
+shares across a volley are shared here too instead of being rebuilt per arrow per
+cell. Measured at **3.3–4.4×**, growing with volley size (D55).
+
+The budget follows from that: each cell is charged one hit-test, so a volley that
+would trip `hit_test_frame_us` as 18 separate cross-cell shots stays inside it.
 
 Only hits that are **returned** fire `on_hit_location`. A candidate the shot
 passed on its way to a nearer target is never reported.

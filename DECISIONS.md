@@ -3601,3 +3601,103 @@ It asserts on the cache rather than the kernel now.
 Twenty-four mutants for this kernel - 17 on the wiring, 7 on the C, all caught -
 plus six harness-liveness tests. 774 tests green, in both CI configurations,
 checked before pushing this time.
+
+---
+
+## D55 — The volley crosses the boundary, and a speedup claim that was only true on one CI job
+
+D45 batched a volley within one cell and logged the cross-cell case as not built.
+`WorldHitTester.resolve_volley` is that closed. It is the call the runtime should
+be making: `resolve_projectile` is one arrow's worth of it.
+
+### Per cell, not per shot
+
+`HitTester.resolve_volley` shares three things across a volley — the packed
+entity table, each rig's resolved hitboxes, and one budget charge. Resolving a
+cross-cell volley arrow by arrow rebuilds all three **once per arrow per cell**,
+which is the exact scaling D45 exists to avoid, reintroduced one layer up. So the
+world tester inverts the loops: for each cell, gather the arrows that reach it,
+hand them over once.
+
+Two things that inversion must not break, both of which the one-shot path already
+gets right:
+
+* **The merge is by world distance**, decided after every cell has answered. Each
+  cell answers in its own coordinates; taking whichever cell was asked first
+  would let an arrow hit the far bandit through the near one.
+* **An arrow that cannot reach a cell is not sent to it** — the same
+  `_ray_reaches` gate, now per shot rather than per call, so a volley fanned
+  across an arc does not pay a sweep in every cell for every arrow never pointed
+  at it.
+
+**3.3–4.4×**, growing with volley size: 4 arrows 1.06 ms → 0.32, 40 arrows
+14.02 ms → 3.16.
+
+### The budget property, one layer up
+
+Eighteen separate cross-cell shots **trip `hit_test_frame_us`**; the same
+eighteen as a volley do not, because each cell is charged once. That is D45's
+budget property at world scale, and it is now asserted deliberately rather than
+observed in passing — a test that fails if the charge ever goes back to per shot.
+
+### The bookkeeping the batching costs
+
+A cell is handed a *subset* of the volley, so its answers are indexed by position
+in that subset. The moment one arrow fails the reach gate those indices stop
+agreeing with the volley's, and the failure mode is the nastiest kind: every hit
+correct, every hit credited to the wrong archer, nothing raised.
+
+The mutant that swaps the slot list for `enumerate` **survived**, and the reason
+is the one this project keeps finding: *the test was measuring the world, not the
+check*. The mixed-reach fixture existed — one arrow at the sky, two at the crowd
+— but seed 11's two arrows land nowhere, so the assertion compared an empty list
+with an empty list. Fourth time (D49, D52, D54, this). The rule earns another
+statement: **a test whose subject can be absent must assert that it is present.**
+
+The replacement plants named targets and fires four arrows whose reach sets
+deliberately differ — sky, both cells, both cells, village only — and asserts the
+whole attribution `[[alpha], [], [beta], [gamma]]`, with a companion test that
+fails if the fixture ever degenerates into every arrow reaching every cell.
+
+### A direction is a direction, not a distance
+
+`normalize` on the way in also survived, because every fixture direction was
+already within 6% of unit. It is load-bearing: nothing downstream re-normalises
+— `HitTester.resolve_volley` multiplies the vector by `max_distance` as given —
+so `(0, 0, 0.2)` with 45 m of range shoots 9 m, and `(0, 0, 5)` with 10 m shoots
+50. Both are now tested in the direction that changes the answer, plus a test
+that scaling by 0.2, 5 and 100 changes nothing at all.
+
+Twelve of thirteen mutants caught. The thirteenth — deleting the empty-volley
+early return — is **equivalent**: with no shots every cell's batch is empty and
+the loop falls through to the same `[]`. Left in the harness, labelled, rather
+than deleted or contrived around.
+
+### The claim that was only true on one CI job
+
+Benchmarking this on the unaccelerated backend showed the batched path **slower**
+than the per-arrow one, 0.69–0.89×. It is not this layer: D45's own single-cell
+volley is 1.18× *slower* without the accelerator, and has been since it was
+written. CONTRACT said "measured at 4.7–6.6× the per-arrow path" with no
+qualification, and the project runs a pure-python CI job precisely because that
+configuration is supported.
+
+The cause is exact, and it is the seam working as designed. `segment_query` takes
+**packed entity rows**, because a payload a C kernel can read cannot carry a live
+`SpatialIndex`. The reference therefore rebuilds the index from those rows on
+every call — 20% of the unaccelerated volley, 1,260 insertions for eighteen
+arrows over fourteen entities — where `resolve_projectile` queries the index that
+is already there. Packing a payload buys speed only when there is a kernel to
+spend it on.
+
+**Not fixed, deliberately.** The fix that fits is a memo inside
+`reference_segment_query`, and that function is the differential harness's
+AUTHORITY. Stateful caching in the thing every other implementation is judged
+against can make the harness compare a fresh implementation against a stale
+answer, which is a class of failure worth far more than 15% on the configuration
+that exists in order to be *correct*. CONTRACT now says which number belongs to
+which configuration, and why.
+
+Documentation defects are code defects here, and this one had the shape they
+usually have: a true measurement, taken once, that quietly outgrew its
+conditions.

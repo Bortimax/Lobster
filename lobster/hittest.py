@@ -726,6 +726,10 @@ class WorldHitTester:
 
     **No tier changes.** PROJECTILE is still never passed to Octopus, and being
     shot from another cell promotes nothing.
+
+    `resolve_volley` batches a whole volley across the resident set, per cell
+    rather than per shot (D55). `resolve_projectile` is the same thing for one
+    shot and is what the volley is asserted against.
     """
 
     def __init__(self, cells: Iterable[Any],
@@ -809,6 +813,86 @@ class WorldHitTester:
                 self.bus.hit_location(hit.target_id, hit.region, hit.force,
                                       hit.source_id)
         return found
+
+    def resolve_volley(self, view: Any, shots: Sequence[Any], *,
+                       first_hit_only: bool = True) -> List[List[HitResult]]:
+        """A whole volley in **world space**, across every resident cell.
+
+        `shots` are `(origin, direction, max_distance, force, source_id)`
+        tuples in world space; the result is one list of hits per shot, in the
+        same order.
+
+        > **Equivalent to N `resolve_projectile`s**, and a test asserts that
+        > directly - same hits, same order, same Events. A faster path that
+        > answers differently is not a faster path (D45).
+
+        **The batching is per cell, not per shot.** `HitTester.resolve_volley`
+        shares three things across a volley - the packed entity table, each
+        rig's resolved hitboxes, and one budget charge - and resolving a
+        cross-cell volley shot by shot would rebuild all three once per arrow
+        per cell. So each cell is handed the shots that reach *it*, once.
+
+        Two things this must not get wrong, both of which `resolve_projectile`
+        already gets right one shot at a time:
+
+        * **The merge is by world distance**, decided after every cell has
+          answered. Each cell answers in its own coordinates, so taking
+          whichever cell was asked first would let a shot hit the far bandit
+          through the near one.
+        * **A shot that cannot reach a cell is not sent to it.** The same
+          `_ray_reaches` gate, applied per shot rather than per call - so a
+          volley fanned across a wide arc does not pay a sweep in every cell
+          for every arrow that was never pointed at it.
+        """
+        shots = list(shots)
+        if not shots:
+            return []
+
+        headings: List[Vec3] = []
+        for _origin, direction, _max_distance, _force, _source in shots:
+            heading = normalize(direction)
+            if heading == (0.0, 0.0, 0.0):
+                raise HitTestError("a projectile needs a direction")
+            headings.append(heading)
+
+        found: List[List[HitResult]] = [[] for _ in shots]
+        for cell_id in sorted(self.cells):
+            placement = self.placement_of(cell_id)
+            local: List[Any] = []
+            slots: List[int] = []
+            for index, shot in enumerate(shots):
+                origin, _direction, max_distance, force, source_id = shot
+                heading = headings[index]
+                if not self._ray_reaches(cell_id, placement, origin, heading,
+                                         max_distance):
+                    continue
+                slots.append(index)
+                local.append((placement.inverse_apply(origin),
+                              placement.inverse_rotate(heading),
+                              max_distance, force, source_id))
+            if not local:
+                continue
+            answers = self.testers[cell_id].resolve_volley(
+                view, local, first_hit_only=first_hit_only)
+            for slot, hits in zip(slots, answers):
+                origin = shots[slot][0]
+                for hit in hits:
+                    found[slot].append(
+                        self._with_range(hit, cell_id, placement, origin))
+
+        out: List[List[HitResult]] = []
+        for hits in found:
+            hits.sort(key=lambda h: (h.distance_from_source, h.target_id))
+            out.append(hits[:1] if (first_hit_only and hits) else hits)
+
+        # Fired in shot order, after every merge, so the sequence a subscriber
+        # sees is the one N separate calls would have produced.
+        if self.bus is not None:
+            for hits in out:
+                for hit in hits:
+                    self.bus.hit_location(hit.target_id, hit.region, hit.force,
+                                          hit.source_id)
+        return out
 
     def _with_range(self, hit: HitResult, cell_id: str, placement: Any,
                     origin: Vec3) -> HitResult:
