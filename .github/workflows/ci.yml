@@ -1,12 +1,18 @@
 # Lobster CI.
 #
-# The point of the matrix is D26 condition (c): **CI runs both paths.** A
-# native kernel that only ever ran on its author's machine is the D22 failure
-# mode wearing a hat, so every platform compiles the C source itself and puts
-# it through the same differential suite the author ran locally.
+# Two things this has to get right, and the first run got the second one wrong.
 #
-# The binary is never committed. Only `lobster/accel/native/lobster_accel.c` is
-# in the repo, and each runner builds its own.
+# 1. **D26 condition (c): CI runs both paths.** A native kernel that only ever
+#    ran on its author's machine is the D22 failure mode wearing a hat, so every
+#    platform compiles the C source itself and puts it through the same
+#    differential suite the author ran locally. The binary is never committed.
+#
+# 2. **Lobster is not self-contained.** It is the geometry layer *for* Octopus
+#    and imports `lce` from a separate repository. A checkout of Lobster alone
+#    cannot import a single module, which is why the first run failed every job
+#    before it reached anything interesting. Octopus is checked out beside it
+#    and located through `LOBSTER_OCTOPUS_PATH`, which `lobster/octopus_path.py`
+#    already documents as the supported override.
 
 name: CI
 
@@ -16,6 +22,10 @@ on:
   pull_request:
   workflow_dispatch:
 
+env:
+  # `lobster.octopus_path` reads this before falling back to ../Octopus.
+  LOBSTER_OCTOPUS_PATH: ${{ github.workspace }}/octopus
+
 jobs:
   pure-python:
     # The floor. No compiler, no numpy, no accelerator of any kind - the
@@ -24,17 +34,43 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          path: lobster
+
+      - name: Check out Octopus
+        uses: actions/checkout@v4
+        with:
+          repository: Bortimax/Octopus
+          path: octopus
+          # Public repos work with the default token. A private Octopus needs a
+          # PAT with `repo` scope in the OCTOPUS_TOKEN secret; without it this
+          # step fails here rather than 20 import errors later.
+          token: ${{ secrets.OCTOPUS_TOKEN || github.token }}
+
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+
+      - name: Preflight - the engine must be importable
+        working-directory: lobster
+        run: |
+          python -c "import lobster.octopus_path as p; print('lce at', p.ensure_lce_importable())"
+
       - name: Confirm nothing is installed
+        working-directory: lobster
         run: |
           python -c "import importlib.util as u; assert u.find_spec('numpy') is None, 'numpy must be absent in this job'"
+
       - name: Suite
+        working-directory: lobster
         run: python -m unittest discover -s tests -t .
+
       - name: Conformance against the committed vectors
+        working-directory: lobster
         run: python -m lobster.cli conformance
+
       - name: The chosen accelerator must be the reference
+        working-directory: lobster
         run: |
           python -c "from lobster.accel import select; n,_=select(); assert n=='python', n; print('accelerator:', n)"
 
@@ -48,25 +84,52 @@ jobs:
         python: ["3.11", "3.12"]
     steps:
       - uses: actions/checkout@v4
+        with:
+          path: lobster
+
+      - name: Check out Octopus
+        uses: actions/checkout@v4
+        with:
+          repository: Bortimax/Octopus
+          path: octopus
+          token: ${{ secrets.OCTOPUS_TOKEN || github.token }}
+
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python }}
+
+      - name: Preflight - the engine must be importable
+        working-directory: lobster
+        run: |
+          python -c "import lobster.octopus_path as p; print('lce at', p.ensure_lce_importable())"
+
       - name: Build deps
         run: python -m pip install --upgrade pip setuptools numpy
+
       - name: Compile the native kernel from source
+        working-directory: lobster
         run: python lobster/accel/native/setup.py build_ext --inplace
-        working-directory: ${{ github.workspace }}
+
       - name: Report what is live
+        working-directory: lobster
         run: |
           python -c "from lobster.accel import available, select; [print(a) for a in available()]; print('selected:', select()[0])"
+
       - name: The native kernel must actually have built
         # Without this the job would pass by silently falling back, which is
         # exactly the failure this matrix exists to catch.
+        working-directory: lobster
         run: |
           python -c "from lobster.accel import available; assert any(a['name']=='native' and a['available'] for a in available()), 'native kernel did not build'"
+
       - name: Suite
+        working-directory: lobster
         run: python -m unittest discover -s tests -t .
+
       - name: Differential - native vs the reference
+        working-directory: lobster
         run: python -m lobster.cli conformance --impl native
+
       - name: Differential - numpy vs the reference
+        working-directory: lobster
         run: python -m lobster.cli conformance --impl numpy
