@@ -1072,7 +1072,16 @@ a runtime symptom weeks later (§15.2).
 |---|---|---|
 | `one_way_connection` | yes | a connection with no return edge — Octopus's own `lce.lint` (its D26), reused rather than re-implemented |
 | `unenterable_location` | yes | **a Location with no `default_spawn_transform` and no incoming connection carrying a `spawn_transform`** (§4) |
-| `item_placed_without_cell` | yes | an `Item` with a `world_transform` and no `current_location_ref` — a position in no cell's coordinates (§8) |
+| `item_transform_without_location` | yes | a `world_transform` in no cell's coordinates (§8) |
+| `item_location_without_transform` | yes | in the world at no particular place (§8) |
+| `item_current_location_in_content` | yes | content reaching for the save-only field; the message names `default_location_ref` |
+| `item_placed_on_a_character` | yes | carried *and* lying on the floor |
+| `model_has_no_geometry` | yes | a `Model` with neither `asset_ref` nor `primitive` |
+| `model_has_two_geometries` | yes | a `Model` with both — two sources and no rule for which wins |
+| `unknown_primitive_shape` | yes | a shape outside the frozen `box`/`cylinder`/`quad` |
+| `model_ref_unresolved` | yes | a voxel model that no manifest `models` entry names |
+| `model_file_missing` | yes | a manifest entry whose `.vox` is not there |
+| `model_asset_unused` | **no** | a `.vox` in `vox_dir` nothing references — dead weight, not a broken build |
 | `sound_bypass_channel` | yes | a manifest trying to bake record-owned data (sound lists, zone shapes, spawn transforms) into the bundle (§4.5) |
 | `unknown_zone_shape` | yes | a fourth zone primitive |
 | `structure_location_mismatch` | yes | `StructureState.location_id` disagrees with the cell the geometry is baked into |

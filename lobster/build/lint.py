@@ -39,7 +39,8 @@ must fail a build, so a caller decides policy and this module only reports (L4).
 from __future__ import annotations
 
 import os
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Set
+from typing import (Any, Dict, Iterable, List, Mapping, Optional, Sequence,
+                    Set)
 
 from ..constants import (MODEL_KINDS, MODEL_PRIMITIVE, MODEL_VOXEL,
                          PRIMITIVE_SHAPES, ZONE_SHAPE_PRIMITIVES)

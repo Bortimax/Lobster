@@ -16,6 +16,7 @@ they break:
 from __future__ import annotations
 
 import os
+import inspect
 import unittest
 
 from lobster.build.builder import BuildError, build_from_file, build_world
@@ -594,3 +595,58 @@ class TestModelKindLint(unittest.TestCase):
         """An art directory mid-iteration is full of them, and failing a build
         for a file nobody wired up yet teaches authors to ignore the linter."""
         self.assertNotIn("model_asset_unused", ERROR_CODES)
+
+
+class TestTheDocumentedLintCodesAreTheRealOnes(unittest.TestCase):
+    """CONTRACT's lint table, pinned against the code.
+
+    It had drifted twice before this existed. D35 renamed
+    `item_placed_without_cell` to `item_transform_without_location` and added
+    three codes beside it; the table kept the old name for two more entries
+    and then the model codes were added without it. Both times the document
+    described a vocabulary nobody implemented.
+
+    That is the D24 failure mode - a promise the code does not keep - applied
+    to a table instead of an Event list, and the answer is the same: assert it.
+    """
+
+    def documented(self):
+        import os
+        import re
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        with open(os.path.join(root, "CONTRACT.md"), encoding="utf-8") as f:
+            text = f.read()
+        section = text.split("## 12. Build-step lint")[-1]
+        return set(re.findall(r"^\| `([a-z_]+)` \|", section, re.M))
+
+    def test_every_error_code_is_documented(self):
+        missing = sorted(ERROR_CODES - self.documented())
+        self.assertEqual(missing, [],
+                         "these fail a build and CONTRACT does not mention "
+                         "them: {0}".format(missing))
+
+    def test_every_documented_code_exists(self):
+        """The other direction, which is the one that rots quietly: a renamed
+        code leaves its old name behind and a reader binds to a string nothing
+        emits.
+
+        Scans the whole `lobster/build` package, not just `lint.py`. The first
+        version looked only at the linter and reported `over_budget` as
+        undocumented-in-reverse - it is emitted by `builder.py`, so the test was
+        too narrow rather than the document wrong. Checking which before
+        editing the document is the whole discipline.
+        """
+        import os
+        root = os.path.join(os.path.dirname(os.path.dirname(
+            os.path.abspath(__file__))), "lobster", "build")
+        source = ""
+        for base, _dirs, files in os.walk(root):
+            for name in sorted(files):
+                if name.endswith(".py"):
+                    with open(os.path.join(base, name), encoding="utf-8") as f:
+                        source += f.read()
+        for code in sorted(self.documented()):
+            self.assertIn(
+                '"{0}"'.format(code), source,
+                "CONTRACT documents {0!r} and nothing in lobster/build emits "
+                "it".format(code))
