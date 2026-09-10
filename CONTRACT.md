@@ -87,10 +87,6 @@ NumPy, then to pure Python, and the whole suite still passes. CI compiles it
 from source on Linux, Windows and macOS and runs the same differential suite,
 plus a job with no accelerator at all to keep the pure path honest.
 
-They are still **not wired into `HitTester`**: D26 fixed the seam at *volley*
-granularity, and that path is the remaining work between these kernels and a
-frame-rate difference.
-
 **The GPU backend is written** (D44). `select_backend()` returns it wherever
 there is OpenGL, geometry is uploaded once per cell residency through the
 residency Events, and `render()` hands back a `GLFrame` that stays on the GPU -
