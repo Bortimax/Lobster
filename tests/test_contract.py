@@ -370,3 +370,77 @@ class TestDeclaredInvariants(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestTheSinkIsSymmetricAboutResidency(unittest.TestCase):
+    """Shrimp finding #2 (DECISIONS.md D46).
+
+    `on_enter_cell` was refused for the right reason and `on_exit_cell` was
+    forwarded anyway, so a Trigger bound to it fired on **ring churn** - a cell
+    two hops away being released, for cells the player was never in, several
+    times per transition.
+
+    No test asserted what the sink forwards, either way. That is why the
+    asymmetry survived being written down correctly in CONTRACT §1, and this
+    class exists so the next one cannot.
+    """
+
+    def sink(self):
+        session = build_session()
+        bus = EventBus()
+        return bus, OctopusEventSink(session).attach(bus)
+
+    def test_neither_residency_event_reaches_octopus(self):
+        bus, sink = self.sink()
+        bus.enter_cell(VILLAGE)
+        bus.exit_cell(VILLAGE)
+        self.assertEqual(sink.fired, [],
+                         "residency is not the player moving - loading a "
+                         "neighbour is not entering a scene, and releasing one "
+                         "two hops away is not leaving")
+
+    def test_the_player_moving_is_announced_explicitly_both_ways(self):
+        _bus, sink = self.sink()
+        sink.enter_scene(VILLAGE)
+        sink.exit_scene(VILLAGE)
+        self.assertEqual([f["trigger_type"] for f in sink.fired],
+                         ["on_enter_scene", "on_exit_scene"])
+        self.assertEqual(sink.fired[1]["bindings"], {"location": VILLAGE})
+
+    def test_exactly_which_events_are_forwarded(self):
+        """Pinned, so a sixth forward cannot appear by accident."""
+        bus, sink = self.sink()
+        transform = Transform()
+        bus.enter_cell(VILLAGE)
+        bus.exit_cell(VILLAGE)
+        bus.hit_location("npc-ada", "head", 3.0, "player")
+        bus.structure_damaged(GATEHOUSE, [1])
+        bus.interact("npc-ada")
+        bus.item_placed("item-sword", VILLAGE, transform)
+        bus.item_removed("item-sword", VILLAGE, transform)
+
+        self.assertEqual(len(bus.log), len(CONTRACT_EVENTS),
+                         "the fixture must raise every contract event")
+        self.assertEqual([f["trigger_type"] for f in sink.fired],
+                         ["on_hit_location", "on_structure_damaged",
+                          "on_interact", "on_item_placed", "on_item_removed"])
+
+    def test_ring_churn_forwards_nothing_at_all(self):
+        """The reported symptom, reproduced: a transition that unloads a cell
+        the player was never in must not fire a player-facing trigger."""
+        from lobster.cell import CellManager
+        from tests.fixtures import KEEP, standard_workspace
+        session = build_session()
+        bus = EventBus()
+        sink = OctopusEventSink(session).attach(bus)
+        bridge = OctopusBridge(session)
+        with standard_workspace() as ws:
+            manager = CellManager(ws.path, bus=bus)
+            manager.set_player_cell(bridge.frame(), VILLAGE)
+            manager.set_player_cell(bridge.frame(), KEEP)
+
+        churned = [e.name for e in bus.log if e.name == "on_exit_cell"]
+        self.assertTrue(churned, "the fixture must actually unload something")
+        self.assertEqual(sink.fired, [],
+                         "residency churn reached Octopus as {0}".format(
+                             [f["trigger_type"] for f in sink.fired]))

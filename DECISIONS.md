@@ -2594,3 +2594,60 @@ A fixture helper called `tester` was collected and run as a test, because
 earlier in this project and was fixed the same way. It is now named
 `make_tester` with a comment saying why, which is the only defence available
 short of not using the word.
+
+---
+
+## D46 — The sink is symmetric about residency (Shrimp finding #2)
+
+**Their report, and it was right.** `OctopusEventSink` refused to forward
+`on_enter_cell` for exactly the correct reason and forwarded `on_exit_cell`
+anyway.
+
+> any consumer that binds a Trigger to `on_exit_cell` fires it on ring churn -
+> a cell two hops away being released - including for cells the player was
+> never in. `set_player_cell` load-then-unload can fire several per transition.
+
+The asymmetry is indefensible on its own terms. CONTRACT §1 has said since it
+was written that *"loading a neighbouring cell for residency is not the player
+entering a scene"*; releasing one two hops away is not the player leaving, by
+precisely the same argument. Half of that reasoning was implemented.
+
+### Decision: both of their options, minus the one the contract forbids
+
+They offered three remedies. Two are taken:
+
+1. **`on_exit_cell` is no longer forwarded**, so the two residency Events are
+   handled identically.
+2. **`sink.exit_scene(location_id)` exists**, the explicit counterpart to
+   `enter_scene`. It fires `on_exit_scene` as an open-string trigger, because
+   Octopus exposes `enter_scene` and has no `exit_scene` of its own - which is
+   exactly the workaround Shrimp was maintaining, now owned by the layer that
+   should own it.
+
+The third - *"rename the residency signal so the two cannot be confused"* -
+**cannot be done.** §13 fixes the seven Event names and `CONTRACT_EVENTS` is
+asserted against that list exactly; renaming one would break every consumer
+bound to it to fix a naming problem. What was available instead is removing the
+*consequence* of the confusion, which is what forwarding it caused, and saying
+so plainly in CONTRACT §1.
+
+### Why it survived being documented correctly
+
+**No test asserted what the sink forwards, in either direction.** The rule was
+written down accurately in CONTRACT §1 and implemented for one of the two
+events, and nothing compared the two. That is the same shape as D24 - a
+document describing behaviour nobody checked - and the fix is the same: pin it.
+
+Four tests now do, including one that reproduces the reported symptom by
+walking a player between cells and asserting that the resulting churn reaches
+Octopus as nothing at all. Verified by mutation, and the first mutation attempt
+was **too small to fail** - reverting only the early return left the event with
+no bindings branch, so it still was not forwarded. Reverting both halves fails
+three tests.
+
+### What this does not change
+
+The Events themselves are untouched: `on_exit_cell` still fires from
+`CellManager.unload`, still means residency, and is still what `GpuResidency`
+uses to release buffers (D44). It was never the Event that was wrong - only its
+onward journey into a trigger vocabulary where it reads as something else.

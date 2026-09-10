@@ -286,15 +286,22 @@ class OctopusEventSink:
         return self
 
     def on_event(self, event: Event) -> None:
-        if event.name == ON_ENTER_CELL:
-            return  # player entry is announced explicitly, see enter_scene()
+        if event.name in (ON_ENTER_CELL, ON_EXIT_CELL):
+            # **Neither** residency Event is forwarded, and the symmetry is the
+            # point. CONTRACT §1 has always said loading a neighbour is not the
+            # player entering a scene - and unloading one two hops away is not
+            # the player leaving. Forwarding only the exit meant a Trigger bound
+            # to it fired on ring churn, for cells the player was never in, and
+            # several times per transition (Shrimp finding #2, D46).
+            #
+            # The player's own movement is announced explicitly:
+            # `enter_scene()` and `exit_scene()`.
+            return
         if event.name == ON_INTERACT:
             self._record(ON_INTERACT, {"target": event.target_id})
             self.session.interact(event.target_id)
             return
-        if event.name == ON_EXIT_CELL:
-            bindings = {"location": event.location_id}
-        elif event.name == ON_HIT_LOCATION:
+        if event.name == ON_HIT_LOCATION:
             bindings = {"target": event.target_id,
                         "subject": event.target_id}
             if event.source_id:
@@ -313,6 +320,22 @@ class OctopusEventSink:
         """The player entered this cell. Separate from residency loading."""
         self._record("on_enter_scene", {"location": location_id})
         self.session.enter_scene(location_id)
+
+    def exit_scene(self, location_id: str) -> None:
+        """The player left this cell. The counterpart to `enter_scene`.
+
+        Fired as `on_exit_scene`, an open-string trigger, because Octopus
+        exposes `enter_scene` and has no `exit_scene` of its own. Content binds
+        to it exactly as it would to any other trigger type
+        (`CONTENT_FORMAT.md` §5 permits new ones).
+
+        **Only the consumer knows this happened.** Lobster sees cells load and
+        unload; it does not see a player decide to walk out of one, which is the
+        same reason `enter_scene` exists rather than being inferred from
+        `on_enter_cell` (Octopus D31).
+        """
+        self._record("on_exit_scene", {"location": location_id})
+        self.session.fire("on_exit_scene", location=location_id)
 
     def _record(self, trigger_type: str, bindings: Dict[str, Any]) -> None:
         self.fired.append({"trigger_type": trigger_type,

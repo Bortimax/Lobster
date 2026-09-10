@@ -244,9 +244,24 @@ bus.subscribe_all(my_recorder)          # every contract event
 
 `OctopusEventSink(session).attach(bus)` forwards the subset Octopus has trigger
 types for, as bindings (record ids only — a list has no place in a binding).
-`on_enter_cell` is **not** forwarded: loading a neighbouring cell for residency
-is not the player entering a scene. Call `sink.enter_scene(location_id)` when the
-player actually arrives.
+
+**Neither residency Event is forwarded.** Loading a neighbouring cell is not the
+player entering a scene, and releasing one two hops away is not the player
+leaving. The player's own movement is announced explicitly, both ways:
+
+```python
+sink.enter_scene(location_id)    # fires on_enter_scene
+sink.exit_scene(location_id)     # fires on_exit_scene
+```
+
+Only the consumer knows a player decided to move; Lobster sees cells load and
+unload. Forwarding `on_exit_cell` — which this sink used to do — meant a Trigger
+bound to it fired on **ring churn**, for cells the player was never in, several
+times per transition. See DECISIONS.md D46.
+
+Exactly five events reach Octopus: `on_hit_location`, `on_structure_damaged`,
+`on_interact`, `on_item_placed`, `on_item_removed`. `tests/test_contract.py`
+pins that list.
 
 ---
 
