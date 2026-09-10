@@ -2999,3 +2999,94 @@ file *before* editing and restores whatever the sentinel names at startup; and
 the frame comparisons no longer go through `assertEqual` on hundred-thousand-byte
 lists, because unittest's differ is superlinear and builds that diff precisely
 when a mutant is caught. That is why the run was slow enough to want killing.
+
+---
+
+## D50 — Instancing, and the item question D48 deferred
+
+ASSET_SCOPE §7 step 5:
+
+> **Drawing, GPU, with instancing.** Draw-call assertions against
+> `RecordingContext` first: one upload per model, one instanced draw per model
+> per cell, no per-placement buffer.
+
+All three hold, and one of them holds more strongly than asked.
+
+### 1. One draw per model, not per model per cell
+
+The scope said *per model per cell*. The instance matrix is the **world**
+placement — the object inside its cell composed with the cell in the world — so
+the cell stopped being a grouping key: fifty barrels spread across three
+resident cells are one draw, not three.
+
+Strictly fewer draws, and it protects exactly the property the scope was after
+(no per-placement buffer, no draw per barrel). Recorded here rather than
+silently improved on, because a scope line and the code disagreeing is the thing
+this log exists for.
+
+### 2. A second program, not a branch in the first
+
+The static path keeps its `model` uniform. Converting terrain and structures to
+one-instance draws for symmetry would be rewriting working, tested code for
+elegance — the trade L8 refuses. The fragment stage is shared, so the two
+programs differ only in where a placement comes from.
+
+The cost is one extra `mvp` write per frame, which is why the uniform-write
+budget test now says `2 + cells + 1` and says why. And a mutation that dropped
+the second program's `mvp` **survived the first pass**: no draw-call count can
+see it, because the draws still happen — they just collapse to the origin.
+
+### 3. The light is per instance, which is the bill D47 deferred
+
+A library tint is unlit by construction: a mesh shared by every cell that places
+it cannot carry one cell's bake. So each instance carries 16 matrix floats plus
+one float of baked light, sampled at the placement. That is what §3 already asks
+of structures — *"structures sample ambient at their position"* — and it is one
+sample per prop per frame rather than one per vertex.
+
+### 4. Items are counted after all
+
+D48 deferred this with three reasons and named step 5 as the place. Here is the
+answer, and the reason it turned out cheap:
+
+**`CellManager` can read the resolution without opening a view.** That was the
+obstacle. `OctopusBridge.frame()` closes any view already open, so opening one
+from inside a residency handler would pull the caller's frame out from under it
+mid-render. Reading `session.resolution()` directly does not, so
+`item_model_refs(cell_id)` is callable at any moment — which is what made the
+whole thing possible without adding a field to a payload CONTRACT §13 freezes.
+
+So `GpuResidency` subscribes to `on_item_placed` and `on_item_removed` too, and
+`_sync_cell` — one primitive — serves all three: entering syncs from nothing,
+an item event syncs a difference, leaving releases everything. The ordering is
+free: `ItemPlacer`'s first docstring line is *"Writes item placement, then
+reports it. In that order"*, so the resolution is already current when the Event
+arrives.
+
+A manager with no session answers no item models. It is the same manager that
+cannot place an item either, so there is no case where this loses something a
+caller could otherwise have had.
+
+### Three defects found, none of them in the new feature
+
+**A leak in `release()`.** It freed the framebuffer, both textures and the
+static program — and not the instanced one, which this entry added. Found by the
+first assertion that looked at `RecordingContext.live_resources()` after
+teardown, which is a check that existed and had never been pointed at this
+method.
+
+**A class attribute pretending to be instance state.** `_missing` — the set of
+cells a draw list named that were never uploaded — was declared at class level,
+so every `ModernGLBackend` in a process shared one, and a test could inherit
+another test's complaint. Pre-existing; found by the same assertion.
+
+**A guard that could not fail, again.** `release()` had a second loop freeing
+instance buffers after `release_model` had already taken them. An instance entry
+cannot exist without its model — `_instance_target` needs the model's vertex
+buffer to build the VAO — so the loop was unreachable, and it survived mutation
+for the only reason unreachable code ever does. Deleted, with the invariant
+written where the loop was. Third time this pattern has appeared in three
+entries (D47, D49, here), which is either a habit worth naming or a sign that
+mutation testing is doing its job. Probably both.
+
+Eighteen mutants, eighteen caught.

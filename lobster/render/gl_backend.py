@@ -32,7 +32,7 @@ from __future__ import annotations
 
 import math
 import struct
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
 from ..constants import MODEL_VERTEX_STRIDE
 from ..geometry import Vec3
@@ -75,6 +75,50 @@ void main() {
 }
 """
 
+INSTANCED_VERTEX_SHADER = """
+#version 330 core
+
+uniform mat4 mvp;
+uniform vec3 sun;
+uniform float ambient;
+
+in vec3 in_position;
+in vec3 in_normal;
+in vec3 in_tint;
+
+// Per instance, not per vertex: fifty barrels are one mesh and fifty
+// transforms (ASSET_SCOPE §4). ES 3.0 has instanced arrays, which is why
+// RENDER_SCOPE §1 names instancing as the one exception to its feature
+// baseline.
+in vec4 in_model_0;
+in vec4 in_model_1;
+in vec4 in_model_2;
+in vec4 in_model_3;
+in float in_light;
+
+out vec3 v_colour;
+out float v_depth;
+
+void main() {
+    // The instance matrix is the *world* placement - the object inside its
+    // cell, composed with the cell in the world - so a cell is not a grouping
+    // key here the way it is for static geometry.
+    mat4 model = mat4(in_model_0, in_model_1, in_model_2, in_model_3);
+    vec4 world = model * vec4(in_position, 1.0);
+    vec4 clip = mvp * world;
+    gl_Position = clip;
+
+    vec3 n = mat3(model) * in_normal;
+    float lambert = max(0.0, dot(normalize(n), normalize(sun)));
+    float level = ambient + (1.0 - ambient) * lambert;
+    // A library tint is unlit by construction (D47): a mesh shared by every
+    // cell that places it cannot carry one cell's bake. So the bake arrives
+    // here, per instance, sampled where the thing actually stands.
+    v_colour = in_tint * level * in_light;
+    v_depth = clip.w;
+}
+"""
+
 FRAGMENT_SHADER = """
 #version 330 core
 
@@ -101,6 +145,13 @@ void main() {
 VERTEX_STRIDE = MODEL_VERTEX_STRIDE
 VERTEX_FORMAT = "3f 3f 3f"
 VERTEX_ATTRIBUTES = ("in_position", "in_normal", "in_tint")
+
+#: per instance: a world matrix as four columns, then the baked light where the
+#: instance stands. `/i` is moderngl's divisor-1 marker.
+INSTANCE_FORMAT = "4f 4f 4f 4f 1f/i"
+INSTANCE_ATTRIBUTES = ("in_model_0", "in_model_1", "in_model_2", "in_model_3",
+                       "in_light")
+INSTANCE_STRIDE = 17 * 4
 
 
 class GLFrame:
@@ -163,8 +214,31 @@ class ModernGLBackend(RenderBackend):
         #: model_ref -> (buffer, vao, vertex count). Shared by every cell that
         #: places one, which is why it is not inside `CellBuffers`.
         self.models: Dict[str, Tuple[Any, Any, int]] = {}
+        #: model_ref -> [instance buffer, instanced vao, capacity in bytes].
+        #: One per model and reused across frames: a buffer per *placement*
+        #: would be the thing instancing exists to remove, and a buffer per
+        #: frame would be a driver allocation every frame for a few hundred
+        #: bytes - the mistake `_draw_impostors` already records.
+        self._instances: Dict[str, List[Any]] = {}
+        #: models a draw list asked for that residency never uploaded. Counted
+        #: for the same reason `missing_uploads` is: the symptom is a barrel
+        #: that is not there, and silence names nobody.
+        self._missing_models: Set[str] = set()
+        #: cells a draw list named that were never uploaded. An *instance*
+        #: attribute: it used to be a class one, which meant every backend in a
+        #: process shared one set and a test could inherit another test's
+        #: complaint. Found by the first assertion that looked at teardown.
+        self._missing: Set[str] = set()
         self._program = self.ctx.program(vertex_shader=VERTEX_SHADER,
                                          fragment_shader=FRAGMENT_SHADER)
+        # A second program rather than one with a branch. The static path
+        # already works and is tested, and converting terrain and structures to
+        # one-instance draws for symmetry would rewrite it for elegance - which
+        # is the trade L8 exists to refuse. The fragment stage is shared, so
+        # the two differ only in where a placement comes from.
+        self._instanced = self.ctx.program(
+            vertex_shader=INSTANCED_VERTEX_SHADER,
+            fragment_shader=FRAGMENT_SHADER)
         self._colour = self.ctx.texture((width, height), 3)
         self._depth = self.ctx.depth_texture((width, height))
         self._fbo = self.ctx.framebuffer(color_attachments=(self._colour,),
@@ -222,6 +296,12 @@ class ModernGLBackend(RenderBackend):
         self.models[mesh.model_ref] = self._make_mesh(mesh.vertices)
 
     def release_model(self, model_ref: str) -> None:
+        # The instanced VAO holds a reference to the model's vertex buffer, so
+        # it has to go with it. Leaving it would mean the next upload of the
+        # same ref drew last residency's geometry.
+        instance = self._instances.pop(model_ref, None)
+        if instance is not None:
+            _release(instance[0], instance[1])
         existing = self.models.pop(model_ref, None)
         if existing is not None:
             _release(existing[0], existing[1])
@@ -260,15 +340,17 @@ class ModernGLBackend(RenderBackend):
         self.ctx.enable(self.ctx.DEPTH_TEST)
 
         mvp = _view_projection(draw_list.camera)
-        self._program["mvp"].write(_pack_matrix(mvp))
-        self._program["sun"].value = tuple(settings.sun)
-        self._program["ambient"].value = float(settings.ambient)
-        self._program["fog_colour"].value = _unit(settings.fog_colour)
-        self._program["fog_start"].value = float(settings.fog_start_m)
-        self._program["fog_end"].value = float(settings.fog_end_m)
+        for program in (self._program, self._instanced):
+            program["mvp"].write(_pack_matrix(mvp))
+            program["sun"].value = tuple(settings.sun)
+            program["ambient"].value = float(settings.ambient)
+            program["fog_colour"].value = _unit(settings.fog_colour)
+            program["fog_start"].value = float(settings.fog_start_m)
+            program["fog_end"].value = float(settings.fog_end_m)
 
         drawn = set()
         impostors = bytearray()
+        instances: Dict[str, bytearray] = {}
         placed: Optional[str] = None
         for item in draw_list.items:
             buffers = self.cells.get(item.cell_id)
@@ -289,8 +371,11 @@ class ModernGLBackend(RenderBackend):
                 self._program["model"].write(
                     _pack_matrix(_model_matrix(item.cell_placement)))
                 placed = item.cell_id
-            self._draw_item(buffers, item, settings, impostors)
+            self._draw_item(buffers, item, settings, impostors, instances,
+                            cells_by_id.get(item.cell_id))
 
+        if instances:
+            self._draw_instanced(instances)
         if impostors:
             # `DrawItem.center` is already world space, so impostors are placed
             # by the culler rather than by a model matrix.
@@ -299,7 +384,8 @@ class ModernGLBackend(RenderBackend):
         return GLFrame(self, self.width, self.height)
 
     def _draw_item(self, buffers: CellBuffers, item: Any, settings: Any,
-                   impostors: bytearray) -> None:
+                   impostors: bytearray, instances: Dict[str, bytearray],
+                   cell: Any) -> None:
         from ..visibility import ENTITY, ITEM, PROP, STRUCTURE, TERRAIN
         if item.kind == TERRAIN and buffers.terrain is not None:
             _, vao, count = buffers.terrain
@@ -309,8 +395,59 @@ class ModernGLBackend(RenderBackend):
             if mesh is not None:
                 vao = mesh[1]
                 vao.render(vertices=mesh[2])
+        elif item.kind in (PROP, ITEM) and item.model_ref:
+            if item.model_ref not in self.models:
+                # Residency never uploaded it. Same fallback the software path
+                # takes, and counted here rather than raised - a frame that
+                # threw over one absent barrel would take the picture with it.
+                self._missing_models.add(item.model_ref)
+                impostors.extend(_impostor_vertices(item, settings))
+                return
+            instances.setdefault(item.model_ref, bytearray()).extend(
+                _instance_bytes(item, cell))
         elif item.kind in (ENTITY, PROP, ITEM):
             impostors.extend(_impostor_vertices(item, settings))
+
+    def _draw_instanced(self, instances: Dict[str, bytearray]) -> None:
+        """One draw per distinct model, however many placements it has.
+
+        **Per model, not per model per cell.** ASSET_SCOPE §7 step 5 asked for
+        the latter, and the instance matrix carries the cell placement composed
+        in, so the cell stopped being a grouping key - one draw for fifty
+        barrels spread across three resident cells rather than three. Strictly
+        fewer draws, and it protects the same property the scope was after: no
+        per-placement buffer, and no draw per barrel. See DECISIONS.md D50.
+        """
+        for model_ref in sorted(instances):
+            data = bytes(instances[model_ref])
+            buf, vao, _capacity = self._instance_target(model_ref, len(data))
+            buf.write(data)
+            vao.render(vertices=self.models[model_ref][2],
+                       instances=len(data) // INSTANCE_STRIDE)
+
+    def _instance_target(self, model_ref: str, needed: int) -> List[Any]:
+        """This model's instance buffer and VAO, grown and reused.
+
+        Orphan-and-write for the same reason `_draw_impostors` does it: the
+        contents change every frame, the shape does not, and telling the driver
+        the old contents are dead lets it hand back storage without waiting for
+        the last frame to finish reading them.
+        """
+        entry = self._instances.get(model_ref)
+        if entry is None or needed > entry[2]:
+            capacity = max(needed, (entry[2] * 2 if entry else 0),
+                           8 * INSTANCE_STRIDE)
+            if entry is not None:
+                _release(entry[0], entry[1])
+            buf = self.ctx.buffer(reserve=capacity, dynamic=True)
+            vao = self.ctx.vertex_array(self._instanced, [
+                (self.models[model_ref][0], VERTEX_FORMAT) + VERTEX_ATTRIBUTES,
+                (buf, INSTANCE_FORMAT) + INSTANCE_ATTRIBUTES])
+            entry = [buf, vao, capacity]
+            self._instances[model_ref] = entry
+        else:
+            entry[0].orphan()
+        return entry
 
     def _draw_impostors(self, data: bytes) -> None:
         """Stream everything that moves through one reused buffer.
@@ -364,16 +501,31 @@ class ModernGLBackend(RenderBackend):
             self.release_cell(cell_id)
         # Models too: they are not inside `CellBuffers` precisely because they
         # outlive any one cell, which also means the cell loop above would have
-        # walked straight past them and leaked every one.
+        # walked straight past them and leaked every one. `release_model` takes
+        # the instance buffer with it.
         for model_ref in list(self.models):
             self.release_model(model_ref)
+        # No separate loop for `_instances`. An instance entry cannot exist
+        # without its model - `_instance_target` needs the model's vertex
+        # buffer to build the VAO - and `release_model` takes the pair away
+        # together. The loop that used to be here could never run, and a guard
+        # nothing can make fire is the D47 shape: it survived mutation because
+        # there was no way to make it matter.
         if self._dynamic is not None:
             _release(self._dynamic, self._dynamic_vao)
             self._dynamic = self._dynamic_vao = None
-        for resource in (self._fbo, self._colour, self._depth, self._program):
+        for resource in (self._fbo, self._colour, self._depth,
+                         self._program, self._instanced):
             resource.release()
 
-    _missing: set = set()
+    def missing_models(self) -> List[str]:
+        """Models a draw list asked for that residency never uploaded.
+
+        Empty in a world whose build passed lint. Non-empty means a bundle and
+        a library built apart, and the picture has impostors where geometry
+        should be.
+        """
+        return sorted(self._missing_models)
 
     def missing_uploads(self) -> List[str]:
         """Cells the draw list wanted and no buffer existed for.
@@ -439,6 +591,26 @@ def _structure_vertices(cell: Any, live: Any) -> bytes:
                         "9f", *corners[index], *quad.normal,
                         *_lit(base, cell, corners[index])))
     return bytes(out)
+
+
+def _instance_bytes(item: Any, cell: Any) -> bytes:
+    """One instance: a world matrix, then the baked light where it stands.
+
+    The matrix is the object's own placement inside its cell composed with the
+    cell's placement in the world - the same two steps, in the same order, that
+    the software path applies per vertex.
+
+    The light is sampled once per instance rather than once per vertex, which is
+    the trade a shared mesh forces: the vertices belong to every cell that
+    places this model, so nothing can be baked into them (D47). One sample at
+    the placement is what §3 already asks of structures - *"structures sample
+    ambient at their position"*.
+    """
+    from .raster import _light_at
+    world = _matmul(_model_matrix(item.cell_placement),
+                    _model_matrix(item.transform))
+    origin = (world[0][3], world[1][3], world[2][3])
+    return _pack_matrix(world) + struct.pack("f", _light_at(cell, origin))
 
 
 def _impostor_vertices(item: Any, settings: Any) -> bytes:

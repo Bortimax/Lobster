@@ -231,6 +231,170 @@ class TestTheCountedInvariants(ModelResidencyFixture):
         self.assert_in_step()
 
 
+class TestItemsAreCountedToo(unittest.TestCase):
+    """D48 deferred this to step 5; D50 is where it landed.
+
+    A prop is baked into the bundle and fixed for the whole residency. An item
+    is a record and can be dropped or picked up mid-residency, so its model's
+    lifetime is not the cell's - which is why `on_item_placed` and
+    `on_item_removed` are two more subscribers rather than a cache somebody has
+    to remember to invalidate.
+    """
+
+    def setUp(self):
+        from lobster.geometry import Transform
+        self.Transform = Transform
+        self.session = build_session()
+        for record in ({"id": "item-sword", "type": "Item",
+                        "display_name": "Sword", "model_ref": CRATE},
+                       {"id": "item-shield", "type": "Item",
+                        "display_name": "Shield", "model_ref": CRATE},
+                       {"id": "item-lamp", "type": "Item",
+                        "display_name": "Lamp", "model_ref": SIGN},
+                       {"id": CRATE, "type": "Model"},
+                       {"id": SIGN, "type": "Model"}):
+            self.session.engine.write({"op": "CREATE", "record": record})
+        self.bridge = OctopusBridge(self.session)
+        self.ws = BundleWorkspace()
+        self.addCleanup(self.ws.close)
+        self.ws.write(village_bundle())
+        for cell_id in (FIELD, KEEP):
+            self.ws.write(plain_bundle(cell_id))
+        self.ws.write_library(primitive_library())
+        self.bus = EventBus()
+        self.manager = CellManager(self.ws.path, bus=self.bus,
+                                   session=self.session)
+        self.backend = RecordingBackend()
+        self.gpu = GpuResidency(self.backend, self.manager).attach(self.bus)
+        self.manager.load(self.bridge.frame(), VILLAGE)
+
+    def place(self, item_id, cell_id=VILLAGE, position=(6.0, 0.0, 8.0)):
+        self.manager.place_item(self.bridge.frame(), item_id, cell_id,
+                                self.Transform(position=position))
+
+    def remove(self, item_id):
+        self.manager.remove_item(self.bridge.frame(), item_id)
+
+    def assert_in_step(self):
+        drift = self.gpu.drift()
+        self.assertEqual({k: v for k, v in drift.items() if v}, {}, drift)
+
+    def test_placing_an_item_uploads_its_model(self):
+        self.assertEqual(self.backend.live_models(), [])
+        self.place("item-sword")
+        self.assertEqual(self.backend.live_models(), [CRATE])
+        self.assert_in_step()
+
+    def test_removing_the_last_item_releases_it(self):
+        self.place("item-sword")
+        self.remove("item-sword")
+        self.assertEqual(self.backend.live_models(), [])
+        self.assertEqual(self.backend.model_releases.count(CRATE), 1)
+        self.assert_in_step()
+
+    def test_two_items_sharing_a_model_upload_it_once(self):
+        self.place("item-sword", position=(6.0, 0.0, 8.0))
+        self.place("item-shield", position=(7.0, 0.0, 8.0))
+        self.assertEqual(self.backend.model_uploads.count(CRATE), 1)
+        self.remove("item-sword")
+        self.assertEqual(self.backend.live_models(), [CRATE],
+                         "the shield still needs it")
+        self.remove("item-shield")
+        self.assertEqual(self.backend.live_models(), [])
+        self.assert_in_step()
+
+    def test_a_prop_and_an_item_sharing_a_model_are_two_references(self):
+        """One buffer, two holders, and neither release takes it early.
+
+        Built on its own bus: attaching a second `GpuResidency` to the fixture's
+        bus made the first one see an `on_enter_cell` for a cell that was not
+        resident in *its* manager, which is a loud failure and rightly so.
+        """
+        from dataclasses import replace
+        self.manager.unload(VILLAGE)
+        self.ws.write(replace(village_bundle(),
+                              props=(prop("crate-1", CRATE),)))
+        bus = EventBus()
+        manager = CellManager(self.ws.path, bus=bus, session=self.session)
+        backend = RecordingBackend()
+        gpu = GpuResidency(backend, manager).attach(bus)
+
+        manager.load(self.bridge.frame(), VILLAGE)
+        self.assertEqual(gpu.model_counts[CRATE], 1, "the prop")
+        manager.place_item(self.bridge.frame(), "item-sword", VILLAGE,
+                           self.Transform(position=(6.0, 0.0, 8.0)))
+        self.assertEqual(gpu.model_counts[CRATE], 1,
+                         "a prop and an item in one cell are one reference - "
+                         "the count is per distinct model per cell")
+        self.assertEqual(backend.model_uploads.count(CRATE), 1,
+                         "the item re-uploaded a model the prop already had")
+        manager.remove_item(self.bridge.frame(), "item-sword")
+        self.assertEqual(backend.live_models(), [CRATE],
+                         "the prop still needs it")
+        manager.unload(VILLAGE)
+        self.assertEqual(backend.live_models(), [])
+
+    def test_the_cell_going_releases_what_its_items_held(self):
+        self.place("item-sword")
+        self.place("item-lamp", position=(8.0, 0.0, 8.0))
+        self.assertEqual(self.backend.live_models(), sorted([CRATE, SIGN]))
+        self.manager.unload(VILLAGE)
+        self.assertEqual(self.backend.live_models(), [])
+        self.assertEqual(self.gpu.model_counts, {})
+
+    def test_an_item_in_a_cell_that_is_not_resident_holds_nothing(self):
+        """`place_item` refuses one anyway, so this is the reverse: an item
+        already in a record for a cell nobody has loaded."""
+        self.session.engine.write({"op": "CREATE", "record": {
+            "id": "item-far", "type": "Item", "display_name": "Far",
+            "model_ref": SIGN, "default_location_ref": KEEP,
+            "world_transform": {"position": [1.0, 0.0, 1.0],
+                                "rotation": [0, 0, 0, 1]}}})
+        self.assertEqual(self.backend.live_models(), [])
+        self.assert_in_step()
+
+    def test_loading_a_cell_picks_up_the_items_already_in_it(self):
+        """An item placed before the cell was resident still gets its model
+        when the cell loads - the sync is a set difference, not an event log."""
+        self.place("item-sword")
+        self.manager.unload(VILLAGE)
+        self.assertEqual(self.backend.live_models(), [])
+        self.manager.load(self.bridge.frame(), VILLAGE)
+        self.assertEqual(self.backend.live_models(), [CRATE])
+        self.assert_in_step()
+
+    def test_an_item_with_no_model_ref_holds_nothing(self):
+        self.session.engine.write({"op": "CREATE", "record": {
+            "id": "item-plain", "type": "Item", "display_name": "Plain"}})
+        self.place("item-plain")
+        self.assertEqual(self.backend.live_models(), [])
+        self.assert_in_step()
+
+    def test_churn_leaves_nothing_behind(self):
+        """The randomised walk, with items moving as well as cells."""
+        rng = random.Random(11)
+        items = ["item-sword", "item-shield", "item-lamp"]
+        placed = set()
+        for _step in range(40):
+            item = rng.choice(items)
+            if item in placed:
+                self.remove(item)
+                placed.discard(item)
+            else:
+                self.place(item, position=(4.0 + rng.random(), 0.0, 8.0))
+                placed.add(item)
+            self.assert_in_step()
+        for item in list(placed):
+            self.remove(item)
+        self.assertEqual(self.backend.live_models(), [])
+
+    def test_a_manager_with_no_session_answers_no_item_models(self):
+        """The same manager that cannot place an item either. Documented, not
+        silent: `model_refs_for` still answers for props."""
+        bare = CellManager(self.ws.path)
+        self.assertEqual(bare.item_model_refs(VILLAGE), [])
+
+
 class TestDriftSeesModels(ModelResidencyFixture):
     """`drift()` must compare the counts against the *world*, not against
     themselves.

@@ -411,6 +411,47 @@ class CellManager:
                     raise CellError(str(e)) from e
         return self._library
 
+    def item_model_refs(self, cell_id: str) -> List[str]:
+        """Models the items currently placed in this cell reference.
+
+        Read from the session's resolution rather than cached, and **no view is
+        opened**: `OctopusBridge.frame()` closes any view already open, so
+        opening one from inside a residency handler would pull the caller's
+        frame out from under it mid-render. Reading the resolution directly is
+        what makes this callable at any moment, which is the whole reason item
+        models can be counted at all (D50).
+
+        Cheap because it is rare: this runs on cell load and on item placement,
+        not per frame. A manager with no session answers nothing - it is the
+        same manager that cannot place an item either.
+        """
+        if self.session is None:
+            return []
+        from .octopus_bridge import resolve_item_location
+        seen: Dict[str, None] = {}
+        for record in self.session.resolution().by_type("Item"):
+            if not record.get("world_transform"):
+                continue
+            if resolve_item_location(record) != cell_id:
+                continue
+            model_ref = record.get("model_ref")
+            if model_ref:
+                seen.setdefault(model_ref)
+        return sorted(seen)
+
+    def model_refs_for(self, cell_id: str) -> List[str]:
+        """Every model this cell needs resident: its props, and its items.
+
+        The union lives here and not on `ResidentCell` because half of it is a
+        record read and a `ResidentCell` holds no session - it is baked geometry
+        plus the runtime state derived from records, and reaching for a
+        resolution from inside one would make it a query object.
+        """
+        cell = self.resident.get(cell_id)
+        if cell is None:
+            return []
+        return sorted(set(cell.model_refs()) | set(self.item_model_refs(cell_id)))
+
     # -- residency -----------------------------------------------------------
     def is_exterior(self, view: Any, cell_id: str) -> bool:
         return is_exterior(view, cell_id)

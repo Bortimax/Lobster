@@ -885,10 +885,13 @@ wrong. A `model_ref` the library cannot satisfy is **not** drift — it can neve
 be live — and is reported by `gpu.unresolved_models()` and counted as
 `missing_models`, naming the cells that asked.
 
-**Props only.** A prop is baked into the bundle, so its model is fixed for the
-whole residency, which is what makes counting it correct. A placed `Item` also
-carries a `model_ref`, but an item can be picked up mid-residency, so its
-lifetime is the item's rather than the cell's. See DECISIONS.md D48.
+**Props and items.** A prop is baked into the bundle and fixed for the cell's
+whole residency. An item is a record and can be dropped or picked up
+mid-residency, so `GpuResidency` subscribes to `on_item_placed` and
+`on_item_removed` as well, and re-syncs that cell — one primitive, three Events.
+`CellManager.model_refs_for(cell_id)` is the union, and it reads the session's
+resolution without opening a view, so it is safe to call from inside a frame.
+See DECISIONS.md D48 and D50.
 
 ### Drawing a model — the software path
 
@@ -926,6 +929,30 @@ empty `model_ref`, or a ref the library does not hold. The third is a build erro
 (`prop_model_ref_unresolved`) and a counted residency fault (`missing_models`) —
 named there rather than raised mid-frame, because a renderer that threw over one
 absent barrel would take the whole picture with it.
+
+### Drawing a model — the GPU path, instanced
+
+Fifty barrels is one mesh and fifty transforms. The GPU backend groups the
+visible props and items by `model_ref` and issues **one instanced draw per
+distinct model per frame** — not per placement, and not per model per cell: the
+instance matrix carries the cell placement composed in, so a cell is not a
+grouping key (D50).
+
+Each instance is 17 floats: a world matrix as four columns, then the cell's baked
+light sampled where that instance stands. The light is per instance because a
+library tint is unlit by construction — a mesh shared by every cell that places
+it cannot carry one cell's bake — and one sample at the placement is what §3
+already asks of structures.
+
+Instance buffers are per model, grown and reused with the same orphan-and-write
+idiom the impostor stream uses, so a steady scene allocates nothing per frame.
+`ModernGLBackend.missing_models()` lists refs a draw list asked for that
+residency never uploaded; they draw as impostors, as they do on the software
+path.
+
+The instanced program is a **second** program. The static path keeps its `model`
+uniform: converting terrain and structures to one-instance draws for symmetry
+would rewrite working, tested code for elegance, which is the trade L8 refuses.
 
 ---
 
@@ -1104,11 +1131,11 @@ directions: **a cull must err towards drawing**, because culling something
 invisible costs one wasted draw while culling something visible is a missing
 sword.
 
-An item with a `model_ref` the library holds now draws as **real geometry** on
-the software path (§7), placed by its `world_transform` and its cell's placement.
-An item without one is a bounded impostor, exactly where props have always been.
-The GPU path still draws every item as an impostor — that is ASSET_SCOPE §7
-step 5. See DECISIONS.md D37, D47 and D49.
+An item with a `model_ref` the library holds draws as **real geometry** on both
+backends (§7), placed by its `world_transform` and its cell's placement — looped
+on the software path, instanced on the GPU. An item without one is a bounded
+impostor, exactly where props have always been. See DECISIONS.md D37, D47, D49
+and D50.
 
 ---
 

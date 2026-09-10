@@ -50,6 +50,14 @@ construction - `drift()` extends to them and asserts the thing that actually
 matters: *the set of live models equals the set of models the resident cells
 reference*, after any sequence of loads and unloads whatsoever.
 
+A cell references models two ways, and they have different lifetimes. Its
+**props** are baked into the bundle and fixed for the whole residency. Its
+**items** are records and can be dropped or picked up mid-residency, so the set
+is re-synced on `on_item_placed` and `on_item_removed` - two more Events that
+already exist, subscribed to for the same reason the residency pair is. One
+primitive does all three: `_sync_cell` diffs what a cell needs *now* against
+what it is holding.
+
 ## Break-state is the one dynamic case
 
 Terrain and structure meshes are static per residency, except that destroying a
@@ -133,11 +141,13 @@ class GpuResidency:
     def attach(self, bus: Any) -> "GpuResidency":
         """Subscribe to the residency Events. Returns self, so a caller can
         write `GpuResidency(backend, manager).attach(bus)`."""
-        from ..events import (ON_ENTER_CELL, ON_EXIT_CELL,
-                              ON_STRUCTURE_DAMAGED)
+        from ..events import (ON_ENTER_CELL, ON_EXIT_CELL, ON_ITEM_PLACED,
+                              ON_ITEM_REMOVED, ON_STRUCTURE_DAMAGED)
         bus.subscribe(ON_ENTER_CELL, self.on_enter_cell)
         bus.subscribe(ON_EXIT_CELL, self.on_exit_cell)
         bus.subscribe(ON_STRUCTURE_DAMAGED, self.on_structure_damaged)
+        bus.subscribe(ON_ITEM_PLACED, self.on_item_changed)
+        bus.subscribe(ON_ITEM_REMOVED, self.on_item_changed)
         return self
 
     # -- handlers ------------------------------------------------------------
@@ -160,7 +170,7 @@ class GpuResidency:
         self.backend.upload_cell(cell)
         self.uploaded.add(cell_id)
         self.stats.uploads += 1
-        self._retain_models(cell)
+        self._sync_cell(cell_id)
 
     def on_exit_cell(self, event: Any) -> None:
         cell_id = event.location_id
@@ -189,51 +199,90 @@ class GpuResidency:
                                       tuple(event.chunk_indices))
         self.stats.reuploads += 1
 
-    # -- shared models -------------------------------------------------------
-    def _retain_models(self, cell: Any) -> None:
-        """Count one reference per *distinct* model this cell places.
+    def on_item_changed(self, event: Any) -> None:
+        """An item was dropped or picked up, so that cell's model set moved.
 
-        Distinct is the point: a cell with fifty barrels holds one reference, so
-        unloading it releases the model once. Counting per placement would also
-        balance arithmetically and would make the count mean something else -
-        and the invariant `drift()` asserts is about the set, not the total.
+        Fired *after* the write (`ItemPlacer` says so in its first line), so
+        asking the manager now sees the new state. A cell that is not resident
+        is not holding anything to sync - and `place_item` refuses one anyway.
         """
-        refs = tuple(cell.model_refs())
-        self.retained_by[cell.cell_id] = refs
+        cell_id = getattr(event, "cell_id", None)
+        if cell_id in self.uploaded:
+            self._sync_cell(cell_id)
+
+    # -- shared models -------------------------------------------------------
+    def _wanted(self, cell_id: str) -> Tuple[str, ...]:
+        """What this cell needs resident right now: props, and items.
+
+        Asked of the *manager*, because half the answer is a record read and a
+        `ResidentCell` holds no session. A manager without the method - a test
+        double, say - falls back to the cell's own props.
+        """
+        ask = getattr(self.manager, "model_refs_for", None)
+        if ask is not None:
+            return tuple(ask(cell_id))
+        cell = self.manager.resident.get(cell_id)
+        return tuple(cell.model_refs()) if cell is not None else ()
+
+    def _sync_cell(self, cell_id: str) -> None:
+        """Bring this cell's references in line with what it needs now.
+
+        One primitive for three Events: entering a cell syncs from nothing,
+        placing or removing an item syncs a difference, and leaving releases
+        everything (`_release_models`, which cannot recompute because the cell
+        is gone by then).
+
+        Distinct models, not placements: a cell with fifty barrels holds one
+        reference, so unloading it releases the model once. Counting per
+        placement would balance arithmetically and make the count mean
+        something else - and the invariant `drift()` asserts is about the set.
+        """
+        wanted = self._wanted(cell_id)
+        held = self.retained_by.get(cell_id, ())
+        for model_ref in wanted:
+            if model_ref not in held:
+                self._retain(cell_id, model_ref)
+        for model_ref in held:
+            if model_ref not in wanted:
+                self._release(cell_id, model_ref)
+        self.retained_by[cell_id] = wanted
+
+    def _retain(self, cell_id: str, model_ref: str) -> None:
+        count = self.model_counts.get(model_ref, 0)
+        if count:
+            self.model_counts[model_ref] = count + 1
+            self.stats.model_uploads_shared += 1
+            return
         library = self._library()
-        for model_ref in refs:
-            count = self.model_counts.get(model_ref, 0)
-            if count:
-                self.model_counts[model_ref] = count + 1
-                self.stats.model_uploads_shared += 1
-                continue
-            mesh = library.models.get(model_ref) if library else None
-            if mesh is None:
-                # Never counted, so nothing tries to release it later. The cell
-                # that asked is remembered because "a model is missing" names
-                # nobody.
-                self.unresolved.setdefault(model_ref, set()).add(cell.cell_id)
-                self.stats.missing_models += 1
-                continue
-            self.backend.upload_model(mesh)
-            self.model_counts[model_ref] = 1
-            self.stats.model_uploads += 1
+        mesh = library.models.get(model_ref) if library else None
+        if mesh is None:
+            # Never counted, so nothing tries to release it later. The cell that
+            # asked is remembered because "a model is missing" names nobody.
+            self.unresolved.setdefault(model_ref, set()).add(cell_id)
+            self.stats.missing_models += 1
+            return
+        self.backend.upload_model(mesh)
+        self.model_counts[model_ref] = 1
+        self.stats.model_uploads += 1
+
+    def _release(self, cell_id: str, model_ref: str) -> None:
+        count = self.model_counts.get(model_ref, 0)
+        if count <= 0:
+            # Retained by this cell but no longer counted. Obeying it would
+            # take a live model away from a cell still showing one, so it is
+            # counted instead - `unknown_releases` with a different subject.
+            self.stats.unknown_model_releases += 1
+            return
+        if count > 1:
+            self.model_counts[model_ref] = count - 1
+            return
+        del self.model_counts[model_ref]
+        self.backend.release_model(model_ref)
+        self.stats.model_releases += 1
 
     def _release_models(self, cell_id: str) -> None:
         for model_ref in self.retained_by.pop(cell_id, ()):
-            count = self.model_counts.get(model_ref, 0)
-            if count <= 0:
-                # Retained by this cell but no longer counted. Obeying it would
-                # take a live model away from a cell still showing one, so it is
-                # counted instead - `unknown_releases` with a different subject.
-                self.stats.unknown_model_releases += 1
-                continue
-            if count > 1:
-                self.model_counts[model_ref] = count - 1
-                continue
-            del self.model_counts[model_ref]
-            self.backend.release_model(model_ref)
-            self.stats.model_releases += 1
+            self._release(cell_id, model_ref)
         for cells in self.unresolved.values():
             cells.discard(cell_id)
         self.unresolved = {ref: cells for ref, cells in self.unresolved.items()
@@ -280,7 +329,7 @@ class GpuResidency:
         # be live, so counting them here would make a content typo look like a
         # permanent leak.
         needed = {ref for cell_id in resident
-                  for ref in self.manager.resident[cell_id].model_refs()
+                  for ref in self._wanted(cell_id)
                   if ref in held}
         live = set(self.model_counts)
         return {"leaked": sorted(self.uploaded - resident),
