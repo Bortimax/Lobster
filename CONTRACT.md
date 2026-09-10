@@ -853,6 +853,43 @@ A model that meshes to zero triangles is a **build error**
 from a missing one. The library is built before any cell, so a world with a
 broken model bakes nothing at all rather than bakes partly.
 
+### Models are reference-counted; cells are not
+
+A cell's buffers belong to that cell. A model is shared, so the question "may
+this be released" has as many answers as there are resident cells:
+
+* a model referenced by *n* resident cells is uploaded **once**;
+* releasing one of those cells does **not** release the model;
+* releasing the last one **does**;
+* a count never goes negative, and a release for a model never uploaded is
+  counted (`unknown_model_releases`) rather than obeyed — the same shape as
+  `unknown_releases`.
+
+The reference is per **distinct model per cell**, not per placement: fifty
+barrels in one cell hold one reference. `GpuResidency` does the counting, driven
+by the residency Events it already subscribes to, and `CellManager.library`
+supplies the meshes — the renderer never opens a file.
+
+`drift()` gained two keys for it, and they are the assertion that matters,
+because a leaked model *draws perfectly* (D43):
+
+```python
+gpu.drift()
+# {"leaked": [], "missing": [], "models_leaked": [], "models_missing": []}
+```
+
+`models_leaked` is what the backend holds and no resident cell references;
+`models_missing` is the reverse. Both are recomputed from the resident cells
+rather than from the counts, so a count cannot agree with itself while being
+wrong. A `model_ref` the library cannot satisfy is **not** drift — it can never
+be live — and is reported by `gpu.unresolved_models()` and counted as
+`missing_models`, naming the cells that asked.
+
+**Props only.** A prop is baked into the bundle, so its model is fixed for the
+whole residency, which is what makes counting it correct. A placed `Item` also
+carries a `model_ref`, but an item can be picked up mid-residency, so its
+lifetime is the item's rather than the cell's. See DECISIONS.md D48.
+
 ---
 
 ## 8. Object selection
@@ -1119,6 +1156,7 @@ a runtime symptom weeks later (§15.2).
 | `invalid_primitive_dimensions` | yes | a primitive whose size, radius or height is missing, zero, negative or not a number — it would mesh to nothing |
 | `model_ref_unresolved` | yes | a voxel model that no manifest `models` entry names |
 | `model_file_missing` | yes | a manifest entry whose `.vox` is not there |
+| `prop_model_ref_unresolved` | yes | a prop naming a `Model` no record declares — Octopus's `dangling_reference` covers `Item.model_ref`; a prop lives in the manifest and had no owner |
 | `model_meshing_failed` | yes | a model the mesher could not turn into geometry; carries the reader's own message and the record id |
 | `model_meshes_to_nothing` | yes | a model that meshed to zero triangles — at runtime that is indistinguishable from a missing one |
 | `model_asset_unused` | **no** | a `.vox` in `vox_dir` nothing references — dead weight, not a broken build |

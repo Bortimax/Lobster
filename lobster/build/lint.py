@@ -70,6 +70,7 @@ ERROR_CODES = frozenset({
     "invalid_primitive_dimensions",
     "model_ref_unresolved",
     "model_file_missing",
+    "prop_model_ref_unresolved",
     # emitted by the library build (`library_writer`), not by a check here, for
     # the reason `over_budget` is: it is only knowable once something has been
     # meshed. It is an error for the same reason the rest are - a model that
@@ -208,6 +209,35 @@ def model_kind(record: Mapping[str, Any]) -> Optional[str]:
     if has_primitive and not has_asset:
         return MODEL_PRIMITIVE
     return None
+
+
+def check_prop_models(view: Any, manifest: Any) -> List[Dict[str, Any]]:
+    """Every prop's `model_ref` names a `Model` record.
+
+    The third link in the chain, and the one nothing was checking. Octopus's own
+    `dangling_reference` covers `Item.model_ref`, because that is a record field
+    in its schema; a `PropPlacement` lives in the *manifest*, so its ref had no
+    owner and a typo produced a barrel that was simply not there.
+
+    **An empty `model_ref` is not a fault.** A prop with none is the impostor the
+    draw list has always produced and CONTRACT §10 describes; turning a
+    documented absence into an error would fail every world built so far.
+    """
+    if manifest is None:
+        return []
+    known = {record["id"] for record in view.records_of_type("Model")}
+    out: List[Dict[str, Any]] = []
+    for cell in getattr(manifest, "cells", ()):
+        for prop in cell.props:
+            if not prop.model_ref or prop.model_ref in known:
+                continue
+            out.append(finding(
+                "prop_model_ref_unresolved",
+                "prop {0!r} references model {1!r}, and no Model record "
+                "declares it - so the prop would be baked into the cell and "
+                "then draw nothing".format(prop.prop_id, prop.model_ref),
+                record_id=prop.model_ref, cell_id=cell.location_id))
+    return out
 
 
 def check_models(view: Any, manifest: Any = None) -> List[Dict[str, Any]]:
@@ -551,6 +581,7 @@ def lint_world(view: Any, manifest: Any) -> List[Dict[str, Any]]:
     findings.extend(check_spawn_paths(view))
     findings.extend(check_item_placements(view))
     findings.extend(check_models(view, manifest))
+    findings.extend(check_prop_models(view, manifest))
     findings.extend(check_unused_model_assets(manifest, view))
     findings.extend(check_zone_shapes(view))
     findings.extend(check_exterior_grid(view))

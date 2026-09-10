@@ -160,6 +160,9 @@ class ModernGLBackend(RenderBackend):
         self.width = width
         self.height = height
         self.cells: Dict[str, CellBuffers] = {}
+        #: model_ref -> (buffer, vao, vertex count). Shared by every cell that
+        #: places one, which is why it is not inside `CellBuffers`.
+        self.models: Dict[str, Tuple[Any, Any, int]] = {}
         self._program = self.ctx.program(vertex_shader=VERTEX_SHADER,
                                          fragment_shader=FRAGMENT_SHADER)
         self._colour = self.ctx.texture((width, height), 3)
@@ -210,6 +213,18 @@ class ModernGLBackend(RenderBackend):
         if existing is not None:
             _release(existing[0], existing[1])
         self._upload_one_structure(buffers, cell, structure_id)
+
+    # -- shared models -------------------------------------------------------
+    def upload_model(self, mesh: Any) -> None:
+        """One library model, uploaded once however many cells place it."""
+        if mesh.model_ref in self.models or not mesh.vertices:
+            return
+        self.models[mesh.model_ref] = self._make_mesh(mesh.vertices)
+
+    def release_model(self, model_ref: str) -> None:
+        existing = self.models.pop(model_ref, None)
+        if existing is not None:
+            _release(existing[0], existing[1])
 
     def release_cell(self, cell_id: str) -> None:
         buffers = self.cells.pop(cell_id, None)
@@ -347,6 +362,11 @@ class ModernGLBackend(RenderBackend):
     def release(self) -> None:
         for cell_id in list(self.cells):
             self.release_cell(cell_id)
+        # Models too: they are not inside `CellBuffers` precisely because they
+        # outlive any one cell, which also means the cell loop above would have
+        # walked straight past them and leaked every one.
+        for model_ref in list(self.models):
+            self.release_model(model_ref)
         if self._dynamic is not None:
             _release(self._dynamic, self._dynamic_vao)
             self._dynamic = self._dynamic_vao = None

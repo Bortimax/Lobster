@@ -2777,3 +2777,101 @@ The order is now reversed and both are reachable and independently mutable. This
 is the D30 lesson again in a smaller frame — a guard nothing can make fire is a
 comment with a syntax error budget — and it was caught only because every new
 guard in this project gets mutated. Thirteen mutants, thirteen caught.
+
+---
+
+## D48 — Counting references to a shared model, and whose lifetime an item is
+
+ASSET_SCOPE §2 chose per-residency model loading over loading the whole library,
+and said why:
+
+> **Recommend the second**, because it is the one that keeps L6 meaningful, and
+> because the machinery exists: `GpuResidency` already uploads and releases per
+> cell and already has a `drift()` check for exactly the kind of leak a
+> reference count invites.
+
+It then listed five invariants. All five are implemented and each has a test
+named after it. What the scope did not settle is below.
+
+### 1. A reference is per distinct model per cell, not per placement
+
+Fifty barrels in one cell hold **one** reference.
+
+Both schemes balance arithmetically, so this is not a correctness question - it
+is a question of what the number *means*. Per-placement, the count is "how many
+barrels are standing in resident cells", which is a fact about decoration and
+changes when an author adds one. Per-cell-per-model, it is "how many resident
+cells would miss this buffer if it went", which is exactly the question
+`release_model` is asking.
+
+The tiebreak is invariant 5, the one that catches leaks: it is about the *set*
+of live models, not the total, and a set is what a per-cell count produces
+directly.
+
+### 2. Who reads `models.lobster_lib`
+
+**`CellManager`, not the renderer.** It is a geometry build artifact living in
+the bundle directory, and that is the class that owns that directory. Handing
+the renderer a path would put geometry back inside presentation - the L8 mistake
+RENDER_SCOPE §4 avoided by making the backend a *subscriber* to residency rather
+than a caller into it.
+
+**A world with no library loads.** Every world built before step 2 has none, and
+refusing to load a cell over a missing derived artifact would break them all for
+a file that is safe to delete by definition (D1). What is not silent is the
+consequence: `missing_models` counts it and `unresolved_models()` names the
+model *and the cells that asked*, because "a model is missing" answers nobody.
+
+A library that exists and is *corrupt* is the opposite case and raises. An absent
+derived artifact is a world that predates a feature; a corrupt one is a build
+that lied.
+
+### 3. Items: whose lifetime is a placed item's model?
+
+**Deferred to step 5, deliberately, and this is the entry that says so rather
+than leaving a hole.**
+
+A prop is baked into the bundle, so its model is fixed for the cell's whole
+residency - which is what makes a per-cell reference count correct. A placed
+`Item` also carries a `model_ref` (§8, D33), and an item can be picked up
+mid-residency, so its model's lifetime is the *item's* and not the cell's.
+
+Three reasons this is the right place to stop, and not one of them is "it was
+harder":
+
+1. **The software path needs no residency at all** (step 4). It reads the
+   library directly, so items get real geometry there without any of this.
+2. **`DrawItem` does not carry `model_ref` yet.** It gains one in step 4, which
+   is where the question stops being hypothetical.
+3. **The alternative available today is worse.** `on_item_placed` carries
+   `item_id`, `cell_id` and `transform` - not `model_ref` - so counting item
+   models now would mean adding a field to a payload CONTRACT §13 freezes, to
+   serve a draw path that does not exist. D46 already established that the Event
+   surface is not the place to absorb a downstream convenience.
+
+Until then `ResidentCell.model_refs()` documents itself as props-only in the
+docstring rather than in a comment nobody reads, and CONTRACT §7 says the same.
+
+### 4. The third link nothing was checking
+
+Octopus's `dangling_reference` covers `Item.model_ref`, because that is a record
+field in its schema (`lce/lint.py`'s `_REF_FIELDS`). A `PropPlacement` lives in
+the **manifest**, so its `model_ref` had no owner at all, and a typo produced a
+barrel that was baked into a cell and then drew nothing.
+
+`prop_model_ref_unresolved` closes it, and an **empty** `model_ref` is
+deliberately not a fault: a prop with none is the impostor CONTRACT §10 has
+always described, and turning a documented absence into an error would fail
+every world built so far.
+
+### A leak check that could not report a leak
+
+Mutating `drift()` to compute `needed` as `set(self.model_counts)` - comparing
+the counts against themselves - made the model half always agree and **passed
+every test there was.** Two tests now inject a leak and a gap directly and
+assert `drift()` reports each.
+
+Same shape as the reachability bug D47 records one entry earlier, and the same
+lesson: the tests were asserting that the *world* was consistent, which it was,
+rather than that the *check* could tell when it was not. Sixteen mutants,
+sixteen caught.

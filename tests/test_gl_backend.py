@@ -174,6 +174,65 @@ class TestDrawCallsWithNoGpu(BackendFixture):
             self.assertIn(name, self.manager.resident)
 
 
+class TestSharedModelBuffers(unittest.TestCase):
+    """One buffer per model, however many cells place it (ASSET_SCOPE §2).
+
+    Against `RecordingContext`, because "how many buffers were created" is a
+    draw-call assertion and true regardless of driver - the split RENDER_SCOPE
+    §5 exists for.
+    """
+
+    def setUp(self):
+        from tests.fixtures import primitive_library
+        self.ctx = RecordingContext()
+        self.backend = ModernGLBackend(self.ctx, width=8, height=8)
+        self.library = primitive_library()
+        self.before = len([c for c in self.ctx.calls if c.what == "buffer"])
+
+    def buffers(self):
+        return [c for c in self.ctx.calls if c.what == "buffer"][self.before:]
+
+    def test_uploading_the_same_model_twice_makes_one_buffer(self):
+        mesh = self.library.model("model-crate")
+        self.backend.upload_model(mesh)
+        self.backend.upload_model(mesh)
+        self.assertEqual(len(self.buffers()), 1)
+        self.assertEqual(sorted(self.backend.models), ["model-crate"])
+
+    def test_the_buffer_is_the_model_s_own_vertices(self):
+        mesh = self.library.model("model-barrel")
+        self.backend.upload_model(mesh)
+        _buf, _vao, count = self.backend.models["model-barrel"]
+        self.assertEqual(count, mesh.vertex_count())
+        self.assertEqual(self.buffers()[0].detail.get("nbytes"), mesh.nbytes())
+
+    def test_releasing_frees_the_buffer_and_forgets_it(self):
+        self.backend.upload_model(self.library.model("model-crate"))
+        self.backend.release_model("model-crate")
+        self.assertEqual(self.backend.models, {})
+        self.assertTrue([c for c in self.ctx.calls if c.what == "release"])
+
+    def test_releasing_one_that_was_never_uploaded_is_not_an_error(self):
+        self.backend.release_model("model-nothing")
+
+    def test_an_empty_model_is_not_uploaded(self):
+        """A zero-byte buffer is a GL error on some drivers and a model that
+        draws nothing on the rest. The build refuses to write one
+        (`model_meshes_to_nothing`); this is the belt to that brace."""
+        from lobster.model_library import ModelMesh
+        self.backend.upload_model(ModelMesh(model_ref="empty", kind="voxel"))
+        self.assertEqual(self.backend.models, {})
+        self.assertEqual(self.buffers(), [])
+
+    def test_teardown_frees_models_as_well_as_cells(self):
+        """`release()` walks `self.cells`, and models are deliberately not in
+        there - so without their own loop every one would leak."""
+        self.backend.upload_model(self.library.model("model-crate"))
+        self.backend.upload_model(self.library.model("model-sign"))
+        self.backend.release()
+        self.assertEqual(self.backend.models, {})
+
+
 class TestTheMathsIsRight(unittest.TestCase):
     """Matrices, checked against the geometry they are supposed to reproduce."""
 

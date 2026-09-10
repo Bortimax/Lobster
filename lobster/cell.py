@@ -32,10 +32,11 @@ from .budgets import (Budget, BudgetViolation, MemoryLedger, POOL_LIGHTMAP,
                       POOL_METADATA, POOL_NAVMESH, POOL_STRUCTURES,
                       POOL_TERRAIN)
 from .bundle import BundleError, CellBundle, read_bundle
-from .constants import (BUNDLE_SUFFIX, EXTERIOR_CELL_SIZE_M,
+from .constants import (BUNDLE_SUFFIX, EXTERIOR_CELL_SIZE_M, LIBRARY_FILENAME,
                         RESIDENT_RING, SPATIAL_GRID_CELL_M)
 from .events import EventBus
 from .geometry import Transform, Vec3
+from .model_library import ModelLibrary, ModelLibraryError, read_library
 from .navmesh import Navmesh, PatchJob, PatchQueue, recompute_polys
 from .octopus_path import ensure_lce_importable
 from .skeleton import Skeleton
@@ -155,6 +156,27 @@ class ResidentCell:
         self.quarantined: List[Dict[str, Any]] = []
         grid_m = self.location_record.get("spatial_grid_cell_m") or SPATIAL_GRID_CELL_M
         self.index = SpatialIndex(self.cell_id, cell_size_m=float(grid_m))
+
+    # -- models --------------------------------------------------------------
+    def model_refs(self) -> List[str]:
+        """The distinct models this cell's baked geometry references.
+
+        Props only, and that is a boundary rather than an oversight. A prop is
+        decoration baked into the bundle, so its model is fixed for the whole
+        residency - which is what makes reference counting it correct. A placed
+        `Item` also carries a `model_ref`, but an item can be picked up
+        mid-residency, so its lifetime is the item's and not the cell's; that is
+        a separate question and DECISIONS.md D48 says where it gets answered.
+
+        An empty `model_ref` is not a model. A prop with none is the impostor
+        the draw list has always produced, and asking the library for `""` would
+        turn a documented absence into a reported fault.
+        """
+        seen: Dict[str, None] = {}
+        for prop in self.bundle.props:
+            if prop.model_ref:
+                seen.setdefault(prop.model_ref)
+        return sorted(seen)
 
     # -- structures ----------------------------------------------------------
     def structure(self, structure_id: str) -> LiveStructure:
@@ -324,6 +346,7 @@ class CellManager:
         self.resident: Dict[str, ResidentCell] = {}
         self.player_cell: Optional[str] = None
         self._bundle_cache: Dict[str, CellBundle] = {}
+        self._library: Optional[ModelLibrary] = None
 
     # -- paths ---------------------------------------------------------------
     def bundle_path(self, cell_id: str) -> str:
@@ -355,6 +378,38 @@ class CellManager:
                     cell_id, path, bundle.cell_id))
         self._bundle_cache[cell_id] = bundle
         return bundle
+
+    def library_path(self) -> str:
+        return os.path.join(self.bundle_dir, LIBRARY_FILENAME)
+
+    @property
+    def library(self) -> ModelLibrary:
+        """The shared model library, read once and cached.
+
+        Read here rather than by the renderer because it is a *geometry* build
+        artifact living in the bundle directory, and this is the class that owns
+        that directory. The renderer subscribing to residency Events is what
+        keeps presentation out of geometry (RENDER_SCOPE §4); handing it a file
+        path would put geometry back into presentation.
+
+        **A world with no library loads.** Every world built before this feature
+        existed has none, and refusing to load a cell over a missing derived
+        artifact would break them all for a file that is safe to delete by
+        definition (D1). What is *not* silent is the consequence: a model that
+        was referenced and cannot be found is counted and named by
+        `GpuResidency.missing_models`, so the failure is attributable at the
+        moment it matters instead of being a hole in a picture.
+        """
+        if self._library is None:
+            path = self.library_path()
+            if not os.path.exists(path):
+                self._library = ModelLibrary(source_path=path)
+            else:
+                try:
+                    self._library = read_library(path)
+                except ModelLibraryError as e:
+                    raise CellError(str(e)) from e
+        return self._library
 
     # -- residency -----------------------------------------------------------
     def is_exterior(self, view: Any, cell_id: str) -> bool:

@@ -258,6 +258,22 @@ class RenderBackend:
         structure is cheaper than one of the cell.
         """
 
+    def upload_model(self, mesh: Any) -> None:
+        """Hand the backend one library model. Idempotent by `model_ref`.
+
+        Called when the *first* resident cell references it, and not again
+        while any still does. That is the whole point of the library: fifty
+        barrels in a town are fifty placements of one buffer (ASSET_SCOPE §2).
+        """
+
+    def release_model(self, model_ref: str) -> None:
+        """Drop one model's geometry, when the last cell referencing it goes.
+
+        A CPU backend has nothing to drop and may ignore both of these; a GPU
+        one must not, because a model that is never released draws perfectly
+        while the memory grows (D43).
+        """
+
     def attach(self, bus: Any, manager: Any) -> Any:
         """Bind this backend's buffer lifetime to residency (RENDER_SCOPE §4).
 

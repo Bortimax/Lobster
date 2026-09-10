@@ -19,7 +19,7 @@ import tempfile
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from lobster.build.bundle_writer import write_bundle
-from lobster.bundle import CellBundle
+from lobster.bundle import CellBundle, PropPlacement
 from lobster.constants import BUNDLE_SUFFIX, EXTERIOR_CELL_SIZE_M
 from lobster.geometry import Transform
 from lobster.navmesh import LoadBearingTable, NavPoly, Navmesh
@@ -211,6 +211,14 @@ class BundleWorkspace:
         return write_bundle(bundle,
                             os.path.join(self.path, bundle.cell_id + BUNDLE_SUFFIX))
 
+    def write_library(self, library: Any) -> str:
+        """Put a `models.lobster_lib` beside the cells, where the real build
+        puts one."""
+        from lobster.build.library_writer import write_library
+        from lobster.constants import LIBRARY_FILENAME
+        return write_library(library, os.path.join(self.path,
+                                                   LIBRARY_FILENAME))
+
     def close(self) -> None:
         shutil.rmtree(self.path, ignore_errors=True)
 
@@ -247,10 +255,42 @@ def village_bundle(*, gate_polys: Sequence[int] = (3,),
         provenance={"records": [VILLAGE, GATEHOUSE], "manifest_sha256": "fixture"})
 
 
-def plain_bundle(cell_id: str) -> CellBundle:
+def plain_bundle(cell_id: str,
+                 props: Sequence[PropPlacement] = ()) -> CellBundle:
     return CellBundle(cell_id=cell_id, terrain=flat_terrain(cell_id),
-                      navmesh=corridor_navmesh(cell_id),
+                      navmesh=corridor_navmesh(cell_id), props=tuple(props),
                       provenance={"records": [cell_id]})
+
+
+def prop(prop_id: str, model_ref: str,
+         position: Tuple[float, float, float] = (4.0, 0.0, 4.0)
+         ) -> PropPlacement:
+    return PropPlacement(prop_id=prop_id, model_ref=model_ref,
+                         transform=Transform(position=position))
+
+
+#: one legal spec per frozen primitive shape, so a fixture can ask for a model
+#: by name without every test restating the geometry.
+PRIMITIVE_SPECS = {
+    "model-crate": {"shape": "box", "size": [0.8, 0.8, 0.8], "material": 6},
+    "model-barrel": {"shape": "cylinder", "radius": 0.35, "height": 0.9,
+                     "material": 6},
+    "model-sign": {"shape": "quad", "size": [0.6, 0.4], "material": 5},
+}
+
+
+def primitive_library(*model_refs: str) -> Any:
+    """A `ModelLibrary` of real meshed primitives, keyed as `PRIMITIVE_SPECS`.
+
+    Real geometry rather than stubs: residency counts references, and a
+    zero-byte model is exactly the case `upload_model` skips.
+    """
+    from lobster.build.model_mesher import mesh_primitive
+    from lobster.model_library import ModelLibrary
+    refs = model_refs or tuple(PRIMITIVE_SPECS)
+    return ModelLibrary(models={ref: mesh_primitive(ref, PRIMITIVE_SPECS[ref])
+                                for ref in refs},
+                        provenance={"records": sorted(refs)})
 
 
 def standard_workspace() -> BundleWorkspace:

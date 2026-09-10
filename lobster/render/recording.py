@@ -334,6 +334,11 @@ class RecordingBackend:
         self.uploaded: List[str] = []
         self.released: List[str] = []
         self.structure_uploads: List[Tuple[str, str, Tuple[int, ...]]] = []
+        #: every `upload_model` and `release_model`, in order. Lists and not
+        #: sets: "uploaded once" is a claim about how many times, and a set
+        #: cannot tell you that.
+        self.model_uploads: List[str] = []
+        self.model_releases: List[str] = []
         self.frames = 0
 
     @classmethod
@@ -347,6 +352,12 @@ class RecordingBackend:
 
     def release_cell(self, cell_id: str) -> None:
         self.released.append(cell_id)
+
+    def upload_model(self, mesh: Any) -> None:
+        self.model_uploads.append(mesh.model_ref)
+
+    def release_model(self, model_ref: str) -> None:
+        self.model_releases.append(model_ref)
 
     def upload_structure(self, cell: Any, structure_id: str,
                          chunk_indices: Sequence[int]) -> None:
@@ -372,3 +383,15 @@ class RecordingBackend:
 
     def upload_count(self, cell_id: str) -> int:
         return self.uploaded.count(cell_id)
+
+    def live_models(self) -> List[str]:
+        """Uploaded and not released. The backend's own opinion, which is the
+        one worth comparing a refcount against."""
+        out: List[str] = []
+        released = list(self.model_releases)
+        for model_ref in self.model_uploads:
+            if model_ref in released:
+                released.remove(model_ref)
+            else:
+                out.append(model_ref)
+        return sorted(out)

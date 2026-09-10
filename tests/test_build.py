@@ -38,7 +38,7 @@ from lobster.geometry import Transform
 from lobster.navmesh import Navmesh, NavPoly
 from lobster.octopus_bridge import OctopusBridge, content_view
 from lobster.structures import StructureVoxelData
-from tests.fixtures import (BuildWorkspace, cube_vox, demo_manifest_cells,
+from tests.fixtures import (BuildWorkspace, C, cube_vox, demo_manifest_cells,
                             demo_world_ops, slab_vox, write_vox_file)
 
 
@@ -645,6 +645,54 @@ class TestModelKindLint(unittest.TestCase):
         """An art directory mid-iteration is full of them, and failing a build
         for a file nobody wired up yet teaches authors to ignore the linter."""
         self.assertNotIn("model_asset_unused", ERROR_CODES)
+
+
+class TestPropsResolveToModels(unittest.TestCase):
+    """The third link, and the one nothing was checking.
+
+    Octopus's own `dangling_reference` covers `Item.model_ref`, because that is
+    a record field in its schema. A `PropPlacement` lives in the *manifest*, so
+    its ref had no owner at all and a typo produced a barrel that was simply not
+    there - the exact failure ASSET_SCOPE §3 exists to move to build time.
+    """
+
+    def build(self, model_ref, *, declare=True):
+        with BuildWorkspace() as ws:
+            ops = demo_world_ops()
+            if declare:
+                ops = ops + [C("model-crate", "Model", primitive={
+                    "shape": "box", "size": [0.8, 0.8, 0.8], "material": 6})]
+            slab_vox(os.path.join(ws.art, "slab.vox"))
+            cube_vox(os.path.join(ws.art, "cube.vox"))
+            package = ws.write_package("world.props", ops)
+            cells = demo_manifest_cells(props=[
+                {"prop_id": "crate-1", "model_ref": model_ref,
+                 "transform": {"position": [4, 0, 4]}}])
+            path = ws.write_manifest(cells, [package])
+            report = build_from_file(path, out_dir=ws.out, write=False)
+            return [f for f in report.findings
+                    if f["code"] == "prop_model_ref_unresolved"], report
+
+    def test_a_prop_naming_a_model_that_exists_is_clean(self):
+        found, report = self.build("model-crate")
+        self.assertEqual(found, [])
+        self.assertTrue(report.ok(), report.errors())
+
+    def test_a_prop_naming_a_model_nobody_declares_fails_the_build(self):
+        found, report = self.build("model-ghost")
+        self.assertEqual(len(found), 1)
+        self.assertEqual(found[0]["record_id"], "model-ghost")
+        self.assertEqual(found[0]["cell_id"], "cell-a")
+        self.assertIn("crate-1", found[0]["detail"])
+        self.assertFalse(report.ok())
+        self.assertIn("prop_model_ref_unresolved", ERROR_CODES)
+
+    def test_a_prop_with_no_model_at_all_is_not_a_fault(self):
+        """CONTRACT §10: a prop with no model is the impostor the draw list has
+        always produced. Making that an error would fail every world so far."""
+        found, report = self.build("", declare=False)
+        self.assertEqual(found, [])
+        self.assertTrue(report.ok(), report.errors())
 
 
 class TestTheDocumentedLintCodesAreTheRealOnes(unittest.TestCase):
