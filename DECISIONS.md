@@ -660,7 +660,10 @@ that cannot compose is a lie.
 **Decision:**
 
 1. `DEFAULT_MAX_CELL_BYTES = MAX_TRANSITION_PEAK_BYTES // MAX_RESIDENT_CELLS`
-   — 21.3 MiB. A full residency of all-default cells now fits by construction
+   — 21.3 MiB. **Superseded by D51**, which gave the shared model library a
+   share of the same peak: the divisor is now `RESIDENT_MEMORY_SHARES`
+   (`MAX_RESIDENT_CELLS + 1`) and the default is 19.2 MiB. The *argument* below
+   is unchanged and is what forced the recalculation. A full residency of all-default cells now fits by construction
    rather than by anyone remembering. (Shrimp derived 20 MiB independently from
    the same peak, which is the convergence you want.) This is a real change in
    behaviour: content that fit in 48 MiB and not 21 MiB now fails at load rather

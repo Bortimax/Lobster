@@ -41,7 +41,6 @@ from ..bundle import CellBundle, PropPlacement
 from ..constants import (BUNDLE_SUFFIX, EXTERIOR_CELL_SIZE_M,
                          LIBRARY_FILENAME, MAX_MODEL_LIBRARY_BYTES)
 from ..geometry import Transform, Vec3
-from ..model_library import ModelLibrary
 from ..navmesh import LoadBearingTable, Navmesh
 from ..octopus_bridge import content_view
 from ..structures import StructureError, StructureVoxelData

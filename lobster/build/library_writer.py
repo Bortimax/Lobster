@@ -17,7 +17,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Tuple
 
 from ..constants import (LIBRARY_FORMAT, LIBRARY_FORMAT_VERSION,
                          MODEL_PRIMITIVE)
