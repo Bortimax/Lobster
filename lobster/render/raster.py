@@ -30,7 +30,7 @@ from typing import (Any, Dict, Iterable, List, Optional, Sequence, Tuple)
 
 from ..camera import Camera
 from ..geometry import Vec3, add, cross, distance, dot, normalize, scale, sub
-from ..visibility import (DrawList, ENTITY, PROP, STRUCTURE, TERRAIN,
+from ..visibility import (DrawList, ENTITY, ITEM, PROP, STRUCTURE, TERRAIN,
                           build_draw_list)
 
 Colour = Tuple[int, int, int]
@@ -51,6 +51,20 @@ DEFAULT_PALETTE: Tuple[Colour, ...] = (
 
 ENTITY_COLOUR: Colour = (196, 128, 112)
 PROP_COLOUR: Colour = (150, 122, 90)
+
+#: A placed item. Distinct from `PROP_COLOUR` because the things are distinct -
+#: a prop is scenery baked into the bundle, an item is an `Item` record you can
+#: pick up (D36) - and a viewer that cannot tell them apart cannot tell you
+#: whether the sword on the floor is real.
+ITEM_COLOUR: Colour = (206, 190, 120)
+
+#: Impostor dimensions for a placed item. Smaller than a prop's, because a
+#: sword on flagstones is not a barrel. These are *visual* sizes and
+#: deliberately not `ITEM_PICK_RADIUS_M` or `ITEM_DRAW_RADIUS_M`: the pick
+#: radius is how close a ray must pass, the draw radius is a cull bound that
+#: errs large on purpose (D37), and neither is how big the thing looks.
+ITEM_IMPOSTOR_RADIUS_M = 0.18
+ITEM_IMPOSTOR_HEIGHT_M = 0.4
 
 
 @dataclass(frozen=True)
@@ -339,6 +353,19 @@ def render_draw_list(draw_list: DrawList, cells_by_id: Dict[str, Any], *,
                 frame, camera,
                 Capsule(base, (base[0], base[1] + 1.0, base[2]), 0.35),
                 PROP_COLOUR, settings)
+        elif item.kind == ITEM:
+            # Missing entirely until now. `build_draw_list` culled items in and
+            # this dispatch dropped them, so a placed item was pickable,
+            # labellable and invisible - the exact failure D37 claimed to have
+            # prevented, one layer below where that entry looked.
+            from ..geometry import Capsule
+            base = item.center
+            _draw_capsule_impostor(
+                frame, camera,
+                Capsule(base,
+                        (base[0], base[1] + ITEM_IMPOSTOR_HEIGHT_M, base[2]),
+                        ITEM_IMPOSTOR_RADIUS_M),
+                ITEM_COLOUR, settings)
     return frame
 
 

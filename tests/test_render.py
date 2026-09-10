@@ -28,7 +28,9 @@ from lobster.camera import Camera, CameraError
 from lobster.geometry import AABB, Transform, cross, normalize, sub
 from lobster.render import RenderSettings, render_cell, write_png
 from lobster.render.png import encode_png
-from lobster.render.raster import Framebuffer, _clip_near
+from lobster.render.raster import (Framebuffer, ITEM_COLOUR,
+                                   PROP_COLOUR, _clip_near,
+                                   render_draw_list)
 from lobster.cell import CellManager
 from lobster.octopus_bridge import OctopusBridge
 from lobster.skeleton import Skeleton, humanoid_region_set
@@ -360,3 +362,110 @@ class TestPlacedItemsReachTheDrawList(unittest.TestCase):
         from lobster.render import raster
         source = inspect.getsource(raster.render_resident)
         self.assertIn("view=view", source)
+
+
+class TestEveryDrawKindReachesPixels(unittest.TestCase):
+    """The gap that scoping the GPU backend found (RENDER_SCOPE §0).
+
+    `build_draw_list` culled items in and `render_draw_list` had no branch for
+    them, so a placed item was pickable, labellable and **invisible** - which
+    is the precise failure D37 congratulated itself on preventing, one layer
+    below where that entry looked. The dispatch is now pinned against the
+    declared kind set, so adding a sixth kind and forgetting to draw it fails
+    here rather than in somebody's screenshot.
+    """
+
+    def setUp(self):
+        self.session = build_session()
+        self.session.engine.write({"op": "CREATE", "record": {
+            "id": "item-sword", "type": "Item", "display_name": "Sword"}})
+        self.bridge = OctopusBridge(self.session)
+        self.ws = standard_workspace()
+        self.addCleanup(self.ws.close)
+        self.manager = CellManager(self.ws.path, session=self.session)
+        view = self.bridge.frame()
+        self.manager.set_player_cell(view, VILLAGE)
+        self.manager.place_item(view, "item-sword", VILLAGE,
+                                Transform(position=(6.0, 0.4, 8.0)))
+        self.view = self.bridge.frame()
+
+    def frame_with(self, **kwargs):
+        camera = Camera.looking_at((6.0, 1.2, 2.0), (6.0, 0.6, 12.0))
+        cells = [self.manager.resident[c] for c in sorted(self.manager.resident)]
+        settings = RenderSettings(width=160, height=90, **kwargs)
+        draw_list = build_draw_list(camera.with_aspect(settings.aspect()),
+                                    cells,
+                                    placements=self.manager.placements(self.view),
+                                    view=self.view)
+        return draw_list, render_draw_list(
+            draw_list, {c.cell_id: c for c in cells}, settings=settings)
+
+    def test_every_kind_in_the_draw_list_has_a_branch(self):
+        """The structural half: no kind may be silently dropped."""
+        import inspect
+        from lobster.render import raster
+        source = inspect.getsource(raster.render_draw_list)
+        for kind_name in ("TERRAIN", "STRUCTURE", "ENTITY", "PROP", "ITEM"):
+            self.assertIn("item.kind == " + kind_name, source,
+                          "{0} reaches the draw list with no way to be "
+                          "drawn".format(kind_name))
+
+    def test_a_placed_item_actually_changes_pixels(self):
+        """The behavioural half. A branch that exists and paints nothing would
+        satisfy the test above and still be the same bug.
+
+        Measured by rendering the same scene with the item and without and
+        diffing the buffers. An earlier version counted pixels "near" the item
+        colour, which with any usable tolerance also counted the terrain -
+        6,146 of 14,400 - and said nothing. A diff needs no tolerance and does
+        not care about the sun angle.
+        """
+        draw_list, lit = self.frame_with()
+        self.assertIn(ITEM, [i.kind for i in draw_list.items],
+                      "fixture must put an item in the draw list")
+
+        self.manager.remove_item(self.bridge.frame(), "item-sword")
+        self.view = self.bridge.frame()
+        _, without = self.frame_with()
+
+        changed = _differing_pixels(lit, without)
+        self.assertGreater(changed, 0,
+                           "the item is in the draw list and on no pixel")
+        self.assertLess(changed, lit.width * lit.height // 4,
+                        "a sword should not repaint a quarter of the screen - "
+                        "{0} pixels changed, which means something other than "
+                        "the item moved".format(changed))
+
+    def test_the_item_is_drawn_where_it_was_placed(self):
+        """Not merely somewhere. The changed pixels must sit near where the
+        camera projects the item's own position."""
+        draw_list, lit = self.frame_with()
+        entry = next(i for i in draw_list.items if i.kind == ITEM)
+        projected = draw_list.camera.project(entry.center, lit.width, lit.height)
+        self.assertIsNotNone(projected, "fixture must have the item on screen")
+
+        self.manager.remove_item(self.bridge.frame(), "item-sword")
+        self.view = self.bridge.frame()
+        _, without = self.frame_with()
+
+        xs, ys = _changed_bounds(lit, without)
+        self.assertLessEqual(abs((xs[0] + xs[1]) / 2 - projected[0]), 12.0)
+        self.assertLessEqual(abs((ys[0] + ys[1]) / 2 - projected[1]), 12.0)
+
+    def test_items_are_not_drawn_as_props(self):
+        """A viewer that cannot tell them apart cannot tell you whether the
+        sword on the floor is a real one."""
+        self.assertNotEqual(ITEM_COLOUR, PROP_COLOUR)
+
+
+def _differing_pixels(a, b):
+    return sum(1 for y in range(a.height) for x in range(a.width)
+               if a.pixel(x, y) != b.pixel(x, y))
+
+
+def _changed_bounds(a, b):
+    xs = [x for y in range(a.height) for x in range(a.width)
+          if a.pixel(x, y) != b.pixel(x, y)]
+    ys = [y for y in range(a.height) for x in range(a.width)
+          if a.pixel(x, y) != b.pixel(x, y)]
+    return (min(xs), max(xs)), (min(ys), max(ys))
