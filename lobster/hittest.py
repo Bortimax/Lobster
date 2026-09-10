@@ -172,6 +172,21 @@ class HitResult:
 # Seam kernel (DECISIONS.md D26/D28)
 # ---------------------------------------------------------------------------
 
+def _candidate_from(entry: Any, distance_m: float) -> Any:
+    """A `Candidate` rebuilt from an index `Entry` plus a measured distance.
+
+    The volley path gets ids and distances back from a kernel rather than
+    `Candidate` objects, and `_report` wants the snapshot provenance the entry
+    carries - which is the whole point of that provenance existing (Scope
+    §15.10).
+    """
+    from .spatial import Candidate
+    return Candidate(entity_id=entry.entity_id, position=entry.position,
+                     tier=entry.tier, snapshot_seq=entry.snapshot_seq,
+                     snapshot_reason=entry.snapshot_reason,
+                     distance=distance_m)
+
+
 def nearest_region(boxes: Sequence[Tuple[str, Capsule]], origin: Vec3,
                    direction: Vec3, max_distance: float
                    ) -> Tuple[Optional[str], bool]:
@@ -472,6 +487,114 @@ class HitTester:
                 break
         self._charge()
         return out
+
+
+    def resolve_volley(self, view: Any, shots: Sequence[Any], *,
+                       first_hit_only: bool = True) -> List[List["HitResult"]]:
+        """A whole volley in one call. **Equivalent to N `resolve_projectile`s.**
+
+        `shots` are `(origin, direction, max_distance, force, source_id)`
+        tuples; the result is one list of hits per shot, in the same order. A
+        test asserts that equivalence directly, because a faster path that
+        answers differently is not a faster path.
+
+        This is the granularity D26 fixed the accelerator seam at, and the
+        reason is Amdahl: a per-arrow kernel wins the broad phase and hands the
+        win back in dispatch. Three things are shared across the volley and
+        cannot be shared across separate calls:
+
+        1. **The entity table is built once.** Packing the spatial index into a
+           payload is O(entities); doing it per arrow made it O(arrows x
+           entities), which is precisely the population scaling Scope 7 exists
+           to avoid.
+        2. **Each rig's hitboxes are resolved once.** `limb_state` is read once
+           per entity per volley instead of once per entity per arrow. §13
+           permits exactly this - *"never cached beyond the current hit-test or
+           frame"* - and a volley is one frame's worth of hit-testing. A limb
+           severed *by* this volley is not visible to it, which is already true
+           of the per-arrow path: `resolve_projectile` reports, it does not
+           apply damage (L4).
+        3. **The budget is charged once**, against the accumulated counters.
+
+        The kernels come from `lobster.accel`, so this runs on C where the
+        extension is built, on NumPy where it is not, and on the reference
+        where neither is - with the same answers either way (D28).
+        """
+        from .accel import select as _select_accel
+        _name, kernels = _select_accel()
+        segment_query = kernels["segment_query"]
+        nearest = kernels["nearest_region"]
+
+        entries = self._volley_entries()
+        radius = self.broad_margin()
+        boxes_of: Dict[str, Any] = {}
+        out: List[List[HitResult]] = []
+
+        for shot in shots:
+            origin, direction, max_distance, force, source_id = shot
+            self.stats.projectiles += 1
+            end = tuple(origin[i] + direction[i] * max_distance
+                        for i in range(3))
+            found = segment_query({
+                "entries": entries, "start": list(origin), "end": list(end),
+                "radius": radius, "cell_size_m": self.index.cell_size_m,
+                "tiers": [ACTIVE, PROJECTILE]})["hits"]
+            self.index.stats.queries += 1
+            self.index.stats.candidates_considered += len(found)
+
+            hits: List[HitResult] = []
+            for entity_id, distance_m in found:
+                entry = self.index.entry(entity_id)
+                cand = _candidate_from(entry, distance_m)
+                skeleton = _require_rig(self.skeletons, cand,
+                                        self.index.cell_id)
+
+                if entry.tier != ACTIVE:
+                    self.stats.body_tests += 1
+                    body = skeleton.whole_body_capsule()
+                    if not ray_capsule_hit(origin, direction, body,
+                                           max_distance):
+                        continue
+
+                packed = boxes_of.get(entity_id)
+                if packed is None:
+                    limb_state = view.limb_state(entity_id,
+                                                 purpose=HIT_TEST_ONLY)
+                    # Cached in the shape the kernel wants, not just as
+                    # capsules. Re-packing six bones into lists on every
+                    # arrow was the largest remaining per-arrow cost once the
+                    # loops were in C - the marshalling, not the maths.
+                    packed = [[region, list(c.a), list(c.b), c.radius]
+                              for region, c in
+                              skeleton.hitboxes(limb_state=limb_state)]
+                    boxes_of[entity_id] = packed
+
+                self.stats.bone_refinements += 1
+                self.stats.capsule_tests += len(packed)
+                answer = nearest({
+                    "boxes": packed,
+                    "origin": list(origin), "direction": list(direction),
+                    "max_distance": max_distance})
+                region, precise = answer["region"], answer["precise"]
+
+                if entry.tier == ACTIVE and not precise:
+                    continue
+                if region is None:
+                    continue
+                hits.append(self._report(cand, region, force, source_id,
+                                         region_precise=precise,
+                                         pose_version=skeleton.pose_version))
+                if first_hit_only:
+                    break
+            out.append(hits)
+
+        self._charge()
+        return out
+
+    def _volley_entries(self) -> List[List[Any]]:
+        """The spatial index as a kernel payload. Built once per volley."""
+        return [[e.entity_id, list(e.position), e.tier]
+                for e in self.index.entries()]
 
     def _region_for_ray(self, view: Any, entity_id: str, skeleton: Skeleton,
                         origin: Vec3, direction: Vec3, max_distance: float

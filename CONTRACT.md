@@ -68,9 +68,23 @@ residency Events, and `render()` hands back a `GLFrame` that stays on the GPU -
 call `read_pixels()` only for a screenshot. Where there is no GL the chain drops
 to the software rasteriser and everything still works.
 
-The *hit-test* path is still pure Python: fast enough for tools, tests and
-offline builds, not for a 200-arrow volley at 60 FPS. That number is measured
-(D26/D31), not estimated, and the accelerator kernels are not yet wired into it.
+**The hit-test path uses the kernels through `HitTester.resolve_volley`** (D45),
+which takes a whole volley rather than one arrow — the granularity D26 fixed the
+seam at, because a per-arrow kernel wins the broad phase and hands the win back
+in dispatch.
+
+```python
+hits = tester.resolve_volley(view, shots)   # one list per shot, same order
+```
+
+It answers **exactly** what N `resolve_projectile` calls answer — same regions,
+same order, same Events — and a test asserts that, because a faster path that
+answers differently is not a faster path. Measured at 4.7–6.6× the per-arrow
+path, which is 6 arrows per cell per frame becoming 21–38.
+
+The broad phase is no longer the bottleneck: it is 15% of a volley, down from
+64% of a hit-test. `Skeleton.hitboxes` is now ~50%, and it is not behind the
+seam — see D45.
 
 `python -m lobster.cli conformance --impl numpy` runs the differential suite.
 

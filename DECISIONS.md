@@ -2506,3 +2506,91 @@ sufficient for everything else.
 Neither is an argument against the kernel, which is 79x. Both are an argument
 that a native path needs classes of test the pure path never did, and that the
 differential harness - however good - is not one of them.
+
+---
+
+## D45 — The volley path: the seam, finally used
+
+D26 fixed the accelerator seam at **volley** granularity and argued the case in
+the abstract. D40 and D42 built kernels behind it and measured them at 9.6x and
+79x. Nothing called them, and every entry since has had to say so. This is that
+gap closed.
+
+`HitTester.resolve_volley(view, shots)` takes
+`(origin, direction, max_distance, force, source_id)` tuples and returns one
+list of hits per shot.
+
+### The property that had to hold first
+
+> **`resolve_volley(shots)` answers exactly what N `resolve_projectile`s
+> answer** - same regions, same order, same `region_precise`, same snapshot
+> provenance, and the same Events in the same order.
+
+Asserted directly across three world sizes and both `first_hit_only` settings.
+A faster path that answers differently is not a faster path, and none of the
+timings below would matter if that failed.
+
+### What a volley shares that separate calls cannot
+
+1. **The entity table is packed once.** Turning the spatial index into a kernel
+   payload is O(entities); per arrow it would be O(arrows x entities) - the
+   population scaling Scope §7 exists to avoid, reintroduced by the
+   optimisation meant to remove it.
+2. **Each rig's hitboxes are resolved once**, so `limb_state` is read once per
+   entity per volley rather than once per entity per arrow. §13 permits exactly
+   this - *"never cached beyond the current hit-test or frame"* - and a volley
+   is one frame's hit-testing. A limb severed *by* this volley is not visible
+   to it, which is already true per-arrow: `resolve_projectile` reports, it
+   does not apply damage (L4).
+3. **The budget is charged once**, against the accumulated counters. One
+   frame's work, one decision about whether that frame fits.
+
+### What it bought
+
+| | per-arrow | volley | |
+|---|---|---|---|
+| 200 entities, 200 shots | 70.0 ms | **10.7 ms** | 6.6x |
+| 500 entities, 200 shots | 80.2 ms | **16.3 ms** | 4.9x |
+| 1,000 entities, 200 shots | 89.2 ms | **19.1 ms** | 4.7x |
+
+Against the 2 ms frame slice (D27), that is **6 arrows per cell per frame
+becoming 21-38**, depending on crowd density.
+
+### Where the time goes now, which is the useful part
+
+Profiled rather than guessed, twice - the first guess was wrong.
+
+Caching the *packed* capsule lists as well as the capsules made no measurable
+difference, so marshalling was not the bottleneck. The profile named the real
+one:
+
+| | share of a 200-shot volley |
+|---|---|
+| `Skeleton.hitboxes` (six capsules per rig, quaternion maths in Python) | **~50%** |
+| `segment_query` - the C broad-phase kernel | **15%** |
+| everything else | ~35% |
+
+**The broad phase is no longer the problem.** That is the seam working: the
+thing D26 measured at 64% of a hit-test is now 15% of one, and the cost has
+moved to posing rigs.
+
+### What this does not do, and the next kernel it names
+
+`Skeleton.hitboxes` is now the dominant cost and it is **not behind the seam**.
+Accelerating it means a third kernel - pose to capsules - which D26 did not
+scope and which is a larger surface than the two it did: it would take a rig's
+bone hierarchy rather than a flat array. Logged rather than built, with the
+profile above as the argument for whoever picks it up.
+
+Also not built: a **cross-cell** volley. `WorldHitTester.resolve_projectile`
+handles one shot across the resident set (D23); batching that means one payload
+per cell and merging by world distance. The single-cell volley is where the
+measured win is, and the cross-cell path is unchanged and still correct.
+
+### A test-harness mistake, for the second time
+
+A fixture helper called `tester` was collected and run as a test, because
+`unittest` takes any method beginning with "test". The same thing happened
+earlier in this project and was fixed the same way. It is now named
+`make_tester` with a comment saying why, which is the only defence available
+short of not using the word.
