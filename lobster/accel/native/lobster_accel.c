@@ -133,6 +133,10 @@ static PyObject *segment_query(PyObject *self, PyObject *payload)
     PyObject *radius_o = NULL, *tiers_o = NULL;
     PyObject *result = NULL, *hits = NULL, *fast = NULL;
     Hit *found = NULL;
+    /* Declared and initialised before the first `goto done`: jumping over the
+     * initialisation of a scalar leaves it indeterminate, and the cleanup
+     * loops over `count`. */
+    Py_ssize_t count = 0;
     Vec3 start, end;
 
     entries = PyMapping_GetItemString(payload, "entries");
@@ -158,7 +162,6 @@ static PyObject *segment_query(PyObject *self, PyObject *payload)
 
     found = (Hit *)PyMem_Malloc((n ? n : 1) * sizeof(Hit));
     if (!found) { PyErr_NoMemory(); goto done; }
-    Py_ssize_t count = 0;
 
     for (Py_ssize_t i = 0; i < n; ++i) {
         PyObject *row = PySequence_Fast(rows[i], "entry must be a sequence");
@@ -199,8 +202,13 @@ static PyObject *segment_query(PyObject *self, PyObject *payload)
     hits = NULL;
 
 done:
+    /* Release the references taken when the ids were stashed. `Py_BuildValue`
+     * took its own with the "O" format, so the returned list is unaffected -
+     * and without this the kernel leaked exactly one reference per returned
+     * candidate per call, which no differential test can see because every
+     * answer is right and only the memory grows. */
     if (found) {
-        for (Py_ssize_t i = 0; i < 0; ++i) { (void)i; }
+        for (Py_ssize_t i = 0; i < count; ++i) Py_XDECREF(found[i].id);
         PyMem_Free(found);
     }
     Py_XDECREF(hits);
@@ -254,6 +262,10 @@ static PyObject *nearest_region(PyObject *self, PyObject *payload)
                     origin.y + heading.y * max_distance,
                     origin.z + heading.z * max_distance };
 
+    /* Owned, not borrowed. `cells[0]` belongs to `row`, which is released at
+     * the end of each iteration - safe today only because a list of lists
+     * hands `PySequence_Fast` back the same object. Feed this a generator of
+     * tuples and the borrowed pointer would outlive its owner. */
     PyObject *best_hit = NULL, *best_near = NULL;
     double best_along = 0.0, best_gap = 0.0;
 
@@ -279,10 +291,14 @@ static PyObject *nearest_region(PyObject *self, PyObject *payload)
 
         /* Strictly `<`, so the earlier capsule wins a tie. */
         if (gap <= cap_radius && (best_hit == NULL || along < best_along)) {
+            Py_INCREF(cells[0]);
+            Py_XDECREF(best_hit);
             best_hit = cells[0];
             best_along = along;
         }
         if (best_near == NULL || gap < best_gap) {
+            Py_INCREF(cells[0]);
+            Py_XDECREF(best_near);
             best_near = cells[0];
             best_gap = gap;
         }
@@ -297,6 +313,8 @@ static PyObject *nearest_region(PyObject *self, PyObject *payload)
                                best_near ? best_near : Py_None,
                                "precise", Py_False);
     }
+    Py_XDECREF(best_hit);
+    Py_XDECREF(best_near);
 
 done:
     Py_XDECREF(fast);

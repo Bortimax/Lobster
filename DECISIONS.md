@@ -2449,3 +2449,60 @@ them. D26 fixed the seam at **volley** granularity and `resolve_projectile` is
 still per-arrow; wiring a per-call kernel into it would buy the broad-phase win
 and hand back a chunk of it in dispatch. That path is the one remaining piece
 between these numbers and a frame rate.
+
+---
+
+## D43 — Two reference bugs the differential suite could not see
+
+Found by re-reading the C before the first CI run that could actually reach it,
+not by any test that existed.
+
+### The leak
+
+`segment_query` stashed each surviving candidate's id in a C array, taking a
+reference so it would outlive the row it was borrowed from. `Py_BuildValue`
+then took **its own** reference for the returned list, and the stashed one was
+never given back.
+
+> 2,000 calls, 2,000 leaked references. **2,400 differential cases said
+> nothing.**
+
+That is the point worth keeping. D28's harness compares *answers*, and every
+answer here was correct. A kernel can be perfectly conformant and still grow
+memory until the process dies, and no amount of case generation will find it,
+because the property is not about the output at all.
+
+### The dangling borrow
+
+`nearest_region` kept `best_hit` and `best_near` as **borrowed** pointers into a
+row it released at the end of each iteration. Safe today only by accident: a
+list of lists hands `PySequence_Fast` back the same object, so the inner list
+outlives the loop. Hand it a generator of tuples and the winner would be a
+pointer to freed memory - a crash or a wrong region, depending on timing, which
+is the worst possible shape of bug. Both are owned references now.
+
+A third, smaller: `count` was declared *after* several `goto done` statements
+that jump over its initialisation, leaving it indeterminate on the error paths
+the cleanup loop reads. Moved to the top with the other declarations.
+
+### What now covers it
+
+Three tests, and one detail that makes them mean anything: **the strings are
+built at runtime.** Checking a literal like `"head"` proves nothing, because
+interned and immortal strings have a refcount that never moves - a leak and a
+clean run look identical. `"".join(("reg", "ion"))` is neither.
+
+The error path gets its own test, because that is where the stash is
+half-populated when the loop aborts.
+
+### The wider point
+
+This is the second thing C bought that Python could not have had, and the first
+was D41 - a real defect in the reference, found because a second implementation
+made a different consistent choice. The costs are visible in the same place: two
+memory bugs in three hundred lines, both invisible to a suite that had been
+sufficient for everything else.
+
+Neither is an argument against the kernel, which is 79x. Both are an argument
+that a native path needs classes of test the pure path never did, and that the
+differential harness - however good - is not one of them.

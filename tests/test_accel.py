@@ -7,6 +7,8 @@ real alternative**, rather than the reference compared with itself.
 
 from __future__ import annotations
 
+import gc
+import sys
 import unittest
 
 from lobster.accel import (KERNEL_PREFERENCE, PREFERENCE, AccelError,
@@ -244,3 +246,77 @@ class TestTheSeamKeepsItsPromises(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+@unittest.skipUnless(native_present(), "the C extension is not built here")
+class TestTheNativeKernelDoesNotLeak(unittest.TestCase):
+    """The class of bug the differential suite structurally cannot see.
+
+    Every answer can be correct and the memory still grow. The first version of
+    `segment_query` leaked exactly one reference per returned candidate per
+    call - it stashed a borrowed id, took a reference to keep it alive past the
+    row, and never gave it back once `Py_BuildValue` had taken its own. 2,000
+    calls added 2,000 references and 2,400 differential cases said nothing,
+    because they only ever compare answers (D43).
+    """
+
+    def kernels(self):
+        return select("native")[1]
+
+    @staticmethod
+    def fresh(*parts):
+        """A string built at runtime, so it is neither interned nor immortal.
+
+        Checking a literal like "head" proves nothing: its refcount never
+        moves, so a leak and a clean run look identical.
+        """
+        return "".join(parts)
+
+    def test_segment_query_returns_the_references_it_takes(self):
+        from lobster.tiers import ACTIVE
+        ids = [self.fresh("ent", "ity_", str(i)) for i in range(20)]
+        payload = {"entries": [[ids[i], [float(i), 0.0, 0.0], ACTIVE]
+                               for i in range(20)],
+                   "start": [0.0, 0.0, 0.0], "end": [100.0, 0.0, 0.0],
+                   "radius": 5.0, "cell_size_m": 2.5, "tiers": None}
+        kernel = self.kernels()[SEGMENT_QUERY]
+        self.assertTrue(kernel(payload)["hits"], "fixture must return hits")
+
+        before = sys.getrefcount(ids[0])
+        for _ in range(2000):
+            kernel(payload)
+        gc.collect()
+        self.assertLessEqual(sys.getrefcount(ids[0]), before,
+                             "one leaked reference per call per candidate")
+
+    def test_nearest_region_returns_the_references_it_takes(self):
+        struck = self.fresh("reg", "ion_", "struck")
+        nearest = self.fresh("reg", "ion_", "nearest")
+        payload = {"boxes": [[struck, [0.0, 1.0, 0.0], [0.0, 2.0, 0.0], 0.2],
+                             [nearest, [0.0, 0.0, 0.0], [0.0, 1.0, 0.0], 0.3]],
+                   "origin": [0.0, 1.0, -5.0], "direction": [0.0, 0.0, 1.0],
+                   "max_distance": 20.0}
+        kernel = self.kernels()[NEAREST_REGION]
+        before = (sys.getrefcount(struck), sys.getrefcount(nearest))
+        for _ in range(2000):
+            kernel(payload)
+        gc.collect()
+        self.assertLessEqual(sys.getrefcount(struck), before[0])
+        self.assertLessEqual(sys.getrefcount(nearest), before[1])
+
+    def test_an_error_path_leaks_nothing_either(self):
+        """A malformed row aborts mid-loop, after some ids are already stashed.
+        That path has to release them too."""
+        from lobster.tiers import ACTIVE
+        good = self.fresh("good", "_one")
+        payload = {"entries": [[good, [1.0, 0.0, 0.0], ACTIVE],
+                               ["broken", [1.0], ACTIVE]],
+                   "start": [0.0, 0.0, 0.0], "end": [100.0, 0.0, 0.0],
+                   "radius": 5.0, "cell_size_m": 2.5, "tiers": None}
+        kernel = self.kernels()[SEGMENT_QUERY]
+        before = sys.getrefcount(good)
+        for _ in range(2000):
+            with self.assertRaises(Exception):
+                kernel(payload)
+        gc.collect()
+        self.assertLessEqual(sys.getrefcount(good), before)
