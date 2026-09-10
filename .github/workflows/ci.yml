@@ -158,3 +158,127 @@ jobs:
       - name: Differential - numpy vs the reference
         working-directory: lobster
         run: python -m lobster.cli conformance --impl numpy
+
+  llvmpipe:
+    # D29's **middle tier**, exercised for real. Mesa gives a genuine OpenGL
+    # context with no GPU anywhere, through EGL and with no display server -
+    # which is the case the first probe got wrong by reporting "no OpenGL" and
+    # dropping two tiers (D39).
+    #
+    # This is also the only job that runs the GL backend's real-hardware tests
+    # somewhere other than the author's desk. `has_gpu()` is "is there an
+    # OpenGL context", not "is there silicon", so llvmpipe runs them.
+    name: ubuntu · llvmpipe (GL with no GPU)
+    runs-on: ubuntu-latest
+    env:
+      # Force Mesa's software rasteriser even if the runner ever grows a GPU,
+      # so this job keeps testing the tier it is named after.
+      LIBGL_ALWAYS_SOFTWARE: "1"
+      GALLIUM_DRIVER: llvmpipe
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: lobster
+
+      - name: Octopus access
+        run: |
+          if [ -z "${{ secrets.OCTOPUS_TOKEN }}" ]; then
+            echo "::error title=OCTOPUS_TOKEN is not set::Lobster imports lce from Bortimax/Octopus, which is private. Add a token with read access to that repo as the OCTOPUS_TOKEN secret on this repository (Settings -> Secrets and variables -> Actions). Making Octopus public would also work."
+            exit 1
+          fi
+        shell: bash
+
+      - name: Check out Octopus
+        uses: actions/checkout@v4
+        with:
+          repository: Bortimax/Octopus
+          path: octopus
+          token: ${{ secrets.OCTOPUS_TOKEN || github.token }}
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Mesa
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends             libgl1 libegl1 libgl1-mesa-dri libglapi-mesa
+
+      - name: Python deps
+        run: python -m pip install --upgrade pip setuptools moderngl numpy
+
+      - name: Report what GL is here
+        working-directory: lobster
+        run: |
+          python -c "from lobster.render.backend import gl_probe; r,d = gl_probe(); print('renderer:', r); print('detail  :', d)"
+
+      - name: It must be software GL, and the middle tier
+        # Failing rather than skipping is the point. A job that quietly fell
+        # back to the pure-Python rasteriser would report success while
+        # testing none of what it exists for.
+        working-directory: lobster
+        run: |
+          python - <<'PY'
+          from lobster.render import probe, select_backend
+          from lobster.render.backend import gl_probe
+          renderer, detail = gl_probe()
+          assert renderer is not None, "no GL context: " + detail
+          chosen = select_backend().name
+          print("renderer:", renderer, "| chosen:", chosen)
+          assert chosen == "moderngl-llvmpipe", (
+              "expected the software-GL tier, got %r - if this is a hardware "
+              "renderer the job is not testing llvmpipe" % chosen)
+          PY
+
+      - name: Suite
+        working-directory: lobster
+        run: python -m unittest discover -s tests -t .
+
+      - name: The GL backend's hardware tests must have run, not skipped
+        working-directory: lobster
+        run: |
+          python -m unittest tests.test_gl_backend -v 2>&1 | tee /tmp/gl.log
+          if grep -q "no OpenGL on this machine" /tmp/gl.log; then
+            echo "::error::the real-hardware GL tests skipped on a machine that has GL"
+            exit 1
+          fi
+
+      - name: Draw a frame and prove it is not blank
+        working-directory: lobster
+        run: |
+          python - <<'PY'
+          from lobster.camera import Camera
+          from lobster.cell import CellManager
+          from lobster.events import EventBus
+          from lobster.octopus_bridge import OctopusBridge
+          from lobster.render import RenderSettings, write_png
+          from lobster.render.gl_backend import ModernGLBackend
+          from lobster.render.residency import GpuResidency
+          from lobster.visibility import build_draw_list
+          from tests.fixtures import VILLAGE, build_session, standard_workspace
+
+          W, H = 320, 180
+          s = build_session(); b = OctopusBridge(s); ws = standard_workspace()
+          bus = EventBus(); m = CellManager(ws.path, bus=bus, session=s)
+          backend = ModernGLBackend(width=W, height=H)
+          GpuResidency(backend, m).attach(bus)
+          v = b.frame(); m.set_player_cell(v, VILLAGE)
+          cam = Camera.looking_at((64.0, 6.0, 12.0), (64.0, 0.0, 150.0))
+          st = RenderSettings(width=W, height=H)
+          cells = [m.resident[c] for c in sorted(m.resident)]
+          dl = build_draw_list(cam.with_aspect(st.aspect()), cells,
+                               placements=m.placements(v), view=v)
+          px = backend.render(dl, {c.cell_id: c for c in cells}, st).read_pixels()
+          colours = {tuple(px[i:i+3]) for i in range(0, len(px), 3)}
+          assert len(colours) > 1, "the frame is one flat colour - nothing drew"
+          assert tuple(st.background) in colours, "no sky - the frame is wrong"
+          write_png("llvmpipe_frame.png", W, H, px)
+          print("distinct colours:", len(colours))
+          ws.close()
+          PY
+
+      - name: Keep the frame
+        uses: actions/upload-artifact@v4
+        with:
+          name: llvmpipe-frame
+          path: lobster/llvmpipe_frame.png
