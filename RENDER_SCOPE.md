@@ -1,6 +1,6 @@
 # Render scope — the GPU backend
 
-**Status: scoped, not built.** This is the document D22 has owed since it named
+**Status: built** (steps 1-4; `read_pixels` landed with step 4). Kept as the record of what was decided and why. This is the document D22 has owed since it named
 ModernGL and wrote none of it. It exists because the seam is small and the
 *decisions around* it are not.
 
@@ -224,8 +224,8 @@ draw-list construction or any geometry, all of which are already covered.
    `render/residency.py`; the backend subscribes to `on_enter_cell`,
    `on_exit_cell` and `on_structure_damaged`, `CellManager` learns nothing, and
    `drift()` reports any disagreement between the GPU and the resident set.
-4. **The backend itself**: shaders, buffer packing, draw loop. ← *next*
-5. **`read_pixels`**, and a screenshot compared by eye.
+4. ~~**The backend itself**~~ — **done**. `render/gl_backend.py`.
+5. ~~**`read_pixels`**~~ — **done**, and screenshots inspected by eye, which found the flipped image and the black sky.
 6. **CI**: the accelerated matrix gains an llvmpipe job on Linux — Mesa is one
    `apt` line, and it exercises the real GL path with no GPU present.
 

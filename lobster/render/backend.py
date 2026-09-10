@@ -117,6 +117,39 @@ _CONTEXT_ATTEMPTS: Tuple[Tuple[str, Dict[str, Any]], ...] = (
 )
 
 
+#: Memoised, and that is a correctness fix rather than a speed one.
+#:
+#: `gl_probe` creates a standalone context and releases it. Doing that while a
+#: backend is **rendering** tears the live context out from under it: the first
+#: frame after a probe came back entirely black, on real hardware, because
+#: `render_resident` -> `select_backend` -> `probe` ran between two reads of a
+#: framebuffer that was perfectly good a moment earlier.
+#:
+#: Probing once is also simply correct: which GL is installed does not change
+#: during a process, so the second answer could only ever be the first one
+#: again - bought with a context creation and a teardown.
+_PROBE_CACHE: List[Tuple[Optional[str], str]] = []
+
+
+def prime_gl_probe(renderer: Optional[str], detail: str) -> None:
+    """Record what GL is, from a context somebody already made.
+
+    Memoising alone was not enough: in a fresh process the first `probe()` is
+    still a *first* call, so a backend that starts rendering and only later
+    triggers a probe still gets its context torn down. A live context already
+    knows its own `GL_RENDERER`, so `ModernGLBackend` primes this on creation
+    and no probe ever needs to build a second one.
+    """
+    if not _PROBE_CACHE:
+        _PROBE_CACHE.append((renderer, detail))
+
+
+def forget_gl_probe() -> None:
+    """Drop the memoised answer. For tests, and for a caller that has just
+    installed a driver and wants to be believed."""
+    del _PROBE_CACHE[:]
+
+
 def gl_probe() -> Tuple[Optional[str], str]:
     """`(GL_RENDERER, detail)` - what GL is here, or None and why not.
 
@@ -140,6 +173,14 @@ def gl_probe() -> Tuple[Optional[str], str]:
     pretended about; what *is* exercised is everything downstream of this, which
     takes the result as an argument (`probe_with`).
     """
+    if _PROBE_CACHE:
+        return _PROBE_CACHE[0]
+    answer = _gl_probe_uncached()
+    _PROBE_CACHE.append(answer)
+    return answer
+
+
+def _gl_probe_uncached() -> Tuple[Optional[str], str]:
     try:
         import moderngl                      # type: ignore
     except Exception as exc:
@@ -245,12 +286,17 @@ def _software_backend():
 
 
 def _gl_backend():
-    """The chosen GPU answer (D22). Not implemented yet - see module docstring.
+    """The chosen GPU answer (D22), and now written.
 
     Both GL tiers load this: llvmpipe is a driver under the same code, not a
-    second renderer.
+    second renderer, which is why the two tiers differ only in what
+    `GL_RENDERER` came back as.
     """
-    return None
+    try:
+        from .gl_backend import ModernGLBackend
+    except Exception:
+        return None
+    return ModernGLBackend
 
 
 HARDWARE_GL = "moderngl"
@@ -263,8 +309,7 @@ _CANDIDATES = ((HARDWARE_GL, _gl_backend),
                (PYTHON_RASTER, _software_backend))
 
 _UNIMPLEMENTED = (
-    "the seam is defined and ModernGL is the chosen GPU backend "
-    "(DECISIONS.md D22), but it has not been written against real hardware yet")
+    "the moderngl package is not importable, so the GL backend cannot load")
 
 
 def probe_with(renderer: Optional[str],

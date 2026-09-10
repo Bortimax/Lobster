@@ -26,7 +26,8 @@ from lobster.build.terrain_mesher import (ColumnField, flat_column_field,
                                           mesh_terrain)
 from lobster.camera import Camera, CameraError
 from lobster.geometry import AABB, Transform, cross, normalize, sub
-from lobster.render import RenderSettings, render_cell, write_png
+from lobster.render import (RenderSettings, SoftwareBackend, render_cell,
+                            write_png)
 from lobster.render.png import encode_png
 from lobster.render.raster import (Framebuffer, ITEM_COLOUR,
                                    PROP_COLOUR, _clip_near,
@@ -145,7 +146,7 @@ class TestNearPlaneClipping(unittest.TestCase):
         the screen."""
         cell = _FakeCell(mesh_terrain("c", flat_column_field(24)))
         camera = Camera.looking_at((12.0, 3.0, 12.0), (20.0, 1.0, 20.0))
-        frame = render_cell(camera, cell,
+        frame = render_cell(camera, cell, backend=SoftwareBackend(),
                             settings=RenderSettings(width=160, height=90))
         self.assertGreater(frame.coverage(), 0.25,
                            "the ground was dropped for crossing the near plane")
@@ -236,7 +237,7 @@ class TestRasteriser(unittest.TestCase):
     def test_it_actually_draws(self):
         cell = _FakeCell(mesh_terrain("cell-fake", flat_column_field(24)))
         camera = Camera.looking_at((12.0, 4.0, 2.0), (12.0, 1.0, 18.0))
-        frame = render_cell(camera, cell,
+        frame = render_cell(camera, cell, backend=SoftwareBackend(),
                             settings=RenderSettings(width=160, height=90))
         self.assertGreater(frame.pixels_written, 0)
         self.assertGreater(frame.coverage(), 0.1)
@@ -245,7 +246,8 @@ class TestRasteriser(unittest.TestCase):
         cell = _FakeCell(mesh_terrain("cell-fake", flat_column_field(24)))
         settings = RenderSettings(width=64, height=36)
         camera = Camera.looking_at((12.0, 6.0, 0.0), (12.0, 20.0, -200.0))
-        frame = render_cell(camera, cell, settings=settings)
+        frame = render_cell(camera, cell, settings=settings,
+                            backend=SoftwareBackend())
         self.assertEqual(frame.coverage(), 0.0)
         self.assertEqual(frame.pixel(0, 0), settings.background)
 
@@ -271,9 +273,10 @@ class TestRasteriser(unittest.TestCase):
         camera = Camera.looking_at((12.0, 2.0, 10.0), (12.0, 1.8, 14.0))
         settings = RenderSettings(width=120, height=90, draw_entities=True)
 
-        with_entity = render_cell(camera, cell, settings=settings).pixels_written
+        with_entity = render_cell(camera, cell, settings=settings,
+                                  backend=SoftwareBackend()).pixels_written
         without = render_cell(
-            camera, cell,
+            camera, cell, backend=SoftwareBackend(),
             settings=RenderSettings(width=120, height=90,
                                     draw_entities=False)).pixels_written
         self.assertGreater(with_entity, without,

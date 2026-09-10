@@ -124,6 +124,7 @@ class TestExteriorPlacement(unittest.TestCase):
             manager.set_player_cell(view, VILLAGE)
             camera = Camera.looking_at((60.0, 30.0, -30.0), (60.0, 0.0, 60.0))
             frame = render_resident(camera, manager, view,
+                                    backend=SoftwareBackend(),
                                     settings=RenderSettings(width=160,
                                                             height=90))
             self.assertGreater(frame.pixels_written, 0)
@@ -180,16 +181,37 @@ class TestRenderBackends(unittest.TestCase):
             self.assertTrue(info.detail,
                             "a backend that cannot run must say why")
 
-    def test_selection_falls_back_to_software_here(self):
-        """No GPU, no display: the fallback is the whole point."""
-        self.assertEqual(select_backend().name, "software")
+    def test_selection_takes_the_best_tier_that_can_run(self):
+        """Machine-independent, deliberately.
+
+        This used to assert `"software"`, which encoded "there is no GPU here"
+        as a fact about the world. It stopped being true the moment the GL
+        backend was written and a driver turned up (D44), and a test that has
+        to be edited when the hardware changes was testing the hardware.
+        """
+        infos = {i.name: i for i in probe()}
+        chosen = select_backend().name
+        self.assertTrue(infos[chosen].available,
+                        "selected a tier that reports itself unavailable")
+        order = ["moderngl", "moderngl-llvmpipe", "software"]
+        for better in order[:order.index(chosen)]:
+            self.assertFalse(infos[better].available,
+                             "{0} could have run and was skipped".format(better))
 
     def test_asking_for_a_backend_that_cannot_run_raises(self):
         """Silently handing back a Python rasteriser to somebody who asked for
-        the GPU would draw the right picture and blame the wrong thing."""
+        the GPU would draw the right picture and blame the wrong thing.
+
+        Asks for whichever tier genuinely cannot run here rather than naming
+        one: on a box with a real GPU that is the llvmpipe tier, on a bare one
+        it is both GL tiers, and the property is the same either way.
+        """
+        unavailable = [i.name for i in probe() if not i.available]
+        self.assertTrue(unavailable,
+                        "every tier can run here, so this cannot be tested")
         with self.assertRaises(BackendError) as ctx:
-            select_backend("moderngl")
-        self.assertIn("moderngl", str(ctx.exception))
+            select_backend(unavailable[0])
+        self.assertIn(unavailable[0], str(ctx.exception))
         self.assertIn("cannot run here", str(ctx.exception))
 
     def test_an_unknown_backend_lists_what_there_is(self):
@@ -200,16 +222,15 @@ class TestRenderBackends(unittest.TestCase):
     def test_the_chosen_backend_carries_why_the_better_ones_were_skipped(self):
         """Silent fallback is how somebody spends an afternoon profiling the
         wrong layer (D29). The chain travels with the backend."""
-        backend = select_backend()
-        report = backend.selection
-        self.assertEqual(report.chosen, "software")
+        report = select_backend().selection
+        order = ["moderngl", "moderngl-llvmpipe", "software"]
         self.assertEqual([name for name, _ in report.skipped],
-                         ["moderngl", "moderngl-llvmpipe"])
+                         order[:order.index(report.chosen)],
+                         "the skipped list must be exactly the tiers above the "
+                         "one chosen, in order")
         for _name, reason in report.skipped:
             self.assertTrue(reason, "a skipped tier must say why")
-        self.assertEqual(
-            report.summary(),
-            "moderngl unavailable -> moderngl-llvmpipe unavailable -> software")
+        self.assertTrue(report.summary().endswith(report.chosen))
 
 
 class TestTheThreeTierChain(unittest.TestCase):
@@ -345,10 +366,12 @@ class TestHeadlessIsNotTheSameAsNoGL(unittest.TestCase):
         self.assertIn("software-rasterised", infos["moderngl"].detail)
         self.assertIn("llvmpipe", infos["moderngl-llvmpipe"].detail)
         report = selection_report(infos=list(infos.values()))
-        self.assertEqual(report.chosen, "software",
-                         "the GL backend is still unwritten (D22), so it falls "
-                         "through - but the tier it *would* take is reported")
-        self.assertNotIn("no OpenGL", report.skipped[1][1],
+        self.assertEqual(report.chosen, "moderngl-llvmpipe",
+                         "a headless Mesa box lands on the middle tier - which "
+                         "is what that tier exists for, and what the old probe "
+                         "would have missed entirely")
+        self.assertEqual([n for n, _ in report.skipped], ["moderngl"])
+        self.assertNotIn("no OpenGL", report.skipped[0][1],
                          "this machine has OpenGL; saying otherwise sends "
                          "somebody to install a driver they already have")
 

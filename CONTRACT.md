@@ -62,10 +62,15 @@ They are still **not wired into `HitTester`**: D26 fixed the seam at *volley*
 granularity, and that path is the remaining work between these kernels and a
 frame-rate difference.
 
-The GPU backend (D22/D29) still names its chosen answer and reports itself
-unimplemented rather than pretending. Today the runtime path is pure Python
-everywhere: fast enough for tools, tests and offline builds, not for a 200-arrow
-volley at 60 FPS. That number is measured (D26/D31), not estimated.
+**The GPU backend is written** (D44). `select_backend()` returns it wherever
+there is OpenGL, geometry is uploaded once per cell residency through the
+residency Events, and `render()` hands back a `GLFrame` that stays on the GPU -
+call `read_pixels()` only for a screenshot. Where there is no GL the chain drops
+to the software rasteriser and everything still works.
+
+The *hit-test* path is still pure Python: fast enough for tools, tests and
+offline builds, not for a 200-arrow volley at 60 FPS. That number is measured
+(D26/D31), not estimated, and the accelerator kernels are not yet wired into it.
 
 `python -m lobster.cli conformance --impl numpy` runs the differential suite.
 
@@ -696,7 +701,7 @@ frame = render_resident(camera, manager, view,
 
 | tier | what it is | what to expect |
 |---|---|---|
-| `moderngl` | OpenGL 3.3+ on a real GPU | **the default and the target.** 60 FPS on a 128 m cell with destructible geometry, and the battery-efficient path on a phone |
+| `moderngl` | OpenGL 3.3+ on a real GPU | **the default and the target**, and now written. Measured at 0.10 ms/frame against the software path's 302 ms on the same scene |
 | `moderngl-llvmpipe` | the same GL code on Mesa's software rasteriser | **fast enough for development and many tests.** Not player-facing — do not benchmark against it |
 | `software` | the pure-Python rasteriser | correct pixels for a screenshot, a debug overlay, or a CI oracle. Slow, and viable everywhere |
 
