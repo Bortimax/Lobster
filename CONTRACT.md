@@ -37,12 +37,21 @@ truth about semantics, but editing it does not change what executes. Both paths
 are held to the same answers by differential tests, with a declared float
 tolerance and a named authority where they differ. See DECISIONS.md D26.
 
-**Neither native path is written yet.** The GPU backend (D22) and the arithmetic
-accelerator (D26) both name their chosen answer and both report themselves as
-unimplemented rather than pretending. Today Lobster runs pure Python everywhere,
-and it is fast enough for tools, tests and offline builds — not for a 200-arrow
-volley at 60 FPS. That number is measured and recorded in D26 rather than
-estimated.
+**The arithmetic accelerator exists; the GPU backend does not.**
+`lobster/accel/` holds NumPy kernels for the broad phase, proven against the
+reference by 2,000 differential cases and **7–9.5× faster**. They are not yet
+wired into `HitTester`, because D26 fixed the seam at *volley* granularity and
+the per-arrow path would pay the speed back in dispatch — the refinement kernel
+measured 2.3× *slower* at six bones, which is that same argument one level down.
+So selection is per kernel (`accel.KERNEL_PREFERENCE`) and reports itself as
+`numpy+python` rather than overclaiming.
+
+The GPU backend (D22/D29) still names its chosen answer and reports itself
+unimplemented rather than pretending. Today the runtime path is pure Python
+everywhere: fast enough for tools, tests and offline builds, not for a 200-arrow
+volley at 60 FPS. That number is measured (D26/D31), not estimated.
+
+`python -m lobster.cli conformance --impl numpy` runs the differential suite.
 
 ---
 

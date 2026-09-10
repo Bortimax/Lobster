@@ -2219,3 +2219,90 @@ messages. Six tests, none of which need a GPU.
 tier logic specifically so the branches this machine cannot take are still
 testable - and the defect turned out to be in the four lines that seam left
 uncovered, which is the honest place for a defect to be.
+
+---
+
+## D40 — An accelerator behind the seam, and what measuring it changed
+
+**Assigned by the project owner**: the native kernels are mine to write, not a
+library away.
+
+### The toolchain question, answered by looking
+
+D26 deliberately named no toolchain. Checked, this machine has **none**:
+
+```
+rustc  absent   cargo  absent   cl  absent
+gcc    absent   g++    absent   clang absent   cmake absent
+Cython absent   pybind11 absent
+```
+
+So Rust + PyO3, C++ + pybind11 and Cython are all unbuildable here, and writing
+one would ship code that has never executed a line — the failure mode D22 exists
+to name, invoked four times in this log already. I am not doing it.
+
+**NumPy is installed** (2.3.1, SSE/AVX baseline), and it is a compiled C
+extension that releases the GIL inside its array loops. It satisfies what D26
+actually specified — an optional native path behind a declared seam, absent
+without drama — and unlike the alternatives it can be **run, measured and
+differentially tested today**. So that is the implementation that exists.
+
+A Rust or C++ kernel remains open. It needs a toolchain installed, not a
+decision made.
+
+### D26's third condition, discharged
+
+> **(a) Differential testing, not shared test coverage.** Both paths, same
+> inputs, asserted agreement.
+
+D28 built the harness and admitted it was comparing Python with Python. There
+are now two genuinely different implementations, and the harness earned its
+keep: **2,000 generated cases across five seeds, zero divergences**, with the
+committed vectors clean and `lobster conformance --impl numpy` exiting 0.
+
+Everything D28 asserted about *itself* — the mutation tests, the declared
+tolerance, the boundary and tie latitudes — was written for this moment, and it
+worked first time on the maths. The one bug was mine and structural, not
+numerical: `r = p1 - p2` is a column of vectors when there are many capsules, so
+the reference's scalar `c` is a column too. The first draft treated it as a
+float and numpy refused the shape outright rather than returning a wrong number
+— the good kind of failure.
+
+### The measurement changed the design
+
+| kernel | reference | numpy | |
+|---|---|---|---|
+| `segment_query`, 10 entities | 260 µs | 35 µs | **7.4×** |
+| `segment_query`, 1,000 | 3,321 µs | 349 µs | **9.5×** |
+| `segment_query`, 5,000 | 16,279 µs | 1,954 µs | **8.3×** |
+| `nearest_region`, 6 bones | 46 µs | 107 µs | **0.43×** |
+
+**NumPy loses the refinement by 2.3×**, and that is the finding worth keeping. A
+rig has six bones; building six arrays costs more than looping over six
+capsules. This is **D26's own seam-granularity argument arriving one level down
+than it was aimed**: D26 rejected a per-`dot()` kernel because FFI crossings
+would swamp the work, and a per-call kernel over six items fails for the same
+reason with a different constant.
+
+So selection is **per kernel, not per implementation** (`KERNEL_PREFERENCE`).
+Taking either side wholesale would be slower than the mix. `select()` returns
+`"numpy+python"` rather than `"numpy"`, because a log line claiming the fast
+path when half of it is the reference would send somebody to the wrong
+conclusion — the same discipline as D29's fallback chain.
+
+`nearest_region` would pay off **batched across many targets at once**, which is
+precisely the volley shape D26 specified and which is still not built. Until it
+is, the reference wins that half on merit rather than by default.
+
+### What is and is not integrated
+
+The kernels sit behind the seam and are proven against it. They are **not yet
+wired into `HitTester`**: D26 fixed the seam at *volley* granularity, and
+`resolve_projectile` still calls the per-arrow path. Wiring a per-call kernel in
+would buy the 9.5× on the broad phase and pay it back in dispatch, which is the
+mistake this entry just measured. The volley path is the next piece of work and
+it is now the only thing between these kernels and a frame-rate difference.
+
+**L7 still holds.** Nothing outside `lobster/accel/` imports numpy, and a test
+walks the tree to keep it that way — the shell drags in no dependency even
+though one is installed and used.

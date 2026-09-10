@@ -292,13 +292,24 @@ def cmd_conformance(args: argparse.Namespace) -> int:
     path = args.vectors or os.path.join(
         os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
         "conformance", "vectors.json")
+    from . import accel
     cases, expected = conf.load_vectors(path)
-    divergences = conf.compare(cases, expected, conf.run(cases))
+    if args.impl:
+        impl_name, kernels = accel.select(args.impl)
+        divergences = conf.compare(cases, expected, conf.run(cases, impl=kernels))
+    else:
+        impl_name, _ = accel.select()
+        divergences = conf.compare(cases, expected, conf.run(cases))
+        impl_name = "python"
     _emit({"vectors": path,
            "cases": len(cases),
            "kernels": list(conf.SEAM_KERNELS),
            "authority": conf.AUTHORITY,
+           "compared": impl_name,
            "distance_tolerance_m": conf.DISTANCE_TOLERANCE_M,
+           "accelerators": accel.available(),
+           "kernel_preference": {k: list(v) for k, v
+                                 in accel.KERNEL_PREFERENCE.items()},
            "divergences": [d.to_dict() for d in divergences]})
     return 1 if divergences else 0
 
@@ -428,6 +439,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--vectors", default=None,
                    help="vector file to check against (default: the committed "
                         "conformance/vectors.json)")
+    p.add_argument("--impl", default=None,
+                   help="compare this accelerator against the reference "
+                        "(e.g. numpy); default checks the reference itself")
     p.add_argument("--emit-vectors", action="store_true",
                    help="print regenerated vectors to stdout (redirect to "
                         "conformance/vectors.json to update them)")
