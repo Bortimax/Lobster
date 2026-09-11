@@ -381,6 +381,57 @@ and put a mod-placed sword straight back on its table — and where the item
 
 See DECISIONS.md D33 and D35.
 
+### Completing a destruction
+
+Destroying a chunk is synchronous; making the world agree about it is not, and
+the second half is **one call**:
+
+```python
+manager.damage_structure(view, cell_id, structure_id, chunks, writer=writer)
+...
+manager.pump_navmesh(view, max_jobs=4)     # in the game loop, not the hit path
+```
+
+`damage_structure` removes the voxels, records the destruction, and *queues* a
+navmesh patch if the chunk was inferred load-bearing. The affected polygons go
+dirty immediately, so pathing routes around them or holds.
+
+`pump_navmesh` finishes the job, and finishing it is two things rather than one:
+it recomputes the dirty polygons, and then it **re-checks the connections that
+cross them** and severs what the geometry says is gone. `view` is required
+because the second half cannot be done without one — a patch that only did the
+first half is the state review L3 found, where the navmesh knew the bridge was
+gone and Octopus still said you could walk it (D58).
+
+Each returned job carries what was reconciled:
+
+```python
+job["reconciled"]["checked"]     # cells re-checked against their navmesh
+job["reconciled"]["severed"]     # connections geometry says are gone
+job["reconciled"]["unchecked"]   # [{"cell_id": ..., "reason": ...}]
+job["reconciled"]["applied"]     # False if this manager holds no session
+```
+
+**`unchecked` is not an error and must not be ignored.** §10.3 bounds the
+recompute to the resident ring, so an affected neighbour that is not loaded has
+no navmesh to ask. It is named with a reason rather than skipped, because a gap
+reported as nothing is indistinguishable from a clean bill of health.
+
+Severing needs a session: `CellManager(dir, session=session)`. Without one the
+verdicts are still computed and returned — each severance carries its `ops` —
+but nothing is written, and `applied` is `False`.
+
+**Loading a cell does the same check.** Break state saved by an earlier session
+reaches the navmesh on load, so the graph is re-checked on load too. A player
+who collapses a bridge, quits, and comes back does not find the connection
+standing.
+
+The severance rule itself is unchanged and deliberately conservative: a
+connection is cut only when the navmesh, *fully recomputed*, says the door
+cannot be reached. A cell with no walkable polygon to stand in has **no
+opinion** rather than severing everything — geometry that reports nobody can
+stand anywhere is a problem with the geometry, not evidence about its doors.
+
 ### Damaging many structures at once
 
 For an offscreen siege — a town that is not resident gets a computed outcome and

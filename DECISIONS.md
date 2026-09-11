@@ -3932,3 +3932,159 @@ That is the fifth, sixth and seventh time (D49, D52, D54, D55, and three here).
 The rule stated at D55 - *a test whose subject can be absent must assert that it
 is present* - needs a companion: **a test whose baseline can move must hold the
 baseline still.**
+
+---
+
+## D58 — Five review findings, and what each of them was really about
+
+An external review of the implementation raised five findings against
+`af345fc`, each with a reproduction. **All five reproduced exactly as
+described** before anything was changed, which is the only reason the rest of
+this entry is worth reading: the interesting part is not that they were fixed,
+it is what each one turned out to be underneath.
+
+### L5 — a bridge that drifted from the thing it bridges
+
+`occupants_in_blast` read `character_id` or `id`. Octopus produces neither: an
+occupant is a `resolve_npc_state` result and is keyed `npc_id`, which `lce`
+itself reads that way in four places. So a zone full of villagers came back as a
+list of `None` **of the right length**.
+
+That length is the whole problem. A caller targeting ordinary Events at the
+advertised list applies nothing to everybody and nothing raises. A nameless
+occupant now raises instead of joining the list: a blast that reports a
+casualty it cannot name is worse than one that stops, because the Event it
+feeds goes somewhere and a nameless target is not somewhere.
+
+The old test asserted `isinstance(occupants, list)` against a fixture that
+scheduled nobody. It was a test of `list`.
+
+### L4 — the ordinary case mistaken for the exotic one
+
+Portals wrote a scalar `connection_target` per polygon, so the second door on a
+polygon erased the first. Greedy meshing merges a flat room into **one**
+rectangle, so a room with two exits has both spawn points inside the same
+polygon - the common case, not a corner.
+
+The erased door was worse than missing. It still lay on the navmesh, so the
+off-navmesh lint had nothing to report; and `navmesh_says_connected` then
+answered *None* for it rather than False, which by design means "no opinion"
+and never severs. Unreconcilable, silently, forever.
+
+`connection_targets` is plural. The field is serialised, so
+`BUNDLE_FORMAT_VERSION` goes to 2 and the reader refuses a v1 bundle rather
+than reading it as portal-less.
+
+### L1 — a true sentence that answered a different question
+
+`_bundle` cached every bundle it ever read for the life of the manager, and its
+docstring defended this: a bundle is immutable build data and the runtime state
+derived from it is rebuilt on every load, so reuse is *safe*. Every word true.
+
+Safety was not the question. `unload` released the ledger charges and the
+resident cell and never touched the cache, so terrain, structure voxels, baked
+navigation and lightmaps stayed strongly referenced - `total_bytes()` reporting
+zero while the process held 110 KB per visited cell. Retained geometry grew with
+the **explored** world rather than the resident ring, and no ceiling would have
+caught it because the growth was outside the accounting entirely.
+
+Measured before choosing, as usual. Eviction costs one bundle read - 0.57 ms for
+a 110 KB cell - paid only when a cell re-enters the ring, which is already the
+expensive moment and already permitted to be. The alternative, a separately
+bounded cache, buys that millisecond in exchange for a second memory pool with
+its own budget, its own ledger and its own drift test to keep honest. Not worth
+it; `unload` evicts.
+
+The best of the new tests is a weakref. A dict check proves the manager let go;
+it cannot prove a `LiveStructure` or a cloned navmesh did, and either would leak
+exactly as much.
+
+### L3 — helpers that worked, and a path that never called them
+
+`PatchJob` has recorded `adjacent_cell_ids` since it was written and no
+production caller ever read them. `ConnectionGraphPatcher` has known how to
+re-check a cell's connections since it was written and nothing ever called it -
+except the agreement tests, by hand, after assembling the invariant themselves.
+
+So the tests proved the helpers and could not have caught what was wrong. That
+is the sharpest lesson here and it generalises past this finding: **a test that
+performs the integration itself is a test of the parts.**
+
+`reconcile_connections` is the completion as one operation, run by both callers
+that can produce a disagreement - `pump_navmesh` after applying verdicts, and
+`load` after saved break state reaches the navmesh. `view` became **required**
+on `pump_navmesh`: the half-finished call is what L3 *was*, so it should not be
+spellable.
+
+A neighbour that cannot be checked is named in the result with a reason, because
+a gap reported as nothing looks exactly like a clean bill of health.
+
+**And a fix that needed its own care.** `navmesh_says_connected` asks whether an
+agent can walk from a reference polygon to a door, and the tests passed poly 0.
+Poly 0 can be the polygon that just collapsed - and a reference nobody can stand
+on reports every connection in the cell as unreachable, which writes
+`DELETE_ENTRY` to the save. **A wrong reference is destructive, not merely
+inaccurate.** So the reference is derived: the polygon under the Location's
+declared spawn point, else the lowest-numbered walkable one, and a cell with
+nowhere to stand has *no opinion* rather than severing everything.
+
+### L2 — a bake that ran on the ground and ignored what was built on it
+
+`build_cell` baked the navmesh from the terrain heightfield and only then
+computed the cell's structures, which were used to infer which existing polygons
+a future destruction might affect. A pristine wall corrected nothing: the build
+reported success and an agent walked into a solid gatehouse.
+
+Structures are computed first now and mask the columns they occupy **before**
+the greedy merge. Before is the whole trick, and the naive version would have
+been worse than the bug: a flat field merges into a *single* rectangle, so
+marking finished polygons unwalkable would make one cube in the middle of a cell
+render the whole cell impassable. Clearing columns first makes the mesher cut
+rectangles around the footprint - the demo cell goes from 1 polygon to 4 - which
+is the subdivision the review asked for, obtained by doing less rather than more.
+
+The mask asks `clearance_blocked`, the predicate `recompute_polys` already used
+for runtime patches, now public. Two definitions of "walkable" would have meant
+the first destruction in a cell could *reveal* geometry the bake never
+accounted for, so a test asserts the bake and the runtime recompute agree over
+every polygon of an undamaged cell.
+
+Tests go through `lobster-build`, not hand-assembled fixtures. Including the one
+the review implied and I would not have thought of: a wall that cuts its cell in
+half is as wrong as one that is not there, so the field has to stay connected
+around the footprint.
+
+### The mutation run, again
+
+Five test gaps across the five fixes. Two are worth keeping:
+
+* **The reload test could not fail.** It collapsed the bridge, pumped, unloaded
+  and reloaded - but the pump had already severed the connection, so the reload
+  looked correct whether or not `load` reconciled anything. The real case is
+  destruction saved by an *earlier* session: write the break state, throw the
+  manager away, load cold.
+* **A solid cube cannot catch a wrong voxel lookup.** The mutant that probed
+  structures at terrain's voxel scale survived because every index inside a
+  solid cube reads solid at either scale. Only a structure with a *gap* can
+  tell the difference, which is exactly the gate the review asked for and the
+  reason it asked for one. There is a gate fixture now.
+
+### What was not done, and why
+
+**Walking on an authored structure** - a bridge deck as walkable surface - is
+not in this. Blocking is a mask over the existing column grid; support is a
+second surface in a model that holds one surface per column, and a deck with a
+passage underneath needs two. That is the same limit the review raised
+separately about heightfield terrain, and it is a scope question rather than a
+defect. Recorded here so the two are reconciled together rather than one of them
+being quietly half-answered.
+
+### On the review itself
+
+Worth stating plainly: every finding reproduced, every reproduction was
+accurate, and the two it ranked P1 were the two that mattered most. The pattern
+it named - *foundational promises treated as fulfilled by narrower
+implementations, with tests shaped to fit those implementations* - is the same
+pattern this log has recorded five times under a different name, which is that
+the tests measured the world instead of the check. It is worth more attention
+than any individual finding here.
