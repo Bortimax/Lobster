@@ -381,6 +381,40 @@ and put a mod-placed sword straight back on its table — and where the item
 
 See DECISIONS.md D33 and D35.
 
+### What holds you up
+
+```python
+cell.standing_height(x, z)                 # the roof, if something is built here
+cell.standing_height(x, z, ceiling=feet_y) # the floor you are standing on
+```
+
+The height an agent's feet rest at in cell space, counting **terrain and
+whatever is built on it**, or `None` where nothing does. This is the query to
+move a player with: Lobster does not move anybody, but it had been answering
+only half of this — `ground_height` for terrain and `is_solid` per voxel — so a
+caller wanting to put someone on a crate had to re-derive structure collision
+itself (D59).
+
+`ceiling` bounds the search downward, and that is how you ask from where you
+are: without it you get the highest surface, with your own feet's height you get
+the one under them. Crossing a walkway and walking beneath it are the same call
+with different ceilings.
+
+Solidity is read from the **live** structure, so the cart you are standing on
+stops holding you up the moment somebody breaks it.
+
+**Navigation places polygons on these surfaces too.** A cart's top, a crate, a
+rampart, a roof — in a voxel world those are places to stand, and the bake puts
+walkable polygons on them. Whether one connects to the ground beside it is the
+ordinary step rule: half a metre links, two metres bakes an island that needs
+stairs to reach, and stairs are structure voxels that step up.
+
+> **One surface per column.** The navmesh holds the *topmost* surface at each
+> column, so a deck you can both cross and walk beneath is baked as the deck.
+> `standing_height(ceiling=...)` still answers correctly underneath it — the
+> query has no such limit — so a player can walk under a bridge the pathfinder
+> will not route an NPC under.
+
 ### Completing a destruction
 
 Destroying a chunk is synchronous; making the world agree about it is not, and

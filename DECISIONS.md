@@ -4088,3 +4088,85 @@ implementations, with tests shaped to fit those implementations* - is the same
 pattern this log has recorded five times under a different name, which is that
 the tests measured the world instead of the check. It is worth more attention
 than any individual finding here.
+
+---
+
+## D59 — You can stand on things people build
+
+The project owner read "you cannot walk on a structure" in a handover draft and
+said it sounded dumb for a voxel game, because players will want to jump on
+buildings and carts. Correct on both counts, and the sentence was wrong in a way
+worth recording: **it was two claims, and only one of them was true.**
+
+### The half that was never a rule
+
+Lobster has no player movement and no player collision. Shrimp sets
+`player_position` directly; nothing here forbids putting it on a roof. And the
+geometry to do it has always been present - `TerrainCollider.ground_height` for
+the ground, `LiveStructure.is_solid` per voxel.
+
+What was missing is that **Lobster exposed the pieces and not the question.**
+There was no way to ask "what holds me up at this spot, counting the cart parked
+on it" without re-deriving structure collision from raw voxel lookups - the
+logic existed, privately, inside the navmesh recompute. A consumer would have
+written it a second time, slightly differently, and the ground under the
+player's feet would have drifted from the ground the pathfinder believed in.
+
+`ResidentCell.standing_height(x, z, ceiling=None)` is the question. `ceiling` is
+what makes it the *right* question rather than only a convenient one: without it
+you get the highest surface, and with your own feet's height you get the one
+under them. Crossing a walkway and walking beneath it are the same call with
+different arguments.
+
+### The half that was real, and that I had just made worse
+
+The bake generated polygons only at terrain heights, so NPCs could not path onto
+anything. Worse, the structure-aware bake from review L2 - shipped hours
+earlier - *masked out* the columns a structure occupied. That turned a cart into
+a **hole**: unwalkable at ground level, and no surface on top either. Correct
+for a sheer wall, wrong for everything you would climb on.
+
+The surface is now the topmost thing that holds you up. Whether it joins the
+world is the step rule's business rather than a special case: half a metre links
+to the ground beside it, two metres bakes an island that needs stairs, and
+stairs are structure voxels that step up so the same rule connects them.
+
+### Why one surface per column is enough, and where it is not
+
+I had called this a deferred scope question, on the grounds that a column holds
+one height and a bridge needs two. That over-weighted the limit, because of a
+decision this project already made: **an interior is its own cell** (D8). A
+house you can enter is not a room inside this cell's navmesh; it is a separate
+cell. So from the outside a house is a solid mass whose roof is the only place
+on it to stand - and carts, crates, walls and ramparts are the same shape.
+
+What genuinely needs two heights is a deck you can cross *and* walk beneath. The
+deck wins, the ground under it is not baked, and `standing_height(ceiling=...)`
+answers correctly down there anyway. So a player can walk under a bridge that an
+NPC will not be routed under. That is a real limit, it is written down, and it
+costs nothing that the owner asked for.
+
+### One definition, for the third time
+
+`structure_surface` is shared by the bake and the query, for the same reason
+`clearance_blocked` is shared by the bake and the runtime recompute (D58): two
+answers to "what holds you up here" are two chances for what the player stands
+on and what the pathfinder believes to disagree - and that disagreement is
+invisible until somebody is standing in mid-air. A test walks the columns and
+asserts the two agree.
+
+### What the mutation run was for this time
+
+Eight mutants, two survivors, and both survivors said something:
+
+* **The headroom check in the bake was unreachable.** Under topmost-wins,
+  anything solid above the surface would *have been* the surface, so the probe
+  can never find anything. It was correct in the previous design, where the
+  surface was always the terrain. Deleted rather than left in place: an
+  unreachable check is worse than no check, because it reads like protection.
+* **The ceiling's search bound looked like a duplicate** of the filter below it
+  - both reject a surface above the ceiling - until a two-deck structure showed
+  they differ. Scanning from the ceiling finds the deck *under* you; scanning
+  from the top of the structure finds the walkway above, rejects it, and reports
+  nothing. That is the walk-under-a-bridge case, and it now has the test it
+  needed.
