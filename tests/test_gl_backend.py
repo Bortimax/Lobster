@@ -683,3 +683,89 @@ class TestAgainstRealHardware(BackendFixture):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestACharacterReachesTheGpuAsGeometry(InstancingFixture):
+    """The GL path routed entities to the impostor branch unconditionally, so
+    a dressed character uploaded its models and then drew a grey box over
+    them. The llvmpipe job could not see it: nothing failed, the picture was
+    just wrong, and no GL test mentioned entities at all (D57).
+    """
+
+    HELM = "model-crate"
+
+    def dress(self, cell_id, entity_id, position, bones=("head",)):
+        from lobster.skeleton import Skeleton, Wardrobe, humanoid_region_set
+        from lobster.tiers import ACTIVE
+        skeleton = Skeleton(
+            entity_id, humanoid_region_set(),
+            root=Transform(position=position),
+            wardrobe=Wardrobe("guard", {b: self.HELM for b in bones}))
+        self.cells[cell_id].place(entity_id, position, ACTIVE,
+                                  skeleton=skeleton)
+        return skeleton
+
+    def test_a_worn_model_is_an_instanced_draw_not_an_impostor(self):
+        self.build({"cell-a": []}, models=(self.HELM,))
+        self.dress("cell-a", "npc-ada", (6.0, 0.0, 10.0))
+        before = len(self.instanced_draws())
+        self.frame()
+        draws = self.instanced_draws(before)
+        self.assertEqual(len(draws), 1, "the helm did not reach the GPU")
+        self.assertEqual(draws[0].detail["vertices"],
+                         self.library.model(self.HELM).vertex_count())
+
+    def test_a_guard_and_a_crate_in_one_helm_are_one_draw(self):
+        """Worn models take the path props take, so they group with them."""
+        self.build({"cell-a": [self.prop("c", self.HELM, (5.0, 0.0, 10.0))]},
+                   models=(self.HELM,))
+        self.dress("cell-a", "npc-ada", (7.0, 0.0, 10.0))
+        before = len(self.instanced_draws())
+        self.frame()
+        draws = self.instanced_draws(before)
+        self.assertEqual(len(draws), 1, "one model, one draw")
+        self.assertEqual(draws[0].detail["instances"], 2,
+                         "the crate and the helm should be two instances of "
+                         "one mesh")
+
+    def test_six_guards_are_one_draw_and_six_instances(self):
+        self.build({"cell-a": []}, models=(self.HELM,))
+        for i in range(6):
+            self.dress("cell-a", "npc-%d" % i, (3.0 + i * 0.8, 0.0, 10.0))
+        before = len(self.instanced_draws())
+        self.frame()
+        draws = self.instanced_draws(before)
+        self.assertEqual(len(draws), 1)
+        self.assertEqual(draws[0].detail["instances"], 6)
+
+    def test_an_undressed_entity_is_still_an_impostor(self):
+        """The fallback did not move."""
+        from lobster.geometry import Transform as _T
+        from lobster.skeleton import Skeleton, humanoid_region_set
+        from lobster.tiers import ACTIVE
+        self.build({"cell-a": []}, models=(self.HELM,))
+        self.cells["cell-a"].place(
+            "npc-bare", (6.0, 0.0, 10.0), ACTIVE,
+            skeleton=Skeleton("npc-bare", humanoid_region_set(),
+                              root=_T(position=(6.0, 0.0, 10.0))))
+        before = len(self.instanced_draws())
+        self.frame()
+        self.assertEqual(len(self.instanced_draws(before)), 0,
+                         "an undressed entity produced an instanced draw")
+        # The half that is not visible on screen: an entity with no wardrobe
+        # has an empty `model_ref`, and an empty ref is a documented absence.
+        # Letting it reach the library lookup reports `""` as a model residency
+        # failed to upload - the same absence-into-fault this project refuses
+        # for a prop with no model.
+        self.assertNotIn("", self.backend.missing_models(),
+                         "an entity with no wardrobe was reported as a "
+                         "missing model")
+
+    def test_a_worn_model_residency_never_uploaded_is_counted(self):
+        """Same fallback an absent barrel gets - named, not raised."""
+        self.build({"cell-a": []}, models=())
+        self.dress("cell-a", "npc-ada", (6.0, 0.0, 10.0))
+        before = len(self.instanced_draws())
+        self.frame()
+        self.assertEqual(len(self.instanced_draws(before)), 0)
+        self.assertIn(self.HELM, self.backend.missing_models())
