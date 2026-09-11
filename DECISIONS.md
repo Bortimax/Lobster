@@ -3701,3 +3701,77 @@ which configuration, and why.
 Documentation defects are code defects here, and this one had the shape they
 usually have: a true measurement, taken once, that quietly outgrew its
 conditions.
+
+---
+
+## D56 — "Voxels are fine", and the condition that makes it true
+
+ASSET_SCOPE §1 put a question to the project owner and §5 parked a related one.
+The owner asked it back in concrete form: **a candlestick should not be a giant
+blocky thing as tall as the player, and chalices should sit on tables** — are
+voxels fine at that size, or do we want player-facing bitmaps?
+
+**Answer: voxels are fine.** Recorded, with its condition, because the condition
+is the whole of the finding.
+
+### At today's setting they are not fine
+
+`VOXEL_SIZE_M` is 0.25. A candlestick is about 0.32 m tall and 0.09 m across the
+base, so meshing one at a structure's resolution gives a **1x4x1 stack**: one
+block wide, four tall, 25 cm thick. The owner's fear was the accurate one.
+
+The same candlestick, authored finer and put through the real mesher:
+
+| voxel | grid | voxels | triangles |
+|---|---|---|---|
+| 25 cm | 1x4x1 | 4 | 12 — a post |
+| 5 cm | 2x8x2 | 4 | 12 — still a post |
+| 2 cm | 4x13x4 | 16 | 48 — a shape |
+| **1 cm** | **9x32x9** | **372** | **214 — a candlestick** |
+
+**Fine detail on small objects is nearly free**, which is the non-obvious half.
+372 voxels mesh to 214 triangles because greedy meshing merges coplanar faces,
+so cost tracks surface complexity rather than grid fineness. 22.6 KB against a
+19.2 MB library: ~870 distinct objects at that fidelity. Chalices on every table
+is not where this budget gets spent.
+
+### Why the scale was 0.25 in the first place
+
+Nothing chose it for props. `mesh_voxel_file` has taken a `voxel_size` argument
+since it was written; `library_writer` never passes one, so props inherit the
+default, and the default is a *structure's* resolution. The precedent against
+that inheritance is already in `constants.py`, four lines above it: terrain is
+1 m and structures are 0.25 m, with the comment saying they are separate
+constants because "there is no reason their resolutions should be coupled."
+Props and items are the third case and the argument does not change.
+
+Per model rather than a third constant: a candlestick and a wardrobe want
+different grids, the parameter already exists, and one number for "props" would
+be the same mistake one level along. §7 step 2a.
+
+### Sprites, reconsidered and declined
+
+§1 left sprites "reconsiderable; not free", and named the blocker as PNG decode.
+That was never the real objection — the standard library ships `zlib` and this
+project hand-wrote a `.vox` reader. The objection is what a billboard *looks*
+like: it turns to face the viewer, and tableware is precisely what a player walks
+around at arm's length. Right for distant foliage, wrong for a candlestick.
+
+Declining it for the honest reason matters more than declining it. "We lack a
+decoder" would have been re-litigated the first time someone added one.
+
+### What this does not answer
+
+**Characters.** §5's `rig_ref` staging and §1's skinned-mesh refusal are
+untouched: this answer is about authored props and items, which is what was
+asked. A candlestick needs no vertex weights and no bone matrices, so it never
+reached the parked scope in the first place — the two questions were adjacent,
+not the same one.
+
+### The shape of the record
+
+Writing "voxels are fine" without its condition would leave that sentence beside
+a 0.25 m default for the next reader to find, and it would read as approval of
+the default. That is the failure D55 had just finished documenting one commit
+earlier: a true statement, taken once, that quietly outgrows its conditions. The
+condition is in the same paragraph as the answer, on purpose.

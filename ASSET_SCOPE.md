@@ -137,8 +137,12 @@ Sprites and conventional meshes were both considered and are **not** in the set.
 * **Sprites.** `Item.sprite_ref` and Octopus's `Sprite` record exist, and a
   textured billboard would slot into the impostor path almost directly. It
   needs a texture path — PNG *decode*, which this project does not have — and
-  §1's "vertex-colored voxels" branch was taken instead. Reconsiderable; not
-  free.
+  §1's "vertex-colored voxels" branch was taken instead. **Reconsidered and
+  declined** (D56): the decoder was never the real objection. A billboard turns
+  to face the viewer, and the objects that raised the question — a candlestick,
+  a chalice on a table — are exactly the ones a player walks around at arm's
+  length, where that swivel is most visible. Right for distant foliage, wrong
+  for tableware.
 * **Conventional meshes** (glTF/OBJ). A second format contract with content
   authors, a material model, and the door skinned characters come through. See
   §5: that is a new scope.
@@ -148,10 +152,18 @@ kind, not a richer one — it adds no format, no importer and no file. If someon
 proposes `"shape": "mesh"` with a path in it, that is the mesh importer wearing
 a primitive's clothes, and this paragraph is the objection.
 
-**Open question for the project owner.** This still makes every *authored* prop
-and item a voxel model, with primitives for the ones that are geometrically
-trivial. If characters or weapons need conventional or skinned meshes, that
-remains true and remains a separate scope.
+**Answered by the project owner (D56): voxels are fine.** Every *authored* prop
+and item is a voxel model, with primitives for the ones that are geometrically
+trivial, and no sprite path. **Conditional on a scale this scope has not set.**
+The question was asked about a candlestick, and at the structure voxel size a
+candlestick is a 1x4x1 stack — one block wide, 25 cm thick, a fencepost. At 1 cm
+it is a 9x32x9 grid that meshes to 214 triangles, 22 KB, and looks like a
+candlestick. So the answer holds *at a per-model voxel scale*, which is step 2a
+of §7 and is not built. Reading this paragraph as approval of 0.25 m for props
+would invert it.
+
+Characters are **not** covered by that answer. If they or their weapons need
+conventional or skinned meshes, that remains a separate scope — see §5.
 
 **And if that answer changes later, it is a new scope — not an addition to this
 one.** Conventional or skinned meshes for entities would bring a second
@@ -333,6 +345,13 @@ invisible dishonest one.
    package, the one-of invariant, `models:` manifest entries, and every code in
    §3. No runtime behaviour and no meshing — testable immediately, and it is
    what makes the second kind ordinary instead of a special case.
+2a. **A model's voxel scale.** Props and items do not inherit
+   `VOXEL_SIZE_M`. `mesh_voxel_file` already takes `voxel_size`; nothing
+   passes one, so every voxel model bakes at a structure's 0.25 m. Per
+   model rather than one new constant, because a candlestick and a wardrobe
+   want different grids and allowing both costs nothing (D56). Sits with
+   step 2 because it is the call site that changes.
+
 2. **The library artifact, both kinds.** Mesh each distinct model once —
    voxels through the existing `StructureMesher`, primitives through a
    dozen-line generator — into the same vertex format; write
