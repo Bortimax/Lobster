@@ -3775,3 +3775,160 @@ a 0.25 m default for the next reader to find, and it would read as approval of
 the default. That is the failure D55 had just finished documenting one commit
 earlier: a true statement, taken once, that quietly outgrows its conditions. The
 condition is in the same paragraph as the answer, on purpose.
+
+---
+
+## D57 — Characters draw, because nothing bends
+
+Terrain, structures, props and items all drew as real geometry. Entities never
+had: one flat capsule per bone on the software path, a single 1.8 m box on the
+GPU, and no field connecting a `Model` to a skeleton. Every person in the world
+was a stack of pills.
+
+It had also never been *written down*. CONTRACT had a section on drawing models
+that listed three ways a thing ends up an impostor, all three about props; an
+integrator could read the document end to end and not learn that people do not
+render. The gap was found by ranking the staged scopes, which is an argument for
+keeping that list somewhere.
+
+### The premise that made it expensive was wrong
+
+This sat behind ASSET_SCOPE §5's `rig_ref` staging note and §1's refusal of
+skinned meshes, and I had described it to the owner as "characters need skinned
+meshes" — which framed a small job as a large one. The owner's answer removed
+the premise:
+
+> "we don't need anything to 'bend' ever."
+
+Without bending there is no skinning. No vertex weights, no bone matrices in a
+shader, no mesh format carrying both, no second authoring format. A bone wears a
+rigid model; the model sits at the bone's transform. The cost of that decision
+is real and worth naming: a shoulder is a *joint between two pieces* rather than
+a smooth surface. That is the look this project is for, and it is the look the
+voxel shell already commits to everywhere else.
+
+Almost everything was already built. The rig poses. `pose_capsules` places bones
+in world space every frame for hit-testing. The model library holds and draws
+voxel models. Instancing works. What was missing was a sentence - *this bone
+wears this model* - and a draw path.
+
+### The shape
+
+`Wardrobe` is that sentence: bone id -> model ref, frozen, **shared** between
+entities that look alike rather than copied per entity, and checked against the
+rig when the `Skeleton` is built. A wardrobe dressing a bone the rig lacks
+raises at construction, where both are in one hand, instead of becoming a
+missing model inside a frame.
+
+Models are authored in the rig's own space - the space `Bone.a` and `Bone.b` are
+in - so the workflow is to model the whole character and cut it into per-bone
+files, each keeping its position. Nothing fits, scales or re-centres anything.
+
+That choice buys the property the rest of it rests on:
+
+> **What you see is what you hit.** A worn model is placed by
+> `root.compose(local)`. So is the bone's hitbox. The model on screen and the
+> limb a shot resolves against are the same composition of the same two
+> transforms, and cannot drift apart.
+
+And it is why every worn model on one entity shares that entity's origin as its
+instance position: the offset from origin to shoulder lives in the *mesh*. Two
+guards standing in the same pose are two identical instances, which is what lets
+them share a buffer. A test asserted the wrong half of this first - it looked
+for the item's centre to move when the entity turned, and the centre is exactly
+the thing that does not.
+
+### Worn models take the path props already take
+
+Not a parallel one. They are gathered per model ref, run through the same
+`place_batch` cull, packed into the same instance map, charged through the same
+`charge_placement`. A character's arm costs what a barrel costs, and it costs it
+through the same code.
+
+What that bought: GPU instancing, the budget, and the missing-model fallback,
+none of which had to be written twice. What it cost was one real bug the
+mutation run found - the entity pass wrote `packed[key] = ...` where the item
+pass writes `+=`, so a guard wearing the same model a prop used would have
+*erased the prop's instances*. Nothing in the character tests could see it,
+because it takes a prop and a character naming one model to show.
+
+An entity is still culled **once, as a whole**. Culling per bone would be finer
+and wrong: a head visible over a wall has to bring its body, and the rig's
+`bound_radius` already covers whatever is authored to it.
+
+The arithmetic, because it should be known before a crowd is dressed: a six-bone
+humanoid is six of a cell's 105 drawable placements. **17 fully dressed
+characters fill an exterior cell**, 158 an interior.
+
+### Two latent bugs first, both invisible until something looked
+
+**`bone_matrices` was not world space.** Its docstring said "World-space
+transform per bone. What a renderer and IK consume." The position was world
+space; the rotation was the bone's own, with the root's never composed in.
+`capsule_for` - what a shot resolves against - has always composed both.
+
+Nothing caught it, for two compounding reasons. IK is the only caller, and
+`_foot_tip` ignores the transform it is handed and asks `capsule_for` instead,
+so the argument is dead and the bug never reached a foot. And no renderer had
+ever consumed it, because entities were impostors. It would have surfaced the
+instant one did: a character facing east with its arms still pointing north.
+
+Head, torso and pelvis sit on the axis the root turns about and land in the same
+place either way. Only an *offset* bone shows it - which is the same blind spot
+a rig test hit earlier, assuming every humanoid bone was on the vertical axis.
+One of the four new tests exists purely to fail if the humanoid ever stops
+having an offset bone.
+
+**`_draw_entity` never received its cell's placement.** A rig is posed in cell
+space, like a structure origin, and the impostor path drew it as though cell
+space were world space - invisible in the origin cell, wrong in every other one.
+The same mistake D21 and D23 found in the hit-test path, surviving here because
+no test had ever drawn an entity in a placed cell.
+
+### Residency, and the eighth Event that was not added
+
+A wardrobe is counted like an **item's** models, not a prop's. The distinction
+is already in `model_refs`'s docstring: a prop is baked into the bundle and
+fixed for the whole residency, which is what makes reference-counting it
+correct; an item can leave mid-residency. An entity walks in and out and takes
+its wardrobe with it.
+
+Which exposes the ordering problem. The three Events cover everything arriving
+through a *record*. An entity does not: Lobster is handed a rig by the caller,
+and the documented integration order places entities **after**
+`set_player_cell` - so the cell-entry sync has already run before anyone is
+standing there.
+
+An eighth Event would have covered it. The set is frozen at seven and the
+freezing is load-bearing, so this is an explicit `sync_models(cell_id)` instead:
+place your entities, then say so. Idempotent, a set difference against what is
+held. Not calling it is a **counted** fault rather than a silent one - the
+models stay unuploaded, `drift()` names them, and the backend draws impostors,
+which is the same fallback an absent barrel gets.
+
+### The tests were measuring the world again
+
+Fourteen mutants, all caught - but six only after the tests meant to catch them
+were rewritten. The tally, because the pattern is now the most reliable defect
+in this project:
+
+* **The fallback test asked whether *something* drew.** A fallback that skipped
+  the bone entirely passes that. It now asserts that dressing one bone against a
+  library holding nothing is *pixel-identical* to not dressing it.
+* **The placement test's baseline moved with the thing it measured.** It diffed
+  a placed cell against an *unplaced* one, so the terrain - a huge single
+  colour - was most of the difference and the centroid shifted whether or not
+  the entity did. `Pixels.drawn` carries a comment about this exact mistake
+  costing a mutant once before. It cost one again.
+* **The "capsules are not drawn under the model" test could not work at all.**
+  The model is drawn *at* the bone, so it covers the capsule it would be hiding;
+  both renders can come out identical while the renderer does twice the work. I
+  had also guessed the wrong direction - the box primitive covers *more* screen
+  than six thin capsules, not less. Pixels cannot answer this one; the draw
+  count can, and does.
+* Three more on ordering, absence and instance accumulation.
+
+That is the fifth, sixth and seventh time (D49, D52, D54, D55, and three here).
+The rule stated at D55 - *a test whose subject can be absent must assert that it
+is present* - needs a companion: **a test whose baseline can move must hold the
+baseline still.**

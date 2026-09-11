@@ -304,12 +304,18 @@ popping"*, and §15's checklist treats LOD as a thing the design deliberately
 does not have. Lobster reads `asset_ref` and ignores `lod_refs`. Content may
 populate it for another consumer; this one will not look.
 
-**`rig_ref` — not used yet, and that is a staging decision.** A model bound to a
-rig is skinning, and skinning is geometry rather than animation policy, so it is
-legitimately Lobster's. But it is a large surface — vertex weights, bone
-matrices per frame, a mesh format that carries both — and entities are the only
-things that would use it. Static props and items are the whole of the measured
-gap today. **Staged out, not refused.**
+**`rig_ref` — still not used, and no longer staged.** The staging note here
+said a model bound to a rig is skinning, that skinning is geometry rather than
+animation policy and therefore legitimately Lobster's, and that its surface —
+vertex weights, bone matrices per frame, a mesh format carrying both — was too
+large to take on for entities alone.
+
+**The project owner removed the premise: nothing ever needs to bend.** Without
+bending there is no skinning, and characters turned out to need none of that
+surface. A bone wears a rigid model, placed by the composition that already
+moves its hitbox (D57). So `rig_ref` stays unread — Lobster's wardrobe is a
+mapping from *bones* to models, which is a different question than the one
+`rig_ref` answers — and the thing it was staging is not coming.
 
 ---
 

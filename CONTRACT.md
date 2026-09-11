@@ -1037,12 +1037,55 @@ err towards drawing. `bound_radius()` measures from the model origin rather than
 from the centre of its bounds, so it is the same whichever way the thing is
 facing.
 
-**Entities are always impostors.** The model path above is props and items
-only. An entity draws from its *rig* — one capsule per bone on the software
-path, a single 1.8 m box on the GPU — and no field connects a `Model` to a
-skeleton. The rig is real underneath: it poses, and a shot resolves to a limb.
-But an NPC is a stack of flat capsules on screen, and nothing here has ever said
-otherwise. See README, "What is not built yet".
+### Drawing a character
+
+**An entity wears a model per bone.** Rigid, not skinned — nothing in Lobster
+bends, which is a decision (D57) and not a limitation waiting to be lifted, so
+there are no vertex weights, no bone matrices in a shader and no second
+authoring format. A shoulder is a joint between two pieces.
+
+```python
+from lobster.skeleton import Skeleton, Wardrobe, humanoid_region_set
+
+guard = Wardrobe("guard", {"head": "model-helm", "torso": "model-mail"})
+cell.place("npc-ada", (10.0, 0.0, 4.0), ACTIVE,
+           skeleton=Skeleton("npc-ada", humanoid_region_set(),
+                             root=Transform(position=(10.0, 0.0, 4.0)),
+                             wardrobe=guard))
+```
+
+A `Wardrobe` is **shared**, not per entity: every guard holds the same one. It
+is checked against the rig when the `Skeleton` is built, so a wardrobe dressing
+a bone the rig does not have raises there rather than turning into a missing
+model in a frame.
+
+**Models are authored in the rig's own space** — the space `Bone.a` and
+`Bone.b` are in — so the practical workflow is to model the whole character and
+cut it into per-bone files, each keeping its position. Nothing fits, scales or
+re-centres it.
+
+> **What you see is what you hit.** A worn model is placed by
+> `root.compose(local)`, and so is the bone's hitbox. The model on screen and
+> the limb a shot resolves against cannot drift apart, and a test asserts it
+> bone by bone under a pose and a rotation.
+
+**A bone with no model is the impostor it always was**, and so is every bone of
+an entity with no wardrobe — the same rule a prop with an empty `model_ref`
+gets. A model the library does not hold falls back to *that bone's* capsule,
+not the whole entity's.
+
+**A worn model is a placement and is charged as one.** A character's arm costs
+what a barrel costs, through the same cull kernel and the same instance
+packing, so two guards in one helm are one instance buffer. The arithmetic is
+worth knowing before you dress a crowd: a six-bone humanoid is six of a cell's
+105 drawable placements, so **17 fully dressed characters fill an exterior
+cell's budget** and 158 fill an interior's. An entity is still culled *once, as
+a whole* — a head visible over a wall brings its body.
+
+**Entities are placed after `set_player_cell`**, so the cell-entry sync cannot
+see what they are wearing. Call `GpuResidency.sync_models(cell_id)` once you
+have placed them. Not calling it is a counted fault, not a silent one: the
+models stay unuploaded, `drift()` names them and the backend draws impostors.
 
 **The impostor is not going away.** It is what a thing with no mesh looks like
 (ASSET_SCOPE §4), and there are three honest ways for a *prop* to get one: no
