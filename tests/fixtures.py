@@ -457,6 +457,21 @@ def cube_vox(path: str, side: int = 8, material: int = 7) -> str:
          for z in range(side)])
 
 
+def gate_vox(path: str, side: int = 8, material: int = 7) -> str:
+    """A wall with a way through it.
+
+    Solid for the first half of its X extent and open for the second, so a
+    structure this size straddling two terrain columns blocks one and leaves
+    the other walkable. A solid cube cannot tell a correct voxel lookup from
+    one done at the wrong scale - every index inside it is solid either way -
+    and a gate can, which is why the review asked for one.
+    """
+    return write_vox_file(
+        path, (side, side, side),
+        [(x, y, z, material) for x in range(side // 2)
+         for y in range(side) for z in range(side)])
+
+
 class BuildWorkspace:
     """A temp world: packages, `.vox` art, a manifest, and an output directory."""
 

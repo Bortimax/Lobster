@@ -395,7 +395,10 @@ def _poly_walkable(poly: NavPoly, terrain: Any, structures: Sequence[Any],
 
 def _solid_at(point: Vec3, structures: Sequence[Any], voxel_size: float) -> bool:
     for live in structures:
-        data = live.voxel_data
+        # `LiveStructure` at runtime, bare `StructureVoxels` at build time,
+        # where nothing is destroyed yet and there is no break state to wrap.
+        # Both answer `is_solid`; only one of them has a `voxel_data`.
+        data = getattr(live, "voxel_data", live)
         local = data.origin.inverse_apply(point)
         ix = int(local[0] // voxel_size)
         iy = int(local[1] // voxel_size)
@@ -404,6 +407,19 @@ def _solid_at(point: Vec3, structures: Sequence[Any], voxel_size: float) -> bool
         if 0 <= ix < g and 0 <= iy < g and 0 <= iz < g and live.is_solid(ix, iy, iz):
             return True
     return False
+
+
+def clearance_blocked(x: float, y: float, z: float,
+                      structures: Sequence[Any], agent_height: float,
+                      voxel_size: float) -> bool:
+    """Does something solid stand in the agent's headroom above this point?
+
+    Public because the **bake** asks it too. A navmesh baked from terrain alone
+    and a navmesh recomputed after a destruction have to mean the same thing by
+    "walkable", and the way to guarantee that is one predicate rather than two
+    that agree today (review L2).
+    """
+    return _blocked_above(x, y, z, structures, agent_height, voxel_size)
 
 
 def _blocked_above(x: float, y: float, z: float, structures: Sequence[Any],

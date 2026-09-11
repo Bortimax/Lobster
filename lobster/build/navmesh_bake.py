@@ -26,7 +26,9 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 from ..constants import TERRAIN_VOXEL_SIZE_M
 from ..geometry import Vec3
-from ..navmesh import DEFAULT_AGENT_HEIGHT_M, NavPoly, Navmesh
+from ..constants import VOXEL_SIZE_M
+from ..navmesh import (DEFAULT_AGENT_HEIGHT_M, NavPoly, Navmesh,
+                       clearance_blocked)
 
 #: How much vertical difference an agent can walk up between adjacent polys.
 DEFAULT_MAX_STEP_M = 0.6
@@ -61,15 +63,33 @@ class BakeSettings:
 
 def bake_navmesh(cell_id: str, field: Any, *,
                  settings: Optional[BakeSettings] = None,
-                 portals: Optional[Mapping[str, Vec3]] = None) -> Navmesh:
+                 portals: Optional[Mapping[str, Vec3]] = None,
+                 structures: Sequence[Any] = ()) -> Navmesh:
     """Bake a cell's walkable surface into convex polygons.
 
     `portals` maps a target location id to the spawn point of the connection
     leading there, in cell space. Whichever polygon contains that point becomes
     the door.
+
+    **`structures` are the cell's authored, intact structures, and leaving them
+    out was a hole rather than a simplification** (review L2). The bake ran on
+    the terrain heightfield alone; structures were then used only to infer
+    which existing polygons a *destruction* might affect. So a pristine wall
+    corrected nothing, and an agent walked into a solid gatehouse: the build
+    reported success, and the polygon under the wall was as walkable as the
+    field around it.
+
+    They are masked out **before** the greedy merge, which is what keeps the
+    subdivision honest. Marking whole polygons unwalkable afterwards would be
+    far worse than ignoring structures: a flat field merges into a *single*
+    rectangle, so one cube in the middle of it would make the entire cell
+    impassable. Removing the occupied columns first makes the mesher cut
+    rectangles around the footprint, which is the subdivision the review asked
+    for and costs nothing extra.
     """
     settings = settings or BakeSettings()
     walkable = _walkable_columns(field, settings)
+    _mask_structures(field, walkable, structures, settings)
     rectangles = _merge_rectangles(field, walkable)
     polys = _to_polys(field, rectangles, settings)
     _link_neighbours(polys, rectangles, settings)
@@ -95,6 +115,34 @@ def _walkable_columns(field: Any, settings: BakeSettings) -> List[List[bool]]:
                 steepest = max(steepest, delta)
             out[x][z] = steepest <= settings.max_slope
     return out
+
+
+def _mask_structures(field: Any, walkable: List[List[bool]],
+                     structures: Sequence[Any],
+                     settings: BakeSettings) -> None:
+    """Clear every column an intact structure is standing in.
+
+    Asked at the column's own surface with the same `clearance_blocked` the
+    runtime patch uses, so a cell that is never damaged and a cell that is
+    damaged and recomputed cannot disagree about what "walkable" meant.
+
+    Note the two voxel sizes: columns are terrain-sized (`settings.voxel_size`)
+    and structures are finer (`VOXEL_SIZE_M`), so the probe walks the agent's
+    headroom in *structure* voxels while the grid it clears is terrain's.
+    """
+    structures = list(structures)
+    if not structures:
+        return
+    v = settings.voxel_size
+    for x in range(field.side):
+        for z in range(field.side):
+            if not walkable[x][z]:
+                continue
+            surface = field.height_at(x, z) * v
+            if clearance_blocked((x + 0.5) * v, surface, (z + 0.5) * v,
+                                 structures, settings.agent_height,
+                                 VOXEL_SIZE_M):
+                walkable[x][z] = False
 
 
 def _merge_rectangles(field: Any, walkable: List[List[bool]]

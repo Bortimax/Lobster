@@ -793,3 +793,161 @@ class TestTheDocumentedLintCodesAreTheRealOnes(unittest.TestCase):
                 '"{0}"'.format(code), source,
                 "CONTRACT documents {0!r} and nothing in lobster/build emits "
                 "it".format(code))
+
+
+# ---------------------------------------------------------------------------
+# Navigation over authored structures, through the real build (review L2)
+# ---------------------------------------------------------------------------
+
+class TestTheBakeSeesAuthoredStructures(unittest.TestCase):
+    """The bake ran on the terrain heightfield alone. Structures were consulted
+    afterwards, only to infer which polygons a future *destruction* might
+    affect - so a pristine wall corrected nothing and the polygon under a solid
+    gatehouse was as walkable as the field around it.
+
+    The bridge tests assemble elevated polygons by hand, which proves how
+    destruction affects those polygons and not that `lobster-build` can produce
+    navigation around authored geometry. These go through the real pipeline.
+    """
+
+    def built(self, **manifest_extra):
+        from lobster.build.builder import build_world, content_view
+        from lobster.build.manifest import load_manifest
+        from lobster.cell import CellManager
+        from tests.fixtures import (BuildWorkspace, cube_vox,
+                                    demo_manifest_cells, demo_world_ops,
+                                    slab_vox)
+        ws = BuildWorkspace()
+        self.addCleanup(ws.close)
+        slab_vox(os.path.join(ws.art, "slab.vox"))
+        cube_vox(os.path.join(ws.art, "cube.vox"))
+        package = ws.write_package("world.demo", demo_world_ops())
+        path = ws.write_manifest(demo_manifest_cells(**manifest_extra),
+                                 [package])
+        manifest = load_manifest(path)
+        result = build_world(manifest, out_dir=ws.out)
+        self.assertTrue(result.ok(), result.to_dict())
+        view = content_view(manifest.package_paths())
+        manager = CellManager(ws.out)
+        return manager, manager.load(view, "cell-a")
+
+    def test_the_wall_is_not_walkable(self):
+        """The reproduction, as a test. `cube.vox` sits at (6, 2, 6) and the
+        column under it used to be as walkable as the field."""
+        _manager, cell = self.built()
+        self.assertTrue(cell.structure("gatehouse").is_solid(2, 0, 4),
+                        "the fixture's wall is not solid where this looks")
+        self.assertIsNone(cell.navmesh.poly_at((6.0, 2.0, 6.0)),
+                          "the navmesh still has a polygon inside the wall")
+
+    def test_an_agent_cannot_walk_into_it(self):
+        from lobster.movement import Agent, LeaderLeash
+        _manager, cell = self.built()
+        agent = Agent("walker", (5.5, 2.0, 7.0), speed=1.0)
+        step = LeaderLeash("walker", []).step_leader(
+            cell.navmesh, agent, (7.0, 2.0, 7.0), 1.0)
+        self.assertFalse(step.moved,
+                         "the agent walked to {0}, which is inside a solid "
+                         "structure voxel".format(step.position))
+
+    def test_the_field_around_it_still_is(self):
+        """The other direction, and the one that makes this dangerous to get
+        wrong: masking whole polygons rather than columns would have made a
+        flat cell impassable, because a flat field merges into one rectangle."""
+        _manager, cell = self.built()
+        self.assertGreater(len(cell.navmesh.polys), 1,
+                           "the wall did not subdivide the field; either it "
+                           "blocked everything or it blocked nothing")
+        self.assertIsNotNone(cell.navmesh.poly_at((2.0, 2.0, 2.0)),
+                             "the far corner of the field stopped being "
+                             "walkable")
+        self.assertIsNotNone(cell.navmesh.poly_at((20.0, 2.0, 20.0)))
+
+    def test_you_can_still_walk_around_it(self):
+        """A wall that cuts its cell in half is as wrong as one that is not
+        there. The field has to stay connected around the footprint."""
+        _manager, cell = self.built()
+        start = cell.navmesh.poly_at((2.0, 2.0, 2.0))
+        far = cell.navmesh.poly_at((20.0, 2.0, 20.0))
+        self.assertIsNotNone(start)
+        self.assertIsNotNone(far)
+        self.assertIsNotNone(cell.navmesh.find_path(start, far),
+                             "the wall disconnected the cell")
+
+    def test_the_bake_agrees_with_the_runtime_recompute(self):
+        """The property that keeps the two halves honest.
+
+        A navmesh baked from terrain and a navmesh recomputed after a
+        destruction must mean the same thing by "walkable". They did not: the
+        bake ignored structures and the recompute did not, so the first
+        destruction in a cell could *reveal* geometry the bake had never
+        accounted for. One predicate now answers both, and this asserts it over
+        every polygon of an undamaged cell.
+        """
+        from lobster.navmesh import recompute_polys
+        _manager, cell = self.built()
+        verdicts = recompute_polys(cell.navmesh, list(cell.navmesh.polys),
+                                   terrain=cell.terrain,
+                                   structures=list(cell.structures.values()))
+        self.assertTrue(verdicts, "no polygon was checked")
+        disagreed = [pid for pid, walkable in verdicts.items() if not walkable]
+        self.assertEqual(
+            disagreed, [],
+            "the bake produced {0} polygon(s) the runtime recompute calls "
+            "unwalkable: {1}".format(len(disagreed), disagreed))
+
+
+class TestABuiltGateHasAWayThroughIt(unittest.TestCase):
+    """A wall the build refuses to walk through is half the answer. The other
+    half is that the gap in it stays open - and it is the half that catches a
+    structure lookup done at the wrong voxel scale, because every index inside
+    a *solid* cube is solid whichever scale you read it at.
+
+    Terrain columns are 1 m and structure voxels are 0.25 m, so the probe walks
+    the agent's headroom in structure voxels while clearing a terrain-sized
+    grid. Getting that wrong closes the gate.
+    """
+
+    def built(self):
+        from lobster.build.builder import build_world, content_view
+        from lobster.build.manifest import load_manifest
+        from lobster.cell import CellManager
+        from tests.fixtures import (BuildWorkspace, demo_manifest_cells,
+                                    demo_world_ops, gate_vox, slab_vox)
+        ws = BuildWorkspace()
+        self.addCleanup(ws.close)
+        slab_vox(os.path.join(ws.art, "slab.vox"))
+        gate_vox(os.path.join(ws.art, "cube.vox"))
+        package = ws.write_package("world.demo", demo_world_ops())
+        path = ws.write_manifest(demo_manifest_cells(), [package])
+        manifest = load_manifest(path)
+        result = build_world(manifest, out_dir=ws.out)
+        self.assertTrue(result.ok(), result.to_dict())
+        view = content_view(manifest.package_paths())
+        manager = CellManager(ws.out)
+        return manager.load(view, "cell-a")
+
+    def test_the_solid_half_blocks_and_the_open_half_does_not(self):
+        cell = self.built()
+        gate = cell.structure("gatehouse")
+        self.assertTrue(gate.is_solid(2, 0, 2), "the fixture's gate is open "
+                                                "where this expects wall")
+        self.assertFalse(gate.is_solid(6, 0, 6), "the fixture's gate has no "
+                                                 "way through it")
+
+        self.assertIsNone(cell.navmesh.poly_at((6.5, 2.0, 6.5)),
+                          "the walled half of the gate is walkable")
+        self.assertIsNotNone(cell.navmesh.poly_at((7.5, 2.0, 7.5)),
+                             "the gateway was bricked up by the bake")
+
+    def test_you_can_walk_through_the_gap(self):
+        from lobster.navmesh import recompute_polys
+        cell = self.built()
+        through = cell.navmesh.poly_at((7.5, 2.0, 7.5))
+        self.assertIsNotNone(through)
+        verdict = recompute_polys(cell.navmesh, [through],
+                                  terrain=cell.terrain,
+                                  structures=list(cell.structures.values()))
+        self.assertTrue(verdict[through],
+                        "the bake left the gateway open and the runtime "
+                        "recompute disagrees")

@@ -171,9 +171,11 @@ def build_cell(view: Any, manifest: Manifest, cell: CellEntry, *,
 
     terrain, field = _terrain_for(manifest, cell)
     portals = _portals_for(view, cell.location_id)
-    navmesh = bake_navmesh(cell.location_id, field, settings=cell.navmesh,
-                           portals=portals)
+    # Structures first: the navmesh is baked *around* them, not merely
+    # inspected for what a later destruction might affect (review L2).
     structures = _structures_for(manifest, cell)
+    navmesh = bake_navmesh(cell.location_id, field, settings=cell.navmesh,
+                           portals=portals, structures=structures)
 
     tables: Dict[str, LoadBearingTable] = {}
     inference: List[Dict[str, Any]] = []
