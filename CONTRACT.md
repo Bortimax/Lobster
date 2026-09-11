@@ -1037,9 +1037,16 @@ err towards drawing. `bound_radius()` measures from the model origin rather than
 from the centre of its bounds, so it is the same whichever way the thing is
 facing.
 
+**Entities are always impostors.** The model path above is props and items
+only. An entity draws from its *rig* — one capsule per bone on the software
+path, a single 1.8 m box on the GPU — and no field connects a `Model` to a
+skeleton. The rig is real underneath: it poses, and a shot resolves to a limb.
+But an NPC is a stack of flat capsules on screen, and nothing here has ever said
+otherwise. See README, "What is not built yet".
+
 **The impostor is not going away.** It is what a thing with no mesh looks like
-(ASSET_SCOPE §4), and there are three honest ways to get one: no library, an
-empty `model_ref`, or a ref the library does not hold. The third is a build error
+(ASSET_SCOPE §4), and there are three honest ways for a *prop* to get one: no
+library, an empty `model_ref`, or a ref the library does not hold. The third is a build error
 (`prop_model_ref_unresolved`) and a counted residency fault (`missing_models`) —
 named there rather than raised mid-frame, because a renderer that threw over one
 absent barrel would take the whole picture with it.
@@ -1239,9 +1246,9 @@ bundle, an item is an `Item` record read live. `render_resident` forwards its
 view for you.
 
 `ITEM_DRAW_RADIUS_M` (0.6 m) is larger than `ITEM_PICK_RADIUS_M` (0.35 m) on
-purpose. Both are invented — items declare no extent, since `model_ref` resolves
-to nothing until there is an asset pipeline — and they err in opposite
-directions: **a cull must err towards drawing**, because culling something
+purpose. Both are invented — an item declares no extent of its own, and these
+are what a *ref-less* item is culled by now that one with a model is culled by
+its mesh — and they err in opposite directions: **a cull must err towards drawing**, because culling something
 invisible costs one wasted draw while culling something visible is a missing
 sword.
 

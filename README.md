@@ -129,6 +129,35 @@ with bridge.frame() as view:
 Occupancy is not Lobster's to decide — ask `view.zone_occupants(...)` who is
 there, then tell Lobster where to draw them.
 
+## What is not built yet
+
+Not the same list as the one below it. These are **staged**, in the order the
+project owner ranked them — everything under "deliberately does not do" is
+refused instead.
+
+1. **Characters are impostors.** Terrain, structures, props and items all draw
+   as real geometry. Entities do not: the software path draws one flat capsule
+   per bone, the GPU path a single 1.8 m box. The rig underneath is real — it
+   poses, it hit-tests to a limb — but nothing connects a `Model` to a bone.
+   **This is the one that would be noticed first in a screenshot**, and it is
+   not the skinned-mesh scope: rigid per-bone voxel models need no vertex
+   weights and reuse the pose that already exists.
+2. **A model's voxel scale** — ASSET_SCOPE §7 step 2a. Props inherit a
+   *structure's* 0.25 m, so a candlestick bakes as a 1x4x1 fencepost. Small and
+   self-contained; the mesher already takes the argument (D56).
+3. **Textured voxels.** Colour-only voxels are the current ask because there is
+   no texture artist, and they are sufficient — but tiles are wanted before
+   this is over, and **this needs a scope before props are commissioned, not
+   before code is written**: textures and voxel resolution pull in opposite
+   directions, so art authored for flat colour is authored at the wrong
+   resolution for tiles. Ranked above the handset question by the owner.
+4. **A handset target.** RENDER_SCOPE §1 keeps the draw model inside a GL ES 3.0
+   subset so a phone renderer reuses the shaders, but Python-plus-ModernGL is
+   not an Android deployment and D26's language decision would reopen.
+
+Skinned or conventional meshes for characters remain **refused**, not staged —
+ASSET_SCOPE §1 and §5.
+
 ## What it deliberately does not do
 
 Runtime terrain editing. Damage math, HP, limb-disability rules. Animation state
