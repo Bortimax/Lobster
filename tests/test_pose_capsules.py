@@ -350,3 +350,76 @@ class TestAnUnusualRig(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestBoneMatricesSayWhereTheBoneIs(unittest.TestCase):
+    """`bone_matrices` and `capsule_for` are two answers to one question, and
+    the docstring on the first says *world space*. A renderer that draws a
+    model per bone reads the first; a shot that resolves to a limb reads the
+    second. They have to be the same composition.
+    """
+
+    def placed(self, skeleton, bone):
+        """Where the bone's rest capsule ends up, via `bone_matrices`."""
+        transform = skeleton.bone_matrices()[bone.bone_id]
+        return transform.apply(bone.a), transform.apply(bone.b)
+
+    def test_it_places_every_bone_where_the_capsule_is(self):
+        skeleton = posed(seed=7)
+        for bone in skeleton.region_set.bones:
+            with self.subTest(bone=bone.bone_id):
+                capsule = skeleton.capsule_for(bone.bone_id)
+                a, b = self.placed(skeleton, bone)
+                for got, want in zip(a, capsule.a):
+                    self.assertAlmostEqual(got, want, places=9)
+                for got, want in zip(b, capsule.b):
+                    self.assertAlmostEqual(got, want, places=9)
+
+    def test_the_rig_has_a_bone_off_the_vertical_axis(self):
+        """The guard on the test above. A head and a torso sit on the axis the
+        root turns about, so they land in the same place whether or not the
+        root's rotation is composed in - an arm does not. Without an offset
+        bone the assertion holds against a rig that is only half-placed.
+        """
+        offset = [b.bone_id for b in humanoid_region_set().bones
+                  if abs(b.a[0]) > 1e-6 or abs(b.a[2]) > 1e-6]
+        self.assertTrue(offset,
+                        "every bone is on the vertical axis, so dropping the "
+                        "root's rotation would be invisible here")
+
+    def test_turning_an_entity_turns_its_bones(self):
+        """The failure in the form somebody would see it: a character facing
+        east with its arms still pointing north."""
+        region_set = humanoid_region_set()
+        arm = next(b for b in region_set.bones
+                   if abs(b.a[0]) > 1e-6 or abs(b.a[2]) > 1e-6)
+        half = math.pi / 4.0
+        facing = Transform(position=(0.0, 0.0, 0.0),
+                           rotation=(0.0, math.sin(half), 0.0, math.cos(half)))
+
+        rest = Skeleton("rest", region_set, root=Transform())
+        turned = Skeleton("turned", region_set, root=facing)
+
+        still = rest.bone_matrices()[arm.bone_id].apply(arm.a)
+        moved = turned.bone_matrices()[arm.bone_id].apply(arm.a)
+        self.assertGreater(
+            sum((moved[i] - still[i]) ** 2 for i in range(3)) ** 0.5, 0.1,
+            "turning the entity did not move its arm")
+        self.assertAlmostEqual(moved[0], still[2], places=9)
+        self.assertAlmostEqual(moved[2], -still[0], places=9)
+
+    def test_the_root_alone_still_moves_a_bone(self):
+        """The other half: translation was never the broken part, and a fix
+        that composed the rotation and dropped the offset would pass the tests
+        above."""
+        region_set = humanoid_region_set()
+        here = Skeleton("here", region_set, root=Transform())
+        there = Skeleton("there", region_set,
+                         root=Transform(position=(10.0, 2.0, -4.0)))
+        for bone in region_set.bones:
+            with self.subTest(bone=bone.bone_id):
+                a = here.bone_matrices()[bone.bone_id].apply(bone.a)
+                b = there.bone_matrices()[bone.bone_id].apply(bone.a)
+                self.assertAlmostEqual(b[0] - a[0], 10.0, places=9)
+                self.assertAlmostEqual(b[1] - a[1], 2.0, places=9)
+                self.assertAlmostEqual(b[2] - a[2], -4.0, places=9)

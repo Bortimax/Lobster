@@ -297,11 +297,18 @@ class Skeleton:
         return dict(self._pose)
 
     def bone_matrices(self) -> Dict[str, Transform]:
-        """World-space transform per bone. What a renderer and IK consume."""
-        return {bone_id: Transform(
-            position=self.root.apply(local.position),
-            rotation=local.rotation)
-            for bone_id, local in self._pose.items()}
+        """World-space transform per bone. What a renderer and IK consume.
+
+        `root.compose(local)` - the same composition `capsule_for` uses, and it
+        has to be, or the two disagree about where a bone is. Composing only
+        the *position* and keeping the bone's local rotation would place every
+        bone correctly and orient none of them: a turned entity would have its
+        arms on the wrong side and its head facing whichever way the rig was
+        authored. Bones on the vertical axis - head, torso, pelvis - come out
+        identical either way, which is why this survived having a consumer.
+        """
+        return {bone_id: self.root.compose(local)
+                for bone_id, local in self._pose.items()}
 
     # -- hitboxes ------------------------------------------------------------
     def capsule_for(self, bone_id: str) -> Capsule:
