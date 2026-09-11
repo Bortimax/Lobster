@@ -409,7 +409,10 @@ class ModernGLBackend(RenderBackend):
             if mesh is not None:
                 vao = mesh[1]
                 vao.render(vertices=mesh[2])
-        elif item.kind in (PROP, ITEM) and item.model_ref:
+        elif item.kind in (ENTITY, PROP, ITEM) and item.model_ref:
+            # A worn bone model is a mesh with a transform, which is
+            # everything this branch needs; an entity reaches the
+            # impostor below only when it is undressed.
             if item.model_ref not in self.models:
                 # Residency never uploaded it. Same fallback the software path
                 # takes, and counted here rather than raised - a frame that

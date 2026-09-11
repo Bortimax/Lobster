@@ -394,9 +394,18 @@ def build_draw_list(camera: Camera,
                     packed[key] = packed.get(key, b"") + result["instances"]
 
         # -- entities ----------------------------------------------------------
+        # An entity is culled **once, as a whole**, and only then does what it
+        # wears become draw items. Culling per bone would be finer and wrong:
+        # a head visible over a wall has to bring its body, and the rig's own
+        # `bound_radius` already covers everything authored to it.
         index = getattr(cell, "index", None)
         skeletons = getattr(cell, "skeletons", {})
         if index is not None:
+            #: model ref -> (flat rows, "entity/bone" ids), the same shape the
+            #: item pass builds, so worn models go through the same kernel,
+            #: the same instance packing and the same placement charge. A
+            #: character's arm is a placement exactly as a barrel is.
+            worn_rows: Dict[str, Tuple[List[float], List[str]]] = {}
             for entry in index.entries():
                 if entry.tier == DORMANT and not include_dormant_entities:
                     continue
@@ -407,12 +416,56 @@ def build_draw_list(camera: Camera,
                 center = placement.apply(entry.position)
                 if not camera.sees_sphere(center, radius):
                     continue
-                items.append(DrawItem(
-                    kind=ENTITY, cell_id=cell.cell_id,
-                    item_id=entry.entity_id, cell_placement=placement,
-                    center=center, radius=radius,
-                    distance=camera.distance_to(center)))
+
+                worn = skeleton.worn_models() if skeleton is not None else []
+                for bone_id, model_ref, transform in worn:
+                    flat, ids = worn_rows.setdefault(model_ref, ([], []))
+                    flat.extend((float(transform.position[0]),
+                                 float(transform.position[1]),
+                                 float(transform.position[2]),
+                                 float(transform.rotation[0]),
+                                 float(transform.rotation[1]),
+                                 float(transform.rotation[2]),
+                                 float(transform.rotation[3])))
+                    ids.append("{0}/{1}".format(entry.entity_id, bone_id))
+
+                # The impostor item is still emitted for an entity with any
+                # *undressed* bone, which is every entity until someone gives
+                # it a wardrobe. A fully dressed one does not need it, and
+                # emitting it anyway would draw capsules through the model.
+                bones = len(skeleton.region_set.bones) if skeleton else 0
+                if skeleton is None or len(worn) < bones:
+                    items.append(DrawItem(
+                        kind=ENTITY, cell_id=cell.cell_id,
+                        item_id=entry.entity_id, cell_placement=placement,
+                        center=center, radius=radius,
+                        distance=camera.distance_to(center)))
                 drew_any = True
+
+            for model_ref, (flat, worn_ids) in sorted(worn_rows.items()):
+                radius, model_ref = _model_radius(library, model_ref,
+                                                  ITEM_DRAW_RADIUS_M)
+                result = place(_place_payload(camera, placement, radius, flat,
+                                              lightmap))
+                for slot, index_of in enumerate(result["visible"]):
+                    base = index_of * 7
+                    items.append(DrawItem(
+                        kind=ENTITY, cell_id=cell.cell_id,
+                        item_id=worn_ids[index_of], cell_placement=placement,
+                        center=tuple(result["centers"][slot]), radius=radius,
+                        distance=result["distances"][slot],
+                        model_ref=model_ref,
+                        transform=Transform(
+                            position=(flat[base], flat[base + 1],
+                                      flat[base + 2]),
+                            rotation=(flat[base + 3], flat[base + 4],
+                                      flat[base + 5], flat[base + 6]))))
+                    if model_ref:
+                        charge_placement(cell.cell_id)
+                    drew_any = True
+                if result["visible"] and _has_mesh(library, model_ref):
+                    key = (cell.cell_id, model_ref)
+                    packed[key] = packed.get(key, b"") + result["instances"]
 
         if drew_any:
             stats.cells_drawn += 1

@@ -495,3 +495,107 @@ class TestTheLibraryIsReadOnce(ModelResidencyFixture):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# ---------------------------------------------------------------------------
+# What entities are wearing
+# ---------------------------------------------------------------------------
+
+class TestAWardrobeIsCountedToo(ModelResidencyFixture):
+    """A character's models are a third source, and they behave like an item's
+    rather than a prop's: a prop is baked into the bundle and fixed for the
+    residency, an entity walks in and out while the cell stays resident."""
+
+    def dress(self, cell_id, entity_id, models, position=(4.0, 0.0, 4.0)):
+        from lobster.geometry import Transform
+        from lobster.skeleton import (Skeleton, Wardrobe,
+                                      humanoid_region_set)
+        from lobster.tiers import ACTIVE
+        skeleton = Skeleton(entity_id, humanoid_region_set(),
+                            root=Transform(position=position),
+                            wardrobe=Wardrobe("guard", models))
+        self.manager.resident[cell_id].place(entity_id, position, ACTIVE,
+                                             skeleton=skeleton)
+        return skeleton
+
+    def test_a_cell_needs_what_its_entities_wear(self):
+        self.world({})
+        self.enter(VILLAGE)
+        self.assertNotIn(BARREL, self.manager.model_refs_for(VILLAGE))
+        self.dress(VILLAGE, "npc-ada", {"head": BARREL})
+        self.assertIn(BARREL, self.manager.model_refs_for(VILLAGE))
+
+    def test_two_guards_in_one_helm_are_one_reference(self):
+        """The same rule fifty barrels get."""
+        self.world({})
+        self.enter(VILLAGE)
+        self.dress(VILLAGE, "npc-a", {"head": BARREL}, (4.0, 0.0, 4.0))
+        self.dress(VILLAGE, "npc-b", {"head": BARREL}, (6.0, 0.0, 4.0))
+        self.assertEqual(
+            [r for r in self.manager.model_refs_for(VILLAGE) if r == BARREL],
+            [BARREL])
+
+    def test_an_undressed_entity_references_nothing(self):
+        from lobster.geometry import Transform
+        from lobster.skeleton import Skeleton, humanoid_region_set
+        from lobster.tiers import ACTIVE
+        self.world({})
+        self.enter(VILLAGE)
+        before = self.manager.model_refs_for(VILLAGE)
+        self.manager.resident[VILLAGE].place(
+            "npc-bare", (4.0, 0.0, 4.0), ACTIVE,
+            skeleton=Skeleton("npc-bare", humanoid_region_set(),
+                              root=Transform(position=(4.0, 0.0, 4.0))))
+        self.assertEqual(self.manager.model_refs_for(VILLAGE), before)
+
+    def test_sync_models_uploads_what_the_entities_arrived_wearing(self):
+        """The documented order places entities *after* `set_player_cell`, so
+        the cell-entry sync has already run by the time anyone is standing
+        there. `sync_models` is the explicit "and now they are" - an eighth
+        Event would have done it, and the set is frozen at seven."""
+        self.world({})
+        self.enter(VILLAGE)
+        self.dress(VILLAGE, "npc-ada", {"head": BARREL})
+        self.assertNotIn(BARREL, self.gpu.live_models(),
+                         "it was uploaded before anybody asked")
+
+        self.gpu.sync_models(VILLAGE)
+        self.assertIn(BARREL, self.gpu.live_models())
+        self.assert_in_step()
+
+    def test_syncing_twice_uploads_once(self):
+        self.world({})
+        self.enter(VILLAGE)
+        self.dress(VILLAGE, "npc-ada", {"head": BARREL})
+        self.gpu.sync_models(VILLAGE)
+        live = list(self.gpu.live_models())
+        self.gpu.sync_models(VILLAGE)
+        self.gpu.sync_models()
+        self.assertEqual(self.gpu.live_models(), live)
+        self.assert_in_step()
+
+    def test_leaving_the_cell_releases_the_wardrobe(self):
+        """The invariant that actually matters: a refcount bug is the class
+        where every answer stays correct while the memory grows."""
+        self.world({})
+        self.enter(VILLAGE)
+        self.dress(VILLAGE, "npc-ada", {"head": BARREL})
+        self.gpu.sync_models(VILLAGE)
+        self.assertIn(BARREL, self.gpu.live_models())
+
+        self.enter(KEEP)
+        self.assertNotIn(BARREL, self.gpu.live_models(),
+                         "the guard left and his helm stayed uploaded")
+        self.assert_in_step()
+
+    def test_an_unsynced_wardrobe_is_a_counted_fault_not_a_silent_one(self):
+        self.world({})
+        self.enter(VILLAGE)
+        self.dress(VILLAGE, "npc-ada", {"head": BARREL})
+        self.assertIn(BARREL, self.manager.model_refs_for(VILLAGE),
+                      "the cell does not even know it needs it")
+        self.assertNotIn(BARREL, self.gpu.live_models())
+        self.assertTrue(any(BARREL in missing
+                            for missing in self.gpu.drift().values()),
+                        "nothing reports the gap between what the cell needs "
+                        "and what is uploaded")

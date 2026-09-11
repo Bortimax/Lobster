@@ -349,12 +349,37 @@ def _draw_capsule_impostor(frame: Framebuffer, camera: Camera, capsule: Any,
 
 
 def _draw_entity(frame: Framebuffer, camera: Camera, skeleton: Any,
-                 settings: RenderSettings) -> int:
+                 placement: Any, settings: RenderSettings,
+                 only: Optional[str] = None) -> int:
+    """The bones of an entity that have no model, as capsule impostors.
+
+    **`placement` is not optional and was missing.** A rig is posed in its
+    cell's space, exactly like a structure origin, and this drew it as though
+    cell space were world space - invisible in the origin cell and wrong in
+    every other one, which is the same mistake D21 and D23 found in the
+    hit-test path. Worn models do not go through here; they are placed by the
+    kernel like any other model and were never affected.
+
+    A dressed bone is skipped: it is drawn as geometry, and drawing a capsule
+    through it would put a grey slab inside the model. `only` restricts this to
+    one bone, for the case where a bone's model is named but the library does
+    not hold it - the documented impostor fallback, applied per bone.
+    """
+    from ..geometry import Capsule
     drawn = 0
+    wardrobe = getattr(skeleton, "wardrobe", None)
     for bone in skeleton.region_set.bones:
+        if only is not None and bone.bone_id != only:
+            continue
+        if only is None and wardrobe is not None and wardrobe.model_for(
+                bone.bone_id):
+            continue
+        local = skeleton.capsule_for(bone.bone_id)
         drawn += _draw_capsule_impostor(
-            frame, camera, skeleton.capsule_for(bone.bone_id), ENTITY_COLOUR,
-            settings)
+            frame, camera,
+            Capsule(placement.apply(local.a), placement.apply(local.b),
+                    local.radius),
+            ENTITY_COLOUR, settings)
     return drawn
 
 
@@ -392,9 +417,26 @@ def render_draw_list(draw_list: DrawList, cells_by_id: Dict[str, Any], *,
                 _draw_structure(frame, camera, cell, live, item.cell_placement,
                                 settings)
         elif item.kind == ENTITY and settings.draw_entities:
+            # A dressed bone arrives as its own item, carrying the model and
+            # the bone's placement - the same two fields a prop carries, so it
+            # takes the same path. An undressed entity arrives once, with no
+            # model, and becomes capsules.
+            if item.model_ref:
+                mesh = _mesh_for(library, item)
+                if mesh is not None:
+                    _draw_model(frame, camera, cell, mesh, item.cell_placement,
+                                item.transform, settings)
+                    continue
+                entity_id, _, bone_id = item.item_id.rpartition("/")
+                skeleton = getattr(cell, "skeletons", {}).get(entity_id)
+                if skeleton is not None:
+                    _draw_entity(frame, camera, skeleton, item.cell_placement,
+                                 settings, only=bone_id)
+                continue
             skeleton = getattr(cell, "skeletons", {}).get(item.item_id)
             if skeleton is not None:
-                _draw_entity(frame, camera, skeleton, settings)
+                _draw_entity(frame, camera, skeleton, item.cell_placement,
+                             settings)
         elif item.kind == PROP:
             mesh = _mesh_for(library, item)
             if mesh is not None:

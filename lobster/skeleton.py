@@ -204,6 +204,60 @@ class RegionSet:
                 "bones": [b.to_dict() for b in self.bones]}
 
 
+@dataclass(frozen=True)
+class Wardrobe:
+    """Which model each bone of a rig wears.
+
+    A rig says what bones a creature has; a wardrobe says what it *looks*
+    like. Two guards and a villager share `humanoid_region_set()` and do not
+    share a face, so this is a separate object from `RegionSet` - and a shared
+    one, held by every entity that looks alike rather than copied per entity.
+
+    **Rigid, per bone, and that is the whole of it.** A model sits at its
+    bone's transform, in the same space `Bone.a` and `Bone.b` are in, so an
+    artist authors the forearm model where the forearm capsule is and nothing
+    fits, scales or deforms it. Nothing in Lobster bends: the project owner
+    closed that question, and the cost of it being closed is that a shoulder
+    is a joint between two pieces rather than a smooth surface. That is the
+    look this project is for.
+
+    A bone with no entry draws as the impostor it always has, exactly as a
+    prop with an empty `model_ref` does. An absence is not a fault.
+    """
+
+    name: str
+    #: bone id -> model ref. Frozen after construction like everything else a
+    #: renderer reads mid-frame.
+    models: Mapping[str, str] = dc_field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        cleaned: Dict[str, str] = {}
+        for bone_id, model_ref in dict(self.models).items():
+            if not isinstance(bone_id, str) or not isinstance(model_ref, str):
+                raise SkeletonError(
+                    "wardrobe {0!r}: expects bone id -> model ref, both "
+                    "strings, got {1!r} -> {2!r}".format(
+                        self.name, bone_id, model_ref))
+            # An empty ref is an absence, and an absence is spelled by leaving
+            # the bone out. Keeping it would ask the library for "" and turn a
+            # documented absence into a reported fault.
+            if model_ref:
+                cleaned[bone_id] = model_ref
+        object.__setattr__(self, "models", cleaned)
+
+    def model_for(self, bone_id: str) -> Optional[str]:
+        return self.models.get(bone_id)
+
+    def model_refs(self) -> List[str]:
+        """The distinct models an entity wearing this needs resident."""
+        return sorted(set(self.models.values()))
+
+    def fits(self, region_set: "RegionSet") -> List[str]:
+        """Bone ids this wardrobe dresses that the rig does not have."""
+        known = {bone.bone_id for bone in region_set.bones}
+        return sorted(set(self.models) - known)
+
+
 def humanoid_region_set(*, height: float = 1.8) -> RegionSet:
     """The default six-region humanoid rig, scaled to `height`.
 
@@ -249,10 +303,24 @@ class Skeleton:
     """
 
     def __init__(self, entity_id: str, region_set: Optional[RegionSet] = None,
-                 *, root: Optional[Transform] = None) -> None:
+                 *, root: Optional[Transform] = None,
+                 wardrobe: Optional[Wardrobe] = None) -> None:
         self.entity_id = entity_id
         self.region_set = region_set or humanoid_region_set()
         self.root = root or Transform()
+        #: what this entity looks like, or `None` for the capsule impostor.
+        #: Checked against the rig *here*, because this is the first place both
+        #: are in one hand - a wardrobe dressing a bone the rig does not have is
+        #: a content mistake, and finding it at draw time would report it as a
+        #: missing model in a frame instead of a mismatch at its source.
+        if wardrobe is not None:
+            unknown = wardrobe.fits(self.region_set)
+            if unknown:
+                raise SkeletonError(
+                    "{0}: wardrobe {1!r} dresses {2}, which region set {3!r} "
+                    "does not have".format(entity_id, wardrobe.name, unknown,
+                                           self.region_set.name))
+        self.wardrobe = wardrobe
         self._pose: Dict[str, Transform] = {
             b.bone_id: Transform() for b in self.region_set.bones}
         #: bumped on every pose write, so a consumer can tell a stale read.
@@ -309,6 +377,32 @@ class Skeleton:
         """
         return {bone_id: self.root.compose(local)
                 for bone_id, local in self._pose.items()}
+
+    def worn_models(self) -> List[Tuple[str, str, Transform]]:
+        """`(bone_id, model_ref, world transform)` for every dressed bone.
+
+        What a renderer draws instead of an impostor. Bones with no model are
+        absent from this list rather than present with a `None` - the caller
+        still has to draw those as impostors, and a list it can loop over
+        without a branch per bone is the shape both backends want.
+
+        Ordered by the rig's own bone order, not by dictionary order, so two
+        backends drawing the same entity issue the same draws in the same
+        sequence and a recorded draw list is comparable.
+        """
+        if self.wardrobe is None:
+            return []
+        placed = self.bone_matrices()
+        out: List[Tuple[str, str, Transform]] = []
+        for bone in self.region_set.bones:
+            model_ref = self.wardrobe.model_for(bone.bone_id)
+            if model_ref:
+                out.append((bone.bone_id, model_ref, placed[bone.bone_id]))
+        return out
+
+    def model_refs(self) -> List[str]:
+        """The distinct models this entity needs resident."""
+        return self.wardrobe.model_refs() if self.wardrobe is not None else []
 
     # -- hitboxes ------------------------------------------------------------
     def capsule_for(self, bone_id: str) -> Capsule:

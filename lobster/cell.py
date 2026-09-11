@@ -183,6 +183,20 @@ class ResidentCell:
                 seen.setdefault(prop.model_ref)
         return sorted(seen)
 
+    def worn_model_refs(self) -> List[str]:
+        """The distinct models this cell's entities are wearing.
+
+        Not folded into `model_refs`: that one is the *bundle's* models, fixed
+        for the residency and reference-counted on that basis. An entity is
+        placed and removed while the cell stays resident, so its wardrobe has
+        the lifetime an item's model has, not a prop's.
+        """
+        seen: Dict[str, None] = {}
+        for skeleton in self.skeletons.values():
+            for model_ref in skeleton.model_refs():
+                seen.setdefault(model_ref)
+        return sorted(seen)
+
     def prop_rows(self) -> Dict[str, Tuple[List[float], List[str]]]:
         """This cell's props as flat kernel input, grouped by model, cached.
 
@@ -500,17 +514,26 @@ class CellManager:
         return sorted(seen)
 
     def model_refs_for(self, cell_id: str) -> List[str]:
-        """Every model this cell needs resident: its props, and its items.
+        """Every model this cell needs resident: props, items, and what the
+        entities standing in it are wearing.
 
-        The union lives here and not on `ResidentCell` because half of it is a
+        The union lives here and not on `ResidentCell` because part of it is a
         record read and a `ResidentCell` holds no session - it is baked geometry
         plus the runtime state derived from records, and reaching for a
         resolution from inside one would make it a query object.
+
+        Worn models are the third source and behave like an item's rather than
+        a prop's: a prop is baked into the bundle and fixed for the whole
+        residency, while an entity walks in and out mid-residency and takes its
+        wardrobe with it. So this is read live, and `sync_models` is what an
+        integrator calls after placing entities (CONTRACT ~7).
         """
         cell = self.resident.get(cell_id)
         if cell is None:
             return []
-        return sorted(set(cell.model_refs()) | set(self.item_model_refs(cell_id)))
+        return sorted(set(cell.model_refs())
+                      | set(self.item_model_refs(cell_id))
+                      | set(cell.worn_model_refs()))
 
     # -- residency -----------------------------------------------------------
     def is_exterior(self, view: Any, cell_id: str) -> bool:

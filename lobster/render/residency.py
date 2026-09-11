@@ -291,6 +291,34 @@ class GpuResidency:
     def _library(self) -> Any:
         return getattr(self.manager, "library", None)
 
+    def sync_models(self, cell_id: Optional[str] = None) -> None:
+        """Bring a resident cell's uploads in line with what it needs *now*.
+
+        The three Events cover everything that arrives through a record. An
+        **entity does not**: Lobster is handed a rig by the caller, through
+        `ResidentCell.place`, and the documented order places entities *after*
+        `set_player_cell` - so the cell-entry sync has already run by the time
+        anybody is standing in the cell, and what they are wearing was not in
+        the set it uploaded.
+
+        An eighth Event would have covered it and the set is frozen at seven
+        for good reasons (CONTRACT 1), so this is the explicit call instead:
+        place your entities, then say so. It is idempotent and cheap - a set
+        difference against what is already held - and a cell with no change
+        retains and releases nothing.
+
+        Not calling it is a *counted* fault rather than a silent one: the
+        models stay unuploaded, `unresolved_models` names them and the backend
+        draws impostors, which is the same fallback an absent barrel gets.
+
+        With no `cell_id`, every uploaded cell is synced.
+        """
+        if cell_id is None:
+            for uploaded in tuple(self.uploaded):
+                self._sync_cell(uploaded)
+        elif cell_id in self.uploaded:
+            self._sync_cell(cell_id)
+
     def live_models(self) -> List[str]:
         """Which models are on the backend right now."""
         return sorted(self.model_counts)
