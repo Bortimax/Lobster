@@ -397,7 +397,11 @@ MODEL_VERTEX_STRIDE = 9 * 4
 # ---------------------------------------------------------------------------
 
 BUNDLE_FORMAT = "lobster-cell"
-BUNDLE_FORMAT_VERSION = 1
+#: Bumped to 2 when `NavPoly.connection_target` became `connection_targets`
+#: (review L4). The reader refuses a mismatch and says "rebuild" rather than
+#: reading a v1 navmesh as a portal-less one, which is exactly the silent
+#: wrong answer the version exists to prevent.
+BUNDLE_FORMAT_VERSION = 2
 BUNDLE_SUFFIX = ".lobster_cell"
 
 #: The shared model library: one meshed copy of every `Model`, beside the cells.

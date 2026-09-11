@@ -344,7 +344,7 @@ def bridge_navmesh(cell_id: str = VILLAGE, *, span: int = BRIDGE_SPAN,
     """A single-file walkway at deck height, with the far end a portal.
 
     Poly 0 is the reference (where an arrival stands); the last poly carries
-    `connection_target`, which is what makes it a door in Scope 4's sense.
+    `connection_targets`, which is what makes it a door in Scope 4's sense.
     """
     polys = []
     for i in range(span):
@@ -355,7 +355,8 @@ def bridge_navmesh(cell_id: str = VILLAGE, *, span: int = BRIDGE_SPAN,
                     (BRIDGE_POLY_M, z1), (0.0, z1)),
             y=BRIDGE_DECK_Y,
             neighbours=tuple(n for n in (i - 1, i + 1) if 0 <= n < span),
-            connection_target=portal_target if i == span - 1 else None))
+            connection_targets=((portal_target,)
+                                if i == span - 1 and portal_target else ())))
     return Navmesh(cell_id, polys)
 
 

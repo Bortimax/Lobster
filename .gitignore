@@ -15,3 +15,5 @@ cells/
 # written into it before `git status` was read carefully enough to notice.
 /build/
 *.egg-info/
+# Code reviews, can stay local
+/cr/

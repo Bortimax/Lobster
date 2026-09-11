@@ -191,6 +191,27 @@ def occupants_in_blast(view: Any, zone_id: str) -> List[str]:
     villagers in a blast radius got hit' is a zone-occupancy query +
     `apply_effect` per occupant" - and `apply_effect` is not on Lobster's
     permitted surface, deliberately. The Event chain applies; Lobster counts.
+
+    **The key is `npc_id`.** An occupant is a `resolve_npc_state` result, and
+    that is what the result is keyed by. This read `character_id` or `id` -
+    two keys nothing in Octopus produces - so every occupant came back `None`,
+    which is precisely the interface drift a thin bridge exists to prevent
+    (review L5). A caller targeting Events at that list would have applied
+    nothing to everybody.
+
+    An occupant with no `npc_id` raises rather than joining the list as a
+    `None`. A blast that reports a casualty it cannot name is worse than one
+    that stops: the Event it feeds goes somewhere, and a nameless target is
+    not somewhere.
     """
-    return [occupant.get("character_id") or occupant.get("id")
-            for occupant in view.zone_occupants(zone_id)]
+    out: List[str] = []
+    for occupant in view.zone_occupants(zone_id):
+        npc_id = occupant.get("npc_id")
+        if not npc_id:
+            raise WorldTickError(
+                "zone {0!r}: an occupant has no 'npc_id' ({1!r}). Lobster "
+                "reports who is in the blast and applies nothing; an occupant "
+                "it cannot name is not reportable.".format(
+                    zone_id, sorted(occupant)))
+        out.append(npc_id)
+    return out

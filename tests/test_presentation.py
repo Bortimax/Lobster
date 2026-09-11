@@ -23,13 +23,14 @@ from lobster.octopus_bridge import OctopusBridge
 from lobster.skeleton import Skeleton, humanoid_region_set
 from lobster.sound import audible, parse_sources, sources_for_cell
 from lobster.structure_state import StructureStateWriter
-from lobster.worldtick import (occupants_in_blast, placements_for_cell,
+from lobster.worldtick import (WorldTickError, occupants_in_blast,
+                               placements_for_cell,
                                resolve_blast_in_location,
                                resolve_blast_in_zone)
 from lobster.zones import (BOX, CYLINDER, POLYGON, ZoneShapeError,
                            shape_from_dict, volumes_for_cell, zones_containing)
-from tests.fixtures import (FIELD, GATEHOUSE, KEEP, VILLAGE,
-                            build_session, standard_workspace)
+from tests.fixtures import (C, FIELD, GATEHOUSE, KEEP, VILLAGE,
+                            build_session, package_dict, standard_workspace)
 
 
 class TestZoneVolumes(unittest.TestCase):
@@ -305,6 +306,61 @@ class TestWorldTickStructureDamage(unittest.TestCase):
     def test_occupants_come_from_octopus_not_from_lobster(self):
         occupants = occupants_in_blast(self.bridge.frame(), "zone-village")
         self.assertIsInstance(occupants, list)
+
+    # -- who is actually in the blast ---------------------------------------
+    #
+    # The test above asserted a list and the default fixture schedules nobody,
+    # so it passed against a reader using two keys Octopus does not produce and
+    # returning `[None]` for a zone full of villagers (review L5). An occupancy
+    # test whose fixture has no occupants is a test of `list`.
+
+    def peopled(self, *npc_ids):
+        """A session with real scheduled occupants in the village zone."""
+        ops = []
+        for npc_id in npc_ids:
+            ops.append(C("sched-" + npc_id, "ScheduleEntry",
+                         character_ref=npc_id, location_ref=VILLAGE))
+            ops.append({"op": "MERGE", "id": npc_id, "field": "schedule_refs",
+                        "values": ["sched-" + npc_id]})
+        session = build_session(
+            extra_packages=[package_dict("schedule", ops)])
+        return OctopusBridge(session)
+
+    def test_an_occupant_comes_back_named(self):
+        bridge = self.peopled("npc-ada")
+        view = bridge.frame()
+        self.assertEqual([o["npc_id"] for o in view.zone_occupants(
+            "zone-village")], ["npc-ada"],
+            "the fixture schedules nobody, so the assertion below is about an "
+            "empty list")
+        self.assertEqual(occupants_in_blast(bridge.frame(), "zone-village"),
+                         ["npc-ada"])
+
+    def test_it_reports_exactly_who_octopus_reports(self):
+        bridge = self.peopled("npc-ada")
+        view = bridge.frame()
+        want = [o["npc_id"] for o in view.zone_occupants("zone-village")]
+        self.assertTrue(want, "nobody is in the zone")
+        self.assertEqual(occupants_in_blast(bridge.frame(), "zone-village"),
+                         want)
+
+    def test_nobody_comes_back_as_none(self):
+        """The shape of the bug: the right number of occupants, none of them
+        nameable. A caller targeting Events at that list applies nothing to
+        everybody, and nothing raises."""
+        occupants = occupants_in_blast(self.peopled("npc-ada").frame(),
+                                       "zone-village")
+        self.assertNotIn(None, occupants)
+        self.assertTrue(all(isinstance(o, str) and o for o in occupants))
+
+    def test_an_occupant_with_no_id_raises_rather_than_joining_the_list(self):
+        class Nameless:
+            def zone_occupants(self, zone_id, **kwargs):
+                return [{"active": True, "present": True}]
+
+        with self.assertRaises(WorldTickError) as ctx:
+            occupants_in_blast(Nameless(), "zone-village")
+        self.assertIn("npc_id", str(ctx.exception))
 
 
 if __name__ == "__main__":

@@ -12,7 +12,8 @@ leash movement in Scope 9 ever asks for.
 
 Portals come from the manifest, not from geometry. Scope 4: "the connection owns
 the spawn point", so the polygon containing a connection's spawn transform is
-that connection's door, and `NavPoly.connection_target` records it. That is what
+that connection's door, and `NavPoly.connection_targets` records it - plural,
+because one merged polygon commonly holds several. That is what
 lets `lobster.connection_graph` ask "can an agent still reach the door to
 `cell-field`" after a collapse - and, just as importantly, tell the difference
 between "cannot reach it" and "this cell bakes no door there at all".
@@ -160,20 +161,32 @@ def _link_neighbours(polys: List[NavPoly],
         polys[index] = NavPoly(poly_id=poly.poly_id, points=poly.points,
                                y=poly.y,
                                neighbours=tuple(sorted(links[poly.poly_id])),
-                               connection_target=poly.connection_target)
+                               connection_targets=poly.connection_targets)
 
 
 def _attach_portals(navmesh: Navmesh,
                     portals: Mapping[str, Vec3]) -> Navmesh:
-    """Mark the polygon under each connection's spawn point as its door."""
+    """Mark the polygon under each connection's spawn point as its door.
+
+    **Adds; it does not replace.** Two doors on one polygon is the ordinary
+    case rather than the exotic one - greedy meshing merges a flat room into a
+    single rectangle, so a room with two exits has both spawn points inside the
+    same polygon. Overwriting meant the second door erased the first, which
+    then lay on the navmesh looking walkable and answered "no opinion" to every
+    connection question asked about it (review L4).
+    """
     for target, point in sorted(portals.items()):
         poly_id = navmesh.poly_at(point)
         if poly_id is None:
             continue
         poly = navmesh.polys[poly_id]
+        if target in poly.connection_targets:
+            continue
         navmesh.polys[poly_id] = NavPoly(
             poly_id=poly.poly_id, points=poly.points, y=poly.y,
-            neighbours=poly.neighbours, connection_target=target)
+            neighbours=poly.neighbours,
+            connection_targets=tuple(sorted(
+                poly.connection_targets + (target,))))
     return navmesh
 
 
@@ -200,7 +213,6 @@ def unreachable_portals(navmesh: Navmesh,
 
 def bake_report(navmesh: Navmesh) -> Dict[str, Any]:
     return {"cell_id": navmesh.cell_id, "polys": len(navmesh.polys),
-            "portals": sorted(p.connection_target
-                              for p in navmesh.polys.values()
-                              if p.connection_target),
+            "portals": sorted({t for p in navmesh.polys.values()
+                               for t in p.connection_targets}),
             "links": sum(len(p.neighbours) for p in navmesh.polys.values()) // 2}

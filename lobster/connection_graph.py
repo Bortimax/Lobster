@@ -92,8 +92,8 @@ def portal_polys(navmesh: Navmesh) -> Dict[str, List[int]]:
     """Which navmesh polys are the doors out of this cell, by target cell."""
     out: Dict[str, List[int]] = {}
     for pid, poly in navmesh.polys.items():
-        if poly.connection_target:
-            out.setdefault(poly.connection_target, []).append(pid)
+        for target in poly.connection_targets:
+            out.setdefault(target, []).append(pid)
     for target in out:
         out[target].sort()
     return out

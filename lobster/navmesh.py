@@ -91,9 +91,17 @@ class NavPoly:
     points: Tuple[Tuple[float, float], ...]
     y: float
     neighbours: Tuple[int, ...] = ()
-    #: portal polys carry the connection they belong to (Scope 4: "the
+    #: the connections whose doors are on this polygon (Scope 4: "the
     #: connection owns the spawn point").
-    connection_target: Optional[str] = None
+    #:
+    #: **Plural, because greedy meshing merges a flat room into one polygon.**
+    #: This was a single target that each door overwrote, so a room with a
+    #: north door and a south door kept whichever was attached last and the
+    #: other silently stopped being a door - while still lying on the navmesh,
+    #: so the off-navmesh lint saw nothing wrong (review L4). A door with no
+    #: opinion cannot be severed by geometry either, so the erased one was
+    #: unreconcilable rather than merely missing.
+    connection_targets: Tuple[str, ...] = ()
 
     def contains(self, point: Vec3) -> bool:
         return polygon_contains_2d(self.points, point[0], point[2])
@@ -109,11 +117,14 @@ class NavPoly:
         return AABB((min(xs), self.y - LOAD_BEARING_PROBE_MARGIN_M, min(zs)),
                     (max(xs), self.y + DEFAULT_AGENT_HEIGHT_M, max(zs)))
 
+    def connects_to(self, target_location_id: str) -> bool:
+        return target_location_id in self.connection_targets
+
     def to_dict(self) -> Dict[str, Any]:
         return {"poly_id": self.poly_id,
                 "points": [list(p) for p in self.points],
                 "y": self.y, "neighbours": list(self.neighbours),
-                "connection_target": self.connection_target}
+                "connection_targets": list(self.connection_targets)}
 
     @classmethod
     def from_dict(cls, raw: Dict[str, Any]) -> "NavPoly":
@@ -122,7 +133,8 @@ class NavPoly:
                                 for p in raw["points"]),
                    y=float(raw.get("y", 0.0)),
                    neighbours=tuple(int(n) for n in raw.get("neighbours", ())),
-                   connection_target=raw.get("connection_target"))
+                   connection_targets=tuple(
+                       raw.get("connection_targets") or ()))
 
 
 class Navmesh:

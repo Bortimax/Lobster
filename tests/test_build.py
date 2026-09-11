@@ -25,7 +25,9 @@ from lobster.build.lint import (check_item_placements, check_models,
                                 ERROR_CODES, errors, lint_world)
 from lobster.constants import LIBRARY_FILENAME, MODEL_KINDS, PRIMITIVE_SHAPES
 from lobster.build.manifest import ManifestError, load_manifest
-from lobster.build.navmesh_bake import bake_navmesh, unreachable_portals
+from lobster.build.navmesh_bake import (bake_navmesh, bake_report,
+                                        unreachable_portals)
+from lobster.connection_graph import portal_polys
 from lobster.build.navmesh_inference import (infer_load_bearing,
                                              inference_report,
                                              validate_overrides)
@@ -189,8 +191,51 @@ class TestNavmeshBake(unittest.TestCase):
     def test_a_portal_lands_on_the_poly_under_the_spawn_point(self):
         navmesh = bake_navmesh("cell-a", flat_column_field(16),
                                portals={"cell-b": (2.0, 1.0, 2.0)})
-        targets = [p.connection_target for p in navmesh.polys.values()]
+        targets = [t for p in navmesh.polys.values()
+                   for t in p.connection_targets]
         self.assertIn("cell-b", targets)
+
+    def test_two_doors_on_one_flat_surface_both_survive(self):
+        """Greedy meshing merges a flat room into **one** polygon, so two doors
+        land inside the same one - the ordinary case, not an exotic one. The
+        second used to overwrite the first, and the erased door still lay on
+        the navmesh, so the off-navmesh lint saw nothing to report (L4).
+        """
+        navmesh = bake_navmesh("cell-a", flat_column_field(16),
+                               portals={"door-a": (2.0, 1.0, 2.0),
+                                        "door-b": (12.0, 1.0, 12.0)})
+        self.assertEqual(len(navmesh.polys), 1,
+                         "the field meshed to more than one polygon, so this "
+                         "no longer tests two doors sharing one")
+        self.assertEqual(portal_polys(navmesh),
+                         {"door-a": [0], "door-b": [0]})
+
+    def test_three_doors_on_one_surface_all_survive(self):
+        navmesh = bake_navmesh("cell-a", flat_column_field(16),
+                               portals={"door-a": (2.0, 1.0, 2.0),
+                                        "door-b": (12.0, 1.0, 12.0),
+                                        "door-c": (7.0, 1.0, 3.0)})
+        self.assertEqual(sorted(portal_polys(navmesh)),
+                         ["door-a", "door-b", "door-c"])
+
+    def test_the_bake_report_names_every_door(self):
+        navmesh = bake_navmesh("cell-a", flat_column_field(16),
+                               portals={"door-a": (2.0, 1.0, 2.0),
+                                        "door-b": (12.0, 1.0, 12.0)})
+        self.assertEqual(bake_report(navmesh)["portals"], ["door-a", "door-b"])
+
+    def test_a_door_survives_the_round_trip_through_a_dict(self):
+        """The polygon is serialised into the bundle, so a plural field that
+        only worked in memory would come back as no doors at all."""
+        from lobster.navmesh import NavPoly
+        navmesh = bake_navmesh("cell-a", flat_column_field(16),
+                               portals={"door-a": (2.0, 1.0, 2.0),
+                                        "door-b": (12.0, 1.0, 12.0)})
+        poly = navmesh.polys[0]
+        again = NavPoly.from_dict(poly.to_dict())
+        self.assertEqual(again.connection_targets, ("door-a", "door-b"))
+        self.assertTrue(again.connects_to("door-a"))
+        self.assertFalse(again.connects_to("door-z"))
 
     def test_a_portal_off_the_navmesh_is_a_finding(self):
         navmesh = bake_navmesh("cell-a", flat_column_field(16))
