@@ -28,7 +28,7 @@ from ..constants import TERRAIN_VOXEL_SIZE_M
 from ..geometry import Vec3
 from ..constants import VOXEL_SIZE_M
 from ..navmesh import (DEFAULT_AGENT_HEIGHT_M, NavPoly, Navmesh,
-                       clearance_blocked)
+                       structure_surface)
 
 #: How much vertical difference an agent can walk up between adjacent polys.
 DEFAULT_MAX_STEP_M = 0.6
@@ -88,10 +88,9 @@ def bake_navmesh(cell_id: str, field: Any, *,
     for and costs nothing extra.
     """
     settings = settings or BakeSettings()
-    walkable = _walkable_columns(field, settings)
-    _mask_structures(field, walkable, structures, settings)
-    rectangles = _merge_rectangles(field, walkable)
-    polys = _to_polys(field, rectangles, settings)
+    heights, walkable = _surfaces(field, structures, settings)
+    rectangles = _merge_rectangles(heights, walkable)
+    polys = _to_polys(rectangles, settings)
     _link_neighbours(polys, rectangles, settings)
     navmesh = Navmesh(cell_id, polys)
     return _attach_portals(navmesh, portals or {})
@@ -117,54 +116,95 @@ def _walkable_columns(field: Any, settings: BakeSettings) -> List[List[bool]]:
     return out
 
 
-def _mask_structures(field: Any, walkable: List[List[bool]],
-                     structures: Sequence[Any],
-                     settings: BakeSettings) -> None:
-    """Clear every column an intact structure is standing in.
+def _surfaces(field: Any, structures: Sequence[Any], settings: BakeSettings
+              ) -> Tuple[List[List[float]], List[List[bool]]]:
+    """The height an agent stands at in each column, and whether it can.
 
-    Asked at the column's own surface with the same `clearance_blocked` the
-    runtime patch uses, so a cell that is never damaged and a cell that is
-    damaged and recomputed cannot disagree about what "walkable" meant.
+    **The surface is the topmost thing that holds you up, not the terrain.** A
+    cart, a crate, a wall, a rampart, the roof of a house - in a voxel world
+    those are places to stand, and the first version of this pass simply
+    *deleted* the columns they occupied, which made a cart a hole in the
+    navmesh: unwalkable at ground level, and no surface on top either.
 
-    Note the two voxel sizes: columns are terrain-sized (`settings.voxel_size`)
-    and structures are finer (`VOXEL_SIZE_M`), so the probe walks the agent's
-    headroom in *structure* voxels while the grid it clears is terrain's.
+    One surface per column is enough for almost all of it, and that is a
+    consequence of a decision the project already made: an interior is its own
+    cell (D8). A house you can enter is not a room inside this cell's navmesh,
+    it is a separate cell - so from out here a house is a solid mass whose roof
+    is the only place on it to stand. Carts, crates, walls and ramparts are the
+    same shape of problem.
+
+    What one surface per column cannot do is a walkway with a passage *under*
+    it - a bridge you can both cross and walk beneath needs two heights at the
+    same column, and this holds one. The bridge wins: the surface is the
+    topmost, so the deck is walkable and the ground beneath it is not baked.
+
+    Two voxel sizes meet here. Columns are terrain-sized
+    (`settings.voxel_size`); structures are finer (`VOXEL_SIZE_M`), and both
+    the surface query and the headroom probe work in the finer one.
     """
-    structures = list(structures)
-    if not structures:
-        return
     v = settings.voxel_size
-    for x in range(field.side):
-        for z in range(field.side):
-            if not walkable[x][z]:
-                continue
-            surface = field.height_at(x, z) * v
-            if clearance_blocked((x + 0.5) * v, surface, (z + 0.5) * v,
-                                 structures, settings.agent_height,
-                                 VOXEL_SIZE_M):
-                walkable[x][z] = False
-
-
-def _merge_rectangles(field: Any, walkable: List[List[bool]]
-                      ) -> List[Tuple[int, int, int, int, int]]:
-    """Greedy-merge walkable columns of equal height into (x, z, w, d, height)."""
     side = field.side
+    structures = list(structures)
+    terrain_ok = _walkable_columns(field, settings)
+    heights = [[0.0] * side for _ in range(side)]
+    walkable = [[False] * side for _ in range(side)]
+
+    for x in range(side):
+        for z in range(side):
+            cx, cz = (x + 0.5) * v, (z + 0.5) * v
+            surface: Optional[float] = None
+            if terrain_ok[x][z]:
+                surface = field.height_at(x, z) * v
+            if structures:
+                # A structure standing on a cliff gives you a floor the terrain
+                # slope test refused, so this is asked whether or not the
+                # terrain under it was walkable.
+                top = structure_surface(cx, cz, structures)
+                if top is not None and (surface is None or top > surface):
+                    surface = top
+            if surface is None:
+                continue
+            # No headroom check, and that is a consequence rather than an
+            # omission: the surface is the *topmost* thing that holds you up,
+            # so anything solid above it would have been the surface instead.
+            # A probe here can never find anything, and a mutation run proved
+            # it - the guard that used to sit on this line could be deleted
+            # without a single test noticing. An unreachable check is worse
+            # than none: it reads like protection.
+            #
+            # It earned its place in the previous design, where the surface was
+            # always the terrain and a structure could stand on top of it.
+            # Quantised so two columns of one flat roof compare equal and merge
+            # into a single rectangle rather than a row of slivers.
+            heights[x][z] = round(surface, 4)
+            walkable[x][z] = True
+    return heights, walkable
+
+
+def _merge_rectangles(heights: List[List[float]], walkable: List[List[bool]]
+                      ) -> List[Tuple[int, int, int, int, float]]:
+    """Greedy-merge walkable columns of equal height into (x, z, w, d, height).
+
+    `height` is metres now rather than a terrain voxel count, because a surface
+    can be the top of a structure and those do not land on terrain's grid.
+    """
+    side = len(heights)
     claimed = [[False] * side for _ in range(side)]
-    out: List[Tuple[int, int, int, int, int]] = []
+    out: List[Tuple[int, int, int, int, float]] = []
     for z in range(side):
         for x in range(side):
             if claimed[x][z] or not walkable[x][z]:
                 continue
-            height = field.height_at(x, z)
+            height = heights[x][z]
             width = 1
             while (x + width < side and walkable[x + width][z]
                    and not claimed[x + width][z]
-                   and field.height_at(x + width, z) == height):
+                   and heights[x + width][z] == height):
                 width += 1
             depth = 1
             while z + depth < side and all(
                     walkable[x + i][z + depth] and not claimed[x + i][z + depth]
-                    and field.height_at(x + i, z + depth) == height
+                    and heights[x + i][z + depth] == height
                     for i in range(width)):
                 depth += 1
             for dz in range(depth):
@@ -174,7 +214,7 @@ def _merge_rectangles(field: Any, walkable: List[List[bool]]
     return out
 
 
-def _to_polys(field: Any, rectangles: Sequence[Tuple[int, int, int, int, int]],
+def _to_polys(rectangles: Sequence[Tuple[int, int, int, int, float]],
               settings: BakeSettings) -> List[NavPoly]:
     polys: List[NavPoly] = []
     v = settings.voxel_size
@@ -183,20 +223,26 @@ def _to_polys(field: Any, rectangles: Sequence[Tuple[int, int, int, int, int]],
         z0, z1 = z * v, (z + depth) * v
         polys.append(NavPoly(poly_id=index,
                              points=((x0, z0), (x1, z0), (x1, z1), (x0, z1)),
-                             y=height * v))
+                             y=height))
     return polys
 
 
 def _link_neighbours(polys: List[NavPoly],
-                     rectangles: Sequence[Tuple[int, int, int, int, int]],
+                     rectangles: Sequence[Tuple[int, int, int, int, float]],
                      settings: BakeSettings) -> None:
-    """Link rectangles that share an edge and are within one step vertically."""
+    """Link rectangles that share an edge and are within one step vertically.
+
+    This is what keeps a roof a roof. A cart's top is half a metre up and links
+    to the ground beside it; a two-metre wall's top does not, so it bakes as an
+    island nobody can path onto without stairs - which is the right answer, and
+    it falls out of the step rule rather than needing one of its own.
+    """
     links: Dict[int, List[int]] = {p.poly_id: [] for p in polys}
     for i, (xi, zi, wi, di, hi) in enumerate(rectangles):
         for j, (xj, zj, wj, dj, hj) in enumerate(rectangles):
             if i >= j:
                 continue
-            if abs(hi - hj) * settings.voxel_size > settings.max_step:
+            if abs(hi - hj) > settings.max_step:
                 continue
             touch_x = (xi + wi == xj or xj + wj == xi) and not (
                 zi + di <= zj or zj + dj <= zi)

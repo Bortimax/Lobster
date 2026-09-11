@@ -305,6 +305,48 @@ class ResidentCell:
             "should have rejected it as unenterable (Scope 4).".format(
                 self.cell_id, (from_location_record or {}).get("id")))
 
+    def standing_height(self, x: float, z: float, *,
+                        ceiling: Optional[float] = None) -> Optional[float]:
+        """What holds you up at `(x, z)` - terrain, or whatever is built on it.
+
+        The height an agent's feet rest at, in cell space, or `None` where
+        nothing does. **This is the query a consumer needs to move a player**,
+        and its absence is why "you cannot stand on a cart" looked like a rule
+        rather than a missing function: Lobster had the terrain half
+        (`TerrainCollider.ground_height`) and the structure half
+        (`LiveStructure.is_solid`) and never put them together, so a caller
+        wanting to walk onto a crate had to re-derive structure collision from
+        raw voxel lookups.
+
+        Lobster does not move anybody. It answers where the ground is; whether
+        you can get there, what it costs and what happens when you land are the
+        caller's (L4).
+
+        `ceiling` bounds the search downward, which is how you ask the question
+        from where you are standing: without it you get the roof, and with your
+        own feet's height you get the floor you are on. Walking under a bridge
+        and walking over it are the same call with different ceilings.
+
+        Destroyed chunks hold nobody up - solidity is read from the live
+        structure - so the cart you were standing on stops supporting you the
+        moment somebody breaks it.
+        """
+        from .navmesh import structure_surface
+        best: Optional[float] = None
+        terrain = self.terrain
+        if terrain is not None and getattr(terrain, "collider", None) is not None:
+            try:
+                ground = terrain.collider.ground_height(x, z)
+            except Exception:
+                ground = None
+            if ground is not None and (ceiling is None or ground <= ceiling):
+                best = float(ground)
+        on_structure = structure_surface(x, z, list(self.structures.values()),
+                                         ceiling=ceiling)
+        if on_structure is not None and (best is None or on_structure > best):
+            best = on_structure
+        return best
+
     def ambient_at(self, point: Vec3) -> float:
         """Baked light level 0..1 at a position in this cell (Scope 3).
 

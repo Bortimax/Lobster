@@ -831,14 +831,38 @@ class TestTheBakeSeesAuthoredStructures(unittest.TestCase):
         manager = CellManager(ws.out)
         return manager, manager.load(view, "cell-a")
 
-    def test_the_wall_is_not_walkable(self):
+    def test_you_cannot_walk_through_the_wall_at_ground_level(self):
         """The reproduction, as a test. `cube.vox` sits at (6, 2, 6) and the
-        column under it used to be as walkable as the field."""
+        column under it used to be as walkable as the field.
+
+        Note what is asserted: no polygon *at the ground's height*. There is
+        one on the roof, which is the point of the test below.
+        """
         _manager, cell = self.built()
         self.assertTrue(cell.structure("gatehouse").is_solid(2, 0, 4),
                         "the fixture's wall is not solid where this looks")
-        self.assertIsNone(cell.navmesh.poly_at((6.0, 2.0, 6.0)),
-                          "the navmesh still has a polygon inside the wall")
+        inside = cell.navmesh.poly_at((6.5, 2.0, 6.5))
+        self.assertTrue(inside is None or cell.navmesh.polys[inside].y > 3.0,
+                        "there is a polygon at ground level inside the wall")
+
+    def test_the_roof_is_walkable_and_is_an_island(self):
+        """A voxel world is one people climb on. The wall's top is a place to
+        stand - and it is not reachable from the ground, because it is two
+        metres up and the step limit is 0.6. Stairs would be structure voxels
+        stepping up, and the same rule would connect them.
+        """
+        _manager, cell = self.built()
+        roof = cell.navmesh.poly_at((7.0, 4.0, 7.0))
+        self.assertIsNotNone(roof, "the wall has no walkable top")
+        self.assertAlmostEqual(cell.navmesh.polys[roof].y, 4.0, places=2,
+                               msg="the roof polygon is not at the top of the "
+                                   "wall")
+        self.assertEqual(cell.navmesh.polys[roof].neighbours, (),
+                         "a two-metre roof linked to something")
+
+        ground = cell.navmesh.poly_at((2.0, 2.0, 2.0))
+        self.assertIsNone(cell.navmesh.find_path(ground, roof),
+                          "an agent can path up a sheer two-metre wall")
 
     def test_an_agent_cannot_walk_into_it(self):
         from lobster.movement import Agent, LeaderLeash
@@ -935,10 +959,15 @@ class TestABuiltGateHasAWayThroughIt(unittest.TestCase):
         self.assertFalse(gate.is_solid(6, 0, 6), "the fixture's gate has no "
                                                  "way through it")
 
-        self.assertIsNone(cell.navmesh.poly_at((6.5, 2.0, 6.5)),
-                          "the walled half of the gate is walkable")
-        self.assertIsNotNone(cell.navmesh.poly_at((7.5, 2.0, 7.5)),
-                             "the gateway was bricked up by the bake")
+        walled = cell.navmesh.poly_at((6.5, 2.0, 6.5))
+        self.assertTrue(
+            walled is None or cell.navmesh.polys[walled].y > 3.0,
+            "the walled half of the gate is walkable at ground level")
+
+        through = cell.navmesh.poly_at((7.5, 2.0, 7.5))
+        self.assertIsNotNone(through, "the gateway was bricked up by the bake")
+        self.assertAlmostEqual(cell.navmesh.polys[through].y, 2.0, places=2,
+                               msg="the gap is not at ground height")
 
     def test_you_can_walk_through_the_gap(self):
         from lobster.navmesh import recompute_polys
@@ -951,3 +980,158 @@ class TestABuiltGateHasAWayThroughIt(unittest.TestCase):
         self.assertTrue(verdict[through],
                         "the bake left the gateway open and the runtime "
                         "recompute disagrees")
+
+class TestYouCanStandOnThingsPeopleBuild(unittest.TestCase):
+    """A voxel world is one people climb on: carts, crates, walls, roofs.
+
+    The first structure-aware bake deleted the columns a structure stood in,
+    which made a cart a *hole* in the navmesh - unwalkable at ground level and
+    no surface on top either. The surface is the topmost thing that holds you
+    up, and whether it connects to the ground beside it is the step rule's
+    business, not a special case.
+    """
+
+    def built(self, cart_height_voxels, origin=(10, 2, 10)):
+        from lobster.build.builder import build_world, content_view
+        from lobster.build.manifest import load_manifest
+        from lobster.cell import CellManager
+        from tests.fixtures import (BuildWorkspace, demo_manifest_cells,
+                                    demo_world_ops, slab_vox, write_vox_file)
+        ws = BuildWorkspace()
+        self.addCleanup(ws.close)
+        slab_vox(os.path.join(ws.art, "slab.vox"))
+        # a low, wide box - a cart, not a tower
+        side = 8
+        # `.vox` is Z-up - `slab_vox` spans x and y and uses z for height -
+        # so the third component is the one that makes this low rather than
+        # thin.
+        write_vox_file(
+            os.path.join(ws.art, "cube.vox"), (side, side, side),
+            [(x, y, z, 7) for x in range(side) for y in range(side)
+             for z in range(cart_height_voxels)])
+        package = ws.write_package("world.demo", demo_world_ops())
+        path = ws.write_manifest(demo_manifest_cells(structures=[{
+            "structure_id": "gatehouse", "vox": "cube.vox",
+            "origin": {"position": list(origin),
+                       "rotation": [0, 0, 0, 1]}}]), [package])
+        manifest = load_manifest(path)
+        result = build_world(manifest, out_dir=ws.out)
+        self.assertTrue(result.ok(), result.to_dict())
+        view = content_view(manifest.package_paths())
+        return CellManager(ws.out).load(view, "cell-a")
+
+    def test_you_can_climb_onto_a_cart(self):
+        """Two voxels is half a metre, and the step limit is 0.6 - so the top
+        of a cart is not an island, it is part of the walkable world."""
+        cell = self.built(cart_height_voxels=2)
+        top = cell.navmesh.poly_at((10.5, 2.5, 10.5))
+        self.assertIsNotNone(top, "the cart has no walkable top")
+        self.assertAlmostEqual(cell.navmesh.polys[top].y, 2.5, places=2)
+
+        ground = cell.navmesh.poly_at((2.0, 2.0, 2.0))
+        self.assertIsNotNone(cell.navmesh.find_path(ground, top),
+                             "nobody can get onto a half-metre cart")
+
+    def test_a_tall_crate_is_not_a_ramp(self):
+        """The other direction. If everything linked regardless of height,
+        agents would walk up the side of a tower."""
+        cell = self.built(cart_height_voxels=8)
+        top = cell.navmesh.poly_at((10.5, 4.0, 10.5))
+        self.assertIsNotNone(top)
+        ground = cell.navmesh.poly_at((2.0, 2.0, 2.0))
+        self.assertIsNone(cell.navmesh.find_path(ground, top))
+
+    def test_the_cart_is_not_a_hole(self):
+        """What the first version did: deleted the columns and put nothing
+        back."""
+        cell = self.built(cart_height_voxels=2)
+        self.assertIsNotNone(cell.navmesh.poly_at((10.5, 2.5, 10.5)))
+        self.assertIsNotNone(cell.navmesh.poly_at((11.5, 2.5, 11.5)))
+
+    def test_standing_height_and_the_navmesh_agree(self):
+        """`standing_height` is what a consumer moves a player with, and the
+        navmesh is what the pathfinder walks NPCs on. If they disagreed, the
+        player would stand where NPCs believe there is nothing, which is the
+        one way this can look broken without anything failing.
+        """
+        cell = self.built(cart_height_voxels=2)
+        for x, z in ((2.0, 2.0), (10.5, 10.5), (11.5, 11.5), (20.0, 20.0)):
+            with self.subTest(point=(x, z)):
+                stood = cell.standing_height(x, z)
+                self.assertIsNotNone(stood)
+                poly = cell.navmesh.poly_at((x, stood, z))
+                self.assertIsNotNone(poly, "nothing to walk on at {0},{1} and "
+                                           "a player would stand at {2}".format(
+                                               x, z, stood))
+                self.assertAlmostEqual(cell.navmesh.polys[poly].y, stood,
+                                       places=2)
+
+    def test_the_ceiling_finds_the_floor_you_are_standing_on(self):
+        """`standing_height` without a ceiling answers "what is the highest
+        thing here", which is the roof. With your own feet's height it answers
+        "what am I standing on", which is the floor. Walking over a cart and
+        walking past it are the same call with different ceilings.
+        """
+        cell = self.built(cart_height_voxels=2)
+        self.assertAlmostEqual(cell.standing_height(10.5, 10.5), 2.5, places=2,
+                               msg="the top of the cart")
+        self.assertAlmostEqual(
+            cell.standing_height(10.5, 10.5, ceiling=2.4), 2.0, places=2,
+            msg="asked from below the cart, the answer is the ground")
+
+    def test_a_ceiling_below_everything_finds_nothing(self):
+        cell = self.built(cart_height_voxels=2)
+        self.assertIsNone(cell.standing_height(10.5, 10.5, ceiling=1.0))
+
+    def test_destroying_what_you_stand_on_stops_holding_you_up(self):
+        """Solidity is read live, so this follows - but it is the property a
+        consumer moving a player depends on, and it is worth a test that fails
+        loudly if the query ever starts reading the authored voxels instead."""
+        cell = self.built(cart_height_voxels=2)
+        self.assertAlmostEqual(cell.standing_height(10.5, 10.5), 2.5, places=2)
+
+        live = cell.structure("gatehouse")
+        live.destroy_chunks(sorted(live.voxel_data.chunk_indices()))
+        self.assertAlmostEqual(cell.standing_height(10.5, 10.5), 2.0, places=2,
+                               msg="the cart was destroyed and still holds "
+                                   "somebody up")
+
+    def two_decks(self):
+        """A structure with a floor and a walkway above it - the shape the
+        navmesh cannot hold in one column, and the query can."""
+        from lobster.build.builder import build_world, content_view
+        from lobster.build.manifest import load_manifest
+        from lobster.cell import CellManager
+        from tests.fixtures import (BuildWorkspace, demo_manifest_cells,
+                                    demo_world_ops, slab_vox, write_vox_file)
+        ws = BuildWorkspace()
+        self.addCleanup(ws.close)
+        slab_vox(os.path.join(ws.art, "slab.vox"))
+        side = 8
+        write_vox_file(
+            os.path.join(ws.art, "cube.vox"), (side, side, side),
+            [(x, y, z, 7) for x in range(side) for y in range(side)
+             for z in list(range(2)) + list(range(4, 6))])
+        package = ws.write_package("world.demo", demo_world_ops())
+        path = ws.write_manifest(demo_manifest_cells(structures=[{
+            "structure_id": "gatehouse", "vox": "cube.vox",
+            "origin": {"position": [10, 2, 10],
+                       "rotation": [0, 0, 0, 1]}}]), [package])
+        manifest = load_manifest(path)
+        self.assertTrue(build_world(manifest, out_dir=ws.out).ok())
+        view = content_view(manifest.package_paths())
+        return CellManager(ws.out).load(view, "cell-a")
+
+    def test_the_ceiling_finds_the_deck_below_the_one_above(self):
+        """Standing under a walkway. The navmesh bakes the *top* surface and
+        one per column, so the pathfinder has nothing to say down here - but a
+        consumer moving a player asks from where the player is, and gets the
+        floor they are on rather than the walkway over their head.
+        """
+        cell = self.two_decks()
+        self.assertAlmostEqual(cell.standing_height(10.5, 10.5), 3.5, places=2,
+                               msg="without a ceiling, the walkway")
+        self.assertAlmostEqual(
+            cell.standing_height(10.5, 10.5, ceiling=2.8), 2.5, places=2,
+            msg="asked from underneath, the deck under your feet - not "
+                "nothing, and not the walkway above")

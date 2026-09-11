@@ -409,6 +409,67 @@ def _solid_at(point: Vec3, structures: Sequence[Any], voxel_size: float) -> bool
     return False
 
 
+def structure_surface(x: float, z: float, structures: Sequence[Any], *,
+                      ceiling: Optional[float] = None,
+                      voxel_size: Optional[float] = None) -> Optional[float]:
+    """The top of the highest solid structure voxel at `(x, z)`.
+
+    What you stand on when you climb onto a cart, a crate, a wall or a roof -
+    and `None` when there is no structure there to stand on. `ceiling` bounds
+    the search downward, which is how a caller asks the other question: someone
+    walking *under* a bridge wants the surface below them, not the deck.
+
+    Solidity comes from the live structure, so a destroyed chunk stops holding
+    anybody up the moment it is destroyed.
+
+    Public and shared on purpose. The navmesh bake asks it to place a polygon on
+    top of a structure, and `ResidentCell.standing_height` asks it so a consumer
+    can move a player onto the same surface. Two implementations of "what holds
+    you up here" would be two chances for the thing you see under your feet and
+    the thing the pathfinder believes to disagree.
+    """
+    from .constants import VOXEL_SIZE_M
+    v = VOXEL_SIZE_M if voxel_size is None else voxel_size
+    best: Optional[float] = None
+    for live in structures:
+        data = getattr(live, "voxel_data", live)
+        box = data.aabb_world(v)
+        lo, hi = box.minimum, box.maximum
+        if not (lo[0] <= x <= hi[0] and lo[2] <= z <= hi[2]):
+            continue
+        top = hi[1] if ceiling is None else min(hi[1], ceiling)
+        if top < lo[1]:
+            continue
+        # Coarse scan down the column in voxel steps, then bisect the boundary
+        # so the answer is a surface rather than a probe grid. Done in *cell*
+        # space rather than the structure's, so a rotated structure needs no
+        # special case - `_solid_at` transforms each probe itself.
+        hit: Optional[float] = None
+        steps = int((top - lo[1]) / v) + 2
+        for i in range(steps):
+            y = top - v * i
+            if y < lo[1]:
+                break
+            if _solid_at((x, y, z), [live], v):
+                hit = y
+                break
+        if hit is None:
+            continue
+        low, high = hit, min(hit + v, top + v)
+        for _ in range(5):
+            mid = (low + high) * 0.5
+            if _solid_at((x, mid, z), [live], v):
+                low = mid
+            else:
+                high = mid
+        surface = high
+        if ceiling is not None and surface > ceiling:
+            continue
+        if best is None or surface > best:
+            best = surface
+    return best
+
+
 def clearance_blocked(x: float, y: float, z: float,
                       structures: Sequence[Any], agent_height: float,
                       voxel_size: float) -> bool:
