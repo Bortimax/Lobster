@@ -184,7 +184,7 @@ def cmd_damage(args: argparse.Namespace) -> int:
     except (CellError, BudgetViolation) as e:
         print("error: {0}".format(e), file=sys.stderr)
         return 2
-    manager.pump_navmesh(max_jobs=16)
+    manager.pump_navmesh(view, max_jobs=16)
     return _emit({
         "result": result,
         "octopus_op": destroy_op(args.structure, result["destroyed"]),

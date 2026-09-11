@@ -119,7 +119,7 @@ class TestSynchronousColliderAsynchronousNavmesh(unittest.TestCase):
         held = leash.step(self.cell.navmesh, agents, deck_point(5), dt=0.1)[0]
         self.assertEqual(held.reason, HELD_NAVMESH_PENDING)
 
-        self.manager.pump_navmesh(max_jobs=8)
+        self.manager.pump_navmesh(self.bridge.frame(), max_jobs=8)
         self.assertEqual(self.cell.navmesh.dirty, set())
         moved = leash.step(self.cell.navmesh, agents, deck_point(5), dt=0.1)[0]
         self.assertFalse(moved.moved, "poly 1's deck is gone, so it is blocked")

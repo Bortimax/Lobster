@@ -32,6 +32,7 @@ from .budgets import (Budget, BudgetViolation, MemoryLedger, POOL_LIGHTMAP,
                       POOL_METADATA, POOL_NAVMESH, POOL_STRUCTURES,
                       POOL_TERRAIN)
 from .bundle import BundleError, CellBundle, read_bundle
+from .connection_graph import ConnectionGraphPatcher
 from .constants import (BUNDLE_SUFFIX, EXTERIOR_CELL_SIZE_M, EXTERIOR_TAG,
                         LIBRARY_FILENAME,
                         RESIDENT_RING, SPATIAL_GRID_CELL_M)
@@ -423,6 +424,10 @@ class CellManager:
         #: Keyed to residency rather than to the manager's lifetime - see
         #: `_bundle`.
         self._bundle_cache: Dict[str, CellBundle] = {}
+        #: the 10.3 completion, owned here because `pump_navmesh` and `load`
+        #: both have to run it and a consumer holding its own copy is how the
+        #: invariant went unenforced in the first place.
+        self.patcher = ConnectionGraphPatcher(session)
         self._library: Optional[ModelLibrary] = None
 
     # -- paths ---------------------------------------------------------------
@@ -599,6 +604,11 @@ class CellManager:
         self._charge(cell)
         self.resident[cell_id] = cell
         self._apply_break_state_to_navmesh(cell)
+        # Saved destruction reaches the navmesh here, so the graph has to be
+        # re-checked here too. Reloading a cell whose bridge fell in a previous
+        # session used to restore the hole and leave the connection standing
+        # (review L3) - the disagreement survived the round trip.
+        self.reconcile_connections(view, cell_id)
         self.bus.enter_cell(cell_id)
         return cell
 
@@ -929,9 +939,111 @@ class CellManager:
         """
         return sorted({target for target, _ in view.connections(cell_id)})
 
-    def pump_navmesh(self, *, max_jobs: int = 1) -> List[Dict[str, Any]]:
-        """Run pending navmesh patches. Called by the game loop, never by the
-        damage path."""
+    def reference_poly(self, cell_id: str) -> Optional[int]:
+        """The polygon a connection check asks "can you get out of here" from.
+
+        Not poly 0. The question `navmesh_says_connected` answers is whether an
+        agent can still walk from somewhere real to a door, and a hard-coded
+        zero can itself be the polygon that just collapsed - which would report
+        every connection in the cell as severed because the reference standing
+        spot is gone.
+
+        So: the polygon under the cell's `default_spawn_transform`, because
+        that is where arrivals appear and the build-step lint already refuses a
+        Location without one (Scope 4). If that polygon is unwalkable, or the
+        cell declares no spawn, the lowest-numbered walkable polygon stands in.
+        A cell with *no* walkable polygon returns `None`, and the caller reports
+        no opinion rather than severing everything: a cell nobody can stand in
+        is a geometry problem, not evidence about its doors.
+        """
+        cell = self.resident.get(cell_id)
+        if cell is None or cell.navmesh is None:
+            return None
+        raw = (cell.location_record or {}).get("default_spawn_transform")
+        if raw:
+            try:
+                spawn = Transform.from_dict(raw)
+            except Exception:
+                spawn = None
+            if spawn is not None:
+                poly_id = cell.navmesh.poly_at(spawn.position)
+                if poly_id is not None and cell.navmesh.is_walkable(poly_id):
+                    return poly_id
+        for poly_id in sorted(cell.navmesh.polys):
+            if cell.navmesh.is_walkable(poly_id):
+                return poly_id
+        return None
+
+    def reconcile_connections(self, view: Any, cell_id: str,
+                              *, adjacent_cell_ids: Sequence[str] = (),
+                              apply: bool = True) -> Dict[str, Any]:
+        """The other half of a completed patch: make the graph agree (10.3).
+
+        A navmesh patch recomputes polygons. It does not, by itself, tell
+        Octopus that the bridge everybody was crossing is gone - and until
+        something does, `navmesh_says_connected` is False while
+        `graph_says_connected` is still True. That disagreement outlasts the
+        dirty/pending interval the scope explicitly permits, and offscreen NPC
+        routing and topology-driven content go on treating the crossing as
+        traversable (review L3).
+
+        `ConnectionGraphPatcher` has always known how to do this and nothing
+        ever called it: the agreement tests reconstructed the invariant by hand
+        from separate helpers, which proves the helpers and not the path. This
+        is the one operation, and `pump_navmesh` and `load` both run it.
+
+        Bounded to the resident ring, as 10.3 requires. An affected neighbour
+        that is not resident has no navmesh to ask, so it is **named in the
+        result** rather than skipped quietly - the caller can see exactly which
+        connections went unchecked and why.
+        """
+        checked: List[str] = []
+        severed: List[Dict[str, Any]] = []
+        unchecked: List[Dict[str, str]] = []
+
+        for target in [cell_id] + [c for c in adjacent_cell_ids
+                                   if c != cell_id]:
+            cell = self.resident.get(target)
+            if cell is None or cell.navmesh is None:
+                unchecked.append({"cell_id": target,
+                                  "reason": "not resident"})
+                continue
+            poly_id = self.reference_poly(target)
+            if poly_id is None:
+                unchecked.append({"cell_id": target,
+                                  "reason": "no walkable polygon to stand on"})
+                continue
+            checked.append(target)
+            for severance in self.patcher.check_cell(view, target,
+                                                     cell.navmesh, poly_id,
+                                                     apply=apply):
+                severed.append(severance.to_dict())
+
+        # A manager with no session can decide a connection is gone and not
+        # record it. That is a configuration fact, not a geometry one, so it
+        # is reported beside the verdicts rather than swallowed: the ops are
+        # right there in each severance for a caller that writes its own.
+        return {"checked": sorted(checked), "severed": severed,
+                "unchecked": unchecked,
+                "applied": bool(apply and self.session is not None)}
+
+    def pump_navmesh(self, view: Any, *,
+                     max_jobs: int = 1) -> List[Dict[str, Any]]:
+        """Run pending navmesh patches, then make the connection graph agree.
+
+        Called by the game loop, never by the damage path.
+
+        **`view` is required, and that is the fix.** Completing a patch is two
+        halves - recompute the polygons, then re-check the connections that
+        cross them - and the second half needs a view. Making it optional would
+        leave the default call half-finished, which is the state review L3
+        found: `adjacent_cell_ids` recorded on every job and read by nobody,
+        `ConnectionGraphPatcher` invoked only by tests that had assembled the
+        invariant by hand.
+
+        Each returned job carries a `reconciled` block naming what was checked,
+        what was severed, and what could not be checked and why.
+        """
         def resolve(job: PatchJob) -> Dict[int, bool]:
             cell = self.resident.get(job.cell_id)
             if cell is None or cell.navmesh is None:
@@ -941,7 +1053,14 @@ class CellManager:
                 structures=list(cell.structures.values()))
             cell.navmesh.apply_patch(verdicts)
             return verdicts
-        return self.patches.pump(resolve, max_jobs=max_jobs)
+
+        done = self.patches.pump(resolve, max_jobs=max_jobs)
+        for report in done:
+            job = report.get("job") or {}
+            report["reconciled"] = self.reconcile_connections(
+                view, job.get("cell_id"),
+                adjacent_cell_ids=job.get("adjacent_cell_ids") or ())
+        return done
 
     # -- reporting -----------------------------------------------------------
     def report(self) -> Dict[str, Any]:

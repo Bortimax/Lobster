@@ -80,7 +80,7 @@ class TestNavmeshConnectionAgreement(unittest.TestCase):
         self.assertTrue(self.cell.bundle.table_for(BRIDGE).is_load_bearing(chunk))
 
         # the navmesh patch is deferred; run it, then re-check the connections
-        self.assertTrue(self.manager.pump_navmesh(max_jobs=8))
+        self.assertTrue(self.manager.pump_navmesh(self.bridge.frame(), max_jobs=8))
         severed = self.patcher.check_cell(self.bridge.frame(), VILLAGE,
                                           self.cell.navmesh, REFERENCE_POLY)
 
@@ -91,7 +91,7 @@ class TestNavmeshConnectionAgreement(unittest.TestCase):
     def test_both_halves_of_the_connection_are_severed(self):
         """A collapsed bridge is not a one-way passage."""
         self.collapse_the_bridge()
-        self.manager.pump_navmesh(max_jobs=8)
+        self.manager.pump_navmesh(self.bridge.frame(), max_jobs=8)
         self.patcher.check_cell(self.bridge.frame(), VILLAGE, self.cell.navmesh,
                                 REFERENCE_POLY)
 
@@ -121,7 +121,7 @@ class TestNavmeshConnectionAgreement(unittest.TestCase):
         self.assertIsNone(navmesh_says_connected(self.cell.navmesh,
                                                  REFERENCE_POLY, KEEP))
         self.collapse_the_bridge()
-        self.manager.pump_navmesh(max_jobs=8)
+        self.manager.pump_navmesh(self.bridge.frame(), max_jobs=8)
         severed = self.patcher.check_cell(self.bridge.frame(), VILLAGE,
                                           self.cell.navmesh, REFERENCE_POLY)
         self.assertNotIn(KEEP, [s.target_location_id for s in severed])
@@ -226,3 +226,223 @@ class TestTheInferenceCanSeeEverythingThatMattersToWalkability(unittest.TestCase
         self.assertFalse(mesh.polys_intersecting(
             AABB((40.0, -0.1, 40.0), (42.0, 0.1, 42.0))),
             "a chunk on the far side of the cell is not load-bearing here")
+
+
+# ---------------------------------------------------------------------------
+# The completion, through the path a game actually calls (review L3)
+# ---------------------------------------------------------------------------
+
+class TestThePatchCompletesItself(unittest.TestCase):
+    """The tests above prove `ConnectionGraphPatcher` works. They call it by
+    hand, after `pump_navmesh`, having assembled the invariant themselves - so
+    they could not have caught the thing that was actually wrong: **nothing in
+    the runtime called it.** A damage job recorded `adjacent_cell_ids` and no
+    production caller ever read them.
+
+    These use the public path only. No patcher is constructed here, and no
+    connection is severed by the test.
+    """
+
+    def setUp(self):
+        self.session = build_session()
+        self.bridge = OctopusBridge(self.session)
+        self.ws = bridge_workspace()
+        self.addCleanup(self.ws.close)
+        # the session reaches the manager, which is what lets it record a
+        # severance rather than only decide on one
+        self.manager = CellManager(self.ws.path, session=self.session)
+        self.cell = self.manager.load(self.bridge.frame(), VILLAGE)
+
+    def collapse(self):
+        chunk = deck_chunk_under(3, self.cell.structure(BRIDGE).voxel_data)
+        self.manager.damage_structure(
+            self.bridge.frame(), VILLAGE, BRIDGE, [chunk],
+            writer=StructureStateWriter(self.session, self.manager.bus))
+        return chunk
+
+    def agreed(self):
+        view = self.bridge.frame()
+        poly = self.manager.reference_poly(VILLAGE)
+        return (navmesh_says_connected(self.cell.navmesh, poly, FIELD),
+                graph_says_connected(view, VILLAGE, FIELD))
+
+    def test_they_agree_before_anything_happens(self):
+        self.assertEqual(self.agreed(), (True, True))
+
+    def test_pumping_the_patch_makes_the_graph_agree(self):
+        self.collapse()
+        self.assertEqual(self.agreed(), (True, True),
+                         "the patch is deferred, so nothing has changed yet")
+
+        self.manager.pump_navmesh(self.bridge.frame(), max_jobs=8)
+
+        navmesh_verdict, graph_verdict = self.agreed()
+        self.assertFalse(navmesh_verdict, "the navmesh still sees a route")
+        self.assertFalse(graph_verdict,
+                         "the navmesh says the bridge is gone and Octopus "
+                         "still says you can walk it")
+
+    def test_the_report_says_what_it_reconciled(self):
+        self.collapse()
+        done = self.manager.pump_navmesh(self.bridge.frame(), max_jobs=8)
+        reconciled = done[0]["reconciled"]
+        self.assertEqual(reconciled["checked"], [VILLAGE])
+        self.assertEqual([s["target_location_id"]
+                          for s in reconciled["severed"]], [FIELD])
+        self.assertTrue(reconciled["applied"])
+
+    def test_a_neighbour_it_could_not_check_is_named(self):
+        """Bounded to the resident ring by 10.3. A neighbour that is not
+        resident has no navmesh to ask - which must be reported, not skipped,
+        or the gap looks exactly like a clean bill of health."""
+        self.collapse()
+        done = self.manager.pump_navmesh(self.bridge.frame(), max_jobs=8)
+        unchecked = done[0]["reconciled"]["unchecked"]
+        self.assertIn(FIELD, [u["cell_id"] for u in unchecked])
+        self.assertTrue(all(u["reason"] for u in unchecked))
+
+    def test_both_halves_are_severed_without_the_test_touching_octopus(self):
+        self.collapse()
+        self.manager.pump_navmesh(self.bridge.frame(), max_jobs=8)
+        view = self.bridge.frame()
+        self.assertFalse(graph_says_connected(view, VILLAGE, FIELD))
+        self.assertFalse(graph_says_connected(view, FIELD, VILLAGE),
+                         "a collapsed bridge is not a one-way passage")
+
+    def test_the_disagreement_does_not_survive_a_reload(self):
+        self.collapse()
+        self.manager.pump_navmesh(self.bridge.frame(), max_jobs=8)
+        self.manager.unload(VILLAGE)
+
+        self.cell = self.manager.load(self.bridge.frame(), VILLAGE)
+        navmesh_verdict, graph_verdict = self.agreed()
+        self.assertFalse(navmesh_verdict)
+        self.assertFalse(graph_verdict,
+                         "the two systems disagree again after a round trip")
+
+    def test_destruction_saved_by_an_earlier_session_is_reconciled_on_load(self):
+        """The case the test above cannot reach. Once this session has pumped,
+        the connection is already severed and a reload would look correct even
+        if `load` reconciled nothing.
+
+        So: write the destruction, throw the manager away, and load the cell
+        cold - which is what happens when a player quits after collapsing the
+        bridge and comes back. Break-state reaches the navmesh on load, so the
+        graph has to be re-checked on load.
+        """
+        chunk = deck_chunk_under(3, self.cell.structure(BRIDGE).voxel_data)
+        StructureStateWriter(self.session, self.manager.bus).destroy(
+            BRIDGE, [chunk])
+        self.assertTrue(graph_says_connected(self.bridge.frame(),
+                                             VILLAGE, FIELD),
+                        "the connection is already severed, so loading it "
+                        "cannot be what severs it")
+
+        fresh = CellManager(self.ws.path, session=self.session)
+        cell = fresh.load(self.bridge.frame(), VILLAGE)
+
+        poly = fresh.reference_poly(VILLAGE)
+        self.assertFalse(navmesh_says_connected(cell.navmesh, poly, FIELD),
+                         "saved break state did not reach the navmesh")
+        self.assertFalse(graph_says_connected(self.bridge.frame(),
+                                              VILLAGE, FIELD),
+                         "the navmesh knows the bridge is gone and Octopus "
+                         "still says you can walk it")
+
+    def test_an_intact_cell_severs_nothing_on_load(self):
+        """The other direction, and the one that would make this dangerous:
+        reconciling on every load must not cut connections that are fine."""
+        self.manager.unload(VILLAGE)
+        self.manager.load(self.bridge.frame(), VILLAGE)
+        self.assertEqual(self.agreed(), (True, True))
+        self.assertEqual(self.manager.patcher.report(), [])
+
+    def test_pumping_with_no_view_is_not_possible(self):
+        """The half-finished call is what L3 was. It cannot be spelled now."""
+        self.collapse()
+        with self.assertRaises(TypeError):
+            self.manager.pump_navmesh(max_jobs=8)
+
+
+class TestWhereTheConnectionCheckStandsFrom(unittest.TestCase):
+    """`navmesh_says_connected` asks whether an agent can walk from a reference
+    polygon to a door, and a hard-coded poly 0 can be the polygon that just
+    collapsed - which would report every connection in the cell as severed
+    because the reference standing spot is gone."""
+
+    def setUp(self):
+        self.session = build_session()
+        self.bridge = OctopusBridge(self.session)
+        self.ws = bridge_workspace()
+        self.addCleanup(self.ws.close)
+        self.manager = CellManager(self.ws.path, session=self.session)
+        self.cell = self.manager.load(self.bridge.frame(), VILLAGE)
+
+    def test_it_is_a_walkable_polygon(self):
+        poly = self.manager.reference_poly(VILLAGE)
+        self.assertIsNotNone(poly)
+        self.assertTrue(self.cell.navmesh.is_walkable(poly))
+
+    def test_it_moves_off_a_polygon_that_has_been_destroyed(self):
+        poly = self.manager.reference_poly(VILLAGE)
+        self.cell.navmesh.apply_patch({poly: False})
+        moved = self.manager.reference_poly(VILLAGE)
+        self.assertNotEqual(moved, poly)
+        self.assertTrue(self.cell.navmesh.is_walkable(moved))
+
+    def test_a_cell_with_nowhere_to_stand_has_no_opinion(self):
+        """Not "every connection is severed". A cell nobody can stand in is a
+        geometry problem, not evidence about its doors."""
+        navmesh = self.cell.navmesh
+        navmesh.apply_patch({pid: False for pid in navmesh.polys})
+        self.assertIsNone(self.manager.reference_poly(VILLAGE))
+
+        result = self.manager.reconcile_connections(self.bridge.frame(),
+                                                    VILLAGE)
+        self.assertEqual(result["severed"], [])
+        self.assertIn(VILLAGE, [u["cell_id"] for u in result["unchecked"]])
+        self.assertTrue(graph_says_connected(self.bridge.frame(),
+                                             VILLAGE, FIELD),
+                        "an unwalkable cell severed its connections")
+
+    def spawn_at(self, position):
+        """A session whose village Location spawns arrivals at `position`."""
+        from tests.fixtures import package_dict
+        session = build_session(extra_packages=[package_dict(
+            "spawn", [{"op": "PATCH", "id": VILLAGE,
+                       "field": "default_spawn_transform",
+                       "value": {"position": list(position),
+                                 "rotation": [0.0, 0.0, 0.0, 1.0]}}])])
+        bridge = OctopusBridge(session)
+        manager = CellManager(self.ws.path, session=session)
+        cell = manager.load(bridge.frame(), VILLAGE)
+        return manager, cell
+
+    def test_it_stands_where_arrivals_arrive(self):
+        """The spawn point is the one polygon a content author has declared
+        meaningful. It matters when the navmesh is more than one island: the
+        lowest-numbered walkable polygon is arbitrary, and asking from the
+        wrong island reports a perfectly reachable door as gone - which writes
+        a DELETE_ENTRY, so the wrong reference is destructive, not merely
+        inaccurate.
+        """
+        manager, cell = self.spawn_at((1.0, 4.0, 9.0))
+        poly = cell.navmesh.poly_at((1.0, 4.0, 9.0))
+        self.assertEqual(poly, 4, "the fixture moved; pick another centre")
+        self.assertNotEqual(poly, min(cell.navmesh.polys),
+                            "the spawn is on the polygon the fallback would "
+                            "have chosen anyway, so this proves nothing")
+        self.assertEqual(manager.reference_poly(VILLAGE), poly)
+
+    def test_it_falls_back_when_the_spawn_is_off_the_navmesh(self):
+        manager, cell = self.spawn_at((900.0, 0.0, 900.0))
+        self.assertIsNone(cell.navmesh.poly_at((900.0, 0.0, 900.0)))
+        self.assertEqual(manager.reference_poly(VILLAGE),
+                         min(cell.navmesh.polys))
+
+    def test_it_falls_back_when_the_spawn_polygon_is_destroyed(self):
+        manager, cell = self.spawn_at((1.0, 4.0, 9.0))
+        cell.navmesh.apply_patch({4: False})
+        poly = manager.reference_poly(VILLAGE)
+        self.assertNotEqual(poly, 4)
+        self.assertTrue(cell.navmesh.is_walkable(poly))
