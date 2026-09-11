@@ -357,3 +357,89 @@ class TestWhatCountsAsAJump(unittest.TestCase):
             self.assertFalse(manager.is_continuous_move(
                 self.bridge.frame(), KEEP, from_location_id=FIELD),
                 "no authored connection runs from the field into the keep")
+
+
+# ---------------------------------------------------------------------------
+# What is still *held* after residency ends (review L1)
+# ---------------------------------------------------------------------------
+
+class TestRetainedPayloadsFollowResidency(unittest.TestCase):
+    """The ledger is a counter, and a counter can be right about the wrong
+    thing. `unload` released every charge while the manager went on holding the
+    full `CellBundle` - terrain, authored structure voxels, baked navigation,
+    lightmaps - for the life of the process. `total_bytes()` reported zero with
+    110 KB per visited cell still resident in memory, so retained geometry grew
+    with the *explored* world rather than the ring, and no ceiling would have
+    caught it because the growth was outside the accounting.
+
+    So these assert on retained objects, not on the number.
+    """
+
+    def setUp(self):
+        self.session = build_session()
+        self.bridge = OctopusBridge(self.session)
+
+    def walk(self, manager, cell_ids):
+        for cell_id in cell_ids:
+            manager.load(self.bridge.frame(), cell_id)
+            manager.unload(cell_id)
+
+    def test_nothing_is_held_after_the_last_cell_unloads(self):
+        with standard_workspace() as ws:
+            manager = CellManager(ws.path)
+            self.walk(manager, [VILLAGE, FIELD, KEEP])
+            self.assertEqual(manager.ledger.total_bytes(), 0)
+            self.assertEqual(list(manager._bundle_cache), [],
+                             "the charges were released and the payloads kept")
+
+    def test_what_is_held_is_exactly_what_is_resident(self):
+        """The invariant, stated once: the cache is keyed to residency."""
+        with standard_workspace() as ws:
+            manager = CellManager(ws.path)
+            for cell_id in (VILLAGE, KEEP, FIELD, VILLAGE):
+                manager.set_player_cell(self.bridge.frame(), cell_id)
+                self.assertEqual(sorted(manager._bundle_cache),
+                                 sorted(manager.resident),
+                                 "held payloads and resident cells disagree "
+                                 "after entering {0}".format(cell_id))
+
+    def test_walking_a_long_way_does_not_accumulate(self):
+        """The failure in the shape it would actually take: every answer stays
+        correct while the process grows with the distance walked."""
+        with standard_workspace() as ws:
+            manager = CellManager(ws.path)
+            self.walk(manager, [VILLAGE, FIELD, KEEP] * 8)
+            self.assertEqual(list(manager._bundle_cache), [])
+
+    def test_the_bundle_is_actually_collectable_afterwards(self):
+        """The strongest form, and the one a dict check cannot give: nothing
+        *else* is holding it either. A `LiveStructure` or a cloned navmesh that
+        kept its bundle alive would pass every assertion above and leak just as
+        much.
+        """
+        import gc
+        import weakref
+
+        with standard_workspace() as ws:
+            manager = CellManager(ws.path)
+            cell = manager.load(self.bridge.frame(), VILLAGE)
+            ref = weakref.ref(cell.bundle)
+            self.assertIsNotNone(ref(), "the fixture never held it")
+
+            manager.unload(VILLAGE)
+            del cell
+            gc.collect()
+            self.assertIsNone(
+                ref(), "the bundle outlived its residency - something is "
+                       "still holding it")
+
+    def test_a_resident_cell_keeps_its_bundle(self):
+        """The other direction. Evicting while resident would re-read the
+        bundle on every use and quietly undo what the cache is for."""
+        with standard_workspace() as ws:
+            manager = CellManager(ws.path)
+            manager.load(self.bridge.frame(), VILLAGE)
+            self.assertIn(VILLAGE, manager._bundle_cache)
+            manager.load(self.bridge.frame(), FIELD)
+            self.assertIn(VILLAGE, manager._bundle_cache,
+                          "loading a neighbour evicted a resident cell")

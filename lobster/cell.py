@@ -419,6 +419,9 @@ class CellManager:
         self.ring = ring
         self.resident: Dict[str, ResidentCell] = {}
         self.player_cell: Optional[str] = None
+        #: baked payloads for the currently resident cells, and nothing else.
+        #: Keyed to residency rather than to the manager's lifetime - see
+        #: `_bundle`.
         self._bundle_cache: Dict[str, CellBundle] = {}
         self._library: Optional[ModelLibrary] = None
 
@@ -427,12 +430,30 @@ class CellManager:
         return os.path.join(self.bundle_dir, cell_id + BUNDLE_SUFFIX)
 
     def _bundle(self, cell_id: str) -> CellBundle:
-        """Read a bundle, caching the *immutable* baked data by cell id.
+        """Read a bundle, holding the *immutable* baked data while it is resident.
 
         Caching this is safe in a way caching a query result would not be: a
         bundle is a build artifact with no runtime state in it, and the runtime
         state derived from it (`Navmesh.clone()`, `LiveStructure`) is rebuilt on
         every load.
+
+        **Safe is not free, and this is keyed to residency for that reason.**
+        It used to hold every bundle ever read, for the life of the manager.
+        Immutability made reuse correct and said nothing about lifetime, so
+        terrain, authored structure voxels, baked navigation and lightmaps
+        stayed strongly referenced after `unload` released their ledger charges
+        - and the ledger then reported zero bytes while the process held
+        110 KB per visited cell (review L1). Retained geometry grew with the
+        *explored* world rather than with the resident ring, which is the cost
+        model L3 and L6 exist to bound, and no ceiling would have restored it
+        because the growth was outside the accounting entirely.
+
+        `unload` evicts. The measured price is one bundle read - 0.57 ms for a
+        110 KB cell - paid only when a cell re-enters the ring, which is
+        already the expensive moment and is already allowed to be. The
+        alternative, a separately bounded cache, buys under a millisecond in
+        exchange for a second memory pool with its own budget, its own ledger
+        and its own drift test to keep honest.
         """
         cached = self._bundle_cache.get(cell_id)
         if cached is not None:
@@ -638,6 +659,10 @@ class CellManager:
             [(e.entity_id, e.position, e.tier) for e in cell.index.entries()],
             reason=SNAPSHOT_CELL_EXIT)
         self.ledger.release(cell_id)
+        # The baked payload goes with the charge. Releasing the accounting and
+        # keeping the bytes is what made `total_bytes()` a number about
+        # something other than memory (review L1).
+        self._bundle_cache.pop(cell_id, None)
         self.bus.exit_cell(cell_id)
 
     def is_continuous_move(self, view: Any, cell_id: str, *,
